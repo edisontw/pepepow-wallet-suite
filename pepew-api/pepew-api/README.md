@@ -26,8 +26,8 @@ rpcport=8093
 
 txindex=1
 addressindex=1
-timestampindex=1
-spentindex=1
+timestampindex=0
+spentindex=0
 
 zmqpubrawblock=tcp://127.0.0.1:28332
 zmqpubrawtx=tcp://127.0.0.1:28333
