@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "build": "npm --prefix packages/wallet-core run build && npm --prefix services/wallet-api run build && npm --prefix pepew-api/pepew-api run build && npm --prefix apps/web run build"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3"
+  }
+}

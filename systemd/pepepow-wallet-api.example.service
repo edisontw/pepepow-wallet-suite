@@ -1,0 +1,28 @@
+[Unit]
+Description=PEPEPOW Wallet API (node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+
+# Path to the current release
+WorkingDirectory=/opt/pepepow-wallet-suite/current/services/wallet-api
+
+# Production secrets live on the host
+EnvironmentFile=/etc/pepepow/pepepow-wallet-api.env
+
+# Path to node and server script
+ExecStart=/usr/bin/node /opt/pepepow-wallet-suite/current/services/wallet-api/dist/server.js
+
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+SyslogIdentifier=pepepow-wallet-api
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

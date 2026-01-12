@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build artifacts
+dist/
+build/
+.next/
+out/
+*.tar.gz
+*.zip
+
+# Environment & Secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+!*.env.example
+shared.env
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Database & Cache
+*.sqlite
+*.db
+.cache/
+.nyc_output/
+
+# Certificates
+certs/
+*.pem
+*.key
+*.crt
+
+# Project specific
+release_*/
+wallet.dat
+/tmp/rawtx.hex
