@@ -14,7 +14,7 @@ A comprehensive, non-custodial wallet ecosystem for the PEPEPOW (PEPEW) blockcha
 This project is **non-custodial**. Mnemonics and private keys are **NEVER** sent to or stored on the server. They remain exclusively in the client's browser or Telegram environment.
 
 > [!WARNING]
-> **PHISHING ATTACK WARNING**: If you enter your mnemonic on a non-official website, your funds will be lost immediately. Always verify the domain name (`wallet.pepepow.net`) and ensure you are using the official release.
+> **PHISHING ATTACK WARNING**: If you enter your mnemonic on a non-official website, your funds will be lost immediately. Always verify the domain name (`wallet.pepepow.org` or `wallet.pepepow.net`) and ensure you are using the official release.
 
 ## Architecture
 
