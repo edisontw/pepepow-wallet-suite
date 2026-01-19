@@ -29,10 +29,10 @@ export default function Claim() {
                 if (res.ok) {
                     setRequest(res);
                 } else {
-                    setError(res.error || "Failed to fetch request");
+                    setError(res.error || t("claim.fetchFailed"));
                 }
             } catch (e) {
-                if (active) setError("Network error");
+                if (active) setError(t("errors.networkError"));
             } finally {
                 if (active) setLoading(false);
             }
@@ -51,10 +51,10 @@ export default function Claim() {
             if (res.ok) {
                 setSuccess(true);
             } else {
-                setError(res.error || "Claim failed");
+                setError(res.error || t("claim.failed"));
             }
         } catch (e) {
-            setError("Network error");
+            setError(t("errors.networkError"));
         } finally {
             setClaiming(false);
         }
@@ -63,9 +63,9 @@ export default function Claim() {
     if (!requestId) {
         return (
             <AppLayout>
-                <PageCard title={t("claim.title") || "Claim Payment"}>
+                <PageCard title={t("claim.title")}>
                     <div className="card">
-                        <p className="error">{t("claim.missingId") || "Missing Request ID"}</p>
+                        <p className="error">{t("claim.missingId")}</p>
                     </div>
                 </PageCard>
             </AppLayout>
@@ -74,22 +74,22 @@ export default function Claim() {
 
     return (
         <AppLayout>
-            <PageCard title={t("claim.title") || "Claim Payment"}>
+            <PageCard title={t("claim.title")}>
                 <div className="card">
                     {loading && <p>{t("loading")}</p>}
                     {error && <p className="error">{error}</p>}
-                    {success && <p className="success">{t("claim.success") || "Payment claimed successfully!"}</p>}
+                    {success && <p className="success">{t("claim.success")}</p>}
 
                     {request && !success && (
                         <>
                             <div className="row" style={{ marginBottom: 16 }}>
                                 <div>
-                                    <div className="muted">{t("claim.status") || "Status"}</div>
+                                    <div className="muted">{t("claim.status")}</div>
                                     <div className="summary-value" style={{ textTransform: 'capitalize' }}>{request.status}</div>
                                 </div>
                                 {request.expiresAt && (
                                     <div style={{ marginLeft: 20 }}>
-                                        <div className="muted">{t("claim.expires") || "Expires"}</div>
+                                        <div className="muted">{t("claim.expires")}</div>
                                         <div className="summary-value">{new Date(request.expiresAt).toLocaleString()}</div>
                                     </div>
                                 )}
@@ -97,7 +97,7 @@ export default function Claim() {
 
                             {request.status === 'pending' ? (
                                 <>
-                                    <label className="field-label">{t("claim.yourAddress") || "Your Receiving Address"}</label>
+                                    <label className="field-label">{t("claim.yourAddress")}</label>
                                     <input
                                         className="input"
                                         value={address}
@@ -110,12 +110,12 @@ export default function Claim() {
                                             onClick={handleClaim}
                                             disabled={claiming || !address}
                                         >
-                                            {claiming ? "..." : t("claim.button") || "Claim PEPEW"}
+                                            {claiming ? "..." : t("claim.button")}
                                         </button>
                                     </div>
                                 </>
                             ) : (
-                                <p>{t("claim.alreadyProcessed") || "This request has already been processed or expired."}</p>
+                                <p>{t("claim.alreadyProcessed")}</p>
                             )}
                         </>
                     )}

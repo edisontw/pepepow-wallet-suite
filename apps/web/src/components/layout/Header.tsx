@@ -1,6 +1,6 @@
 import { Link, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { normalizeLang } from "../../i18n";
+import { normalizeLang, SUPPORTED_LANGS } from "../../i18n";
 
 type HeaderProps = {
   compact?: boolean;
@@ -16,13 +16,15 @@ export default function Header({ compact }: HeaderProps) {
   const { t, i18n } = useTranslation();
   const location = useLocation();
   const currentLang = normalizeLang(i18n.language);
-  const nextLang = currentLang === "en" ? "zh-TW" : "en";
-  const langLabel = currentLang === "en" ? t("lang.zh") : t("lang.en");
+  const currentIndex = SUPPORTED_LANGS.indexOf(currentLang);
+  const nextLang = SUPPORTED_LANGS[(currentIndex + 1) % SUPPORTED_LANGS.length];
+  const langKey = nextLang === "zh-TW" ? "zh" : nextLang;
+  const langLabel = t(`lang.${langKey}`);
 
   const navItems: NavItem[] = [
-    { to: "/", label: t("nav.home"), short: "H" },
-    { to: "/send", label: t("nav.send"), short: "S" },
-    { to: "/history", label: t("nav.history"), short: "Tx" },
+    { to: "/", label: t("nav.home"), short: t("nav.homeShort") },
+    { to: "/send", label: t("nav.send"), short: t("nav.sendShort") },
+    { to: "/history", label: t("nav.history"), short: t("nav.historyShort") },
   ];
 
   const visibleItems = navItems;
@@ -35,14 +37,14 @@ export default function Header({ compact }: HeaderProps) {
   return (
     <header className={`app-header${compact ? " compact" : ""}`}>
       <div className="app-header-inner">
-        <Link to="/" className="brand" aria-label="PEPEPOW Wallet">
+        <Link to="/" className="brand" aria-label={t("title")}>
           <img src="/brand/logo.png" alt="PEPEPOW" className="brand-logo" />
           <span className="brand-text">
             <span className="brand-name">PEPEPOW</span>
-            <span className="brand-sub">Wallet</span>
+            <span className="brand-sub">{t("header.wallet")}</span>
           </span>
         </Link>
-        <nav className="nav-links" aria-label="Primary">
+        <nav className="nav-links" aria-label={t("header.primaryNav")}>
           {visibleItems.map((item) => {
             const active = isActive(item.to);
             const shortLabel = compact
@@ -71,7 +73,7 @@ export default function Header({ compact }: HeaderProps) {
               const d = document.documentElement;
               d.dataset.theme = d.dataset.theme === "light" ? "" : "light";
             }}
-            aria-label="Toggle theme"
+            aria-label={t("header.toggleTheme")}
           >
             🌓
           </button>

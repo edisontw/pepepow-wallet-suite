@@ -439,17 +439,17 @@ export default function Send() {
         toTgUserId: isId ? query : "",
         toUsername: isId ? "" : query.replace(/^@/, ""),
         amountSats: amountSats || undefined,
-        memo: "Payment from Wallet",
+        memo: t("send.defaultMemo"),
       });
       if (res.ok) {
         const urlBase = window.location.origin;
         const link = `${urlBase}/?requestId=${res.requestId}`;
         setRequestUrl(link);
       } else {
-        setErr(res.error || "Failed to create request");
+        setErr(res.error || t("send.errors.requestCreateFailed"));
       }
     } catch {
-      setErr("Network error creating request");
+      setErr(t("send.errors.requestNetworkError"));
     } finally {
       setRequestLoading(false);
     }
@@ -605,11 +605,12 @@ export default function Send() {
       const utxosForCheck = st.utxos;
       if (!utxosForCheck || utxosForCheck.length === 0) {
         if (st.status === "loading") {
-          setErr("UTXO data is still loading...");
+          setErr(t("send.errors.utxoLoading"));
         } else if (st.status === "error") {
-          setErr(`UTXO fetch failed: ${st.rawUtxoSumError || st.error || "Unknown error"}`);
+          const detail = st.rawUtxoSumError || st.error || t("errors.unknown");
+          setErr(t("send.errors.utxoFetchFailed", { error: detail }));
         } else {
-          setErr("No UTXOs available (Balance is 0 or API returned empty)");
+          setErr(t("send.errors.utxoEmpty"));
         }
         setSending(false);
         return;
@@ -617,7 +618,7 @@ export default function Send() {
 
       const invalidUtxos = utxosForCheck.filter(u => u.invalid);
       if (invalidUtxos.length > 0) {
-        setErr(`UTXO data incomplete: ${invalidUtxos.length} invalid UTXOs detected (missing scriptHex/txid/vout). Please refresh.`);
+        setErr(t("send.errors.utxoIncomplete", { count: invalidUtxos.length }));
         setSending(false);
         return;
       }
@@ -794,12 +795,12 @@ export default function Send() {
 
       if (!raw) {
         console.error("[SEND_ASSERT] buildAndSignP2PKH returned empty/undefined");
-        setErr("Failed to build transaction: output is undefined");
+        setErr(t("send.errors.txBuildMissingOutput"));
         return;
       }
       if (typeof raw !== "string" || raw.length < 20) {
         console.error("[SEND_ASSERT] invalid raw tx hex", { raw });
-        setErr("Failed to build transaction: invalid hex output");
+        setErr(t("send.errors.txBuildInvalidHex"));
         return;
       }
 
@@ -989,7 +990,7 @@ export default function Send() {
 
           {isTelegram && (
             <div className="card" style={{ marginTop: 20 }}>
-              <label className="field-label">{t("send.tgTransfer") || "Send to Telegram User"}</label>
+              <label className="field-label">{t("send.tgTransfer")}</label>
               <div className="row">
                 <input
                   className="input"
@@ -998,7 +999,7 @@ export default function Send() {
                   placeholder="@username or ID"
                 />
                 <button className="btn secondary" onClick={handleResolve} disabled={resolveStatus === "loading" || !tgUserQuery.trim()}>
-                  {resolveStatus === "loading" ? "..." : t("send.resolve") || "Resolve"}
+                  {resolveStatus === "loading" ? "..." : t("send.resolve")}
                 </button>
               </div>
               {resolveMessage && (
@@ -1008,14 +1009,14 @@ export default function Send() {
                   </small>
                   {resolveResult && !resolveResult.resolved && (
                     <button className="btn ghost" style={{ marginLeft: 8 }} onClick={handleCreateRequest} disabled={requestLoading}>
-                      {requestLoading ? "..." : t("send.createRequest") || "Create Payment Request"}
+                      {requestLoading ? "..." : t("send.createRequest")}
                     </button>
                   )}
                 </div>
               )}
               {requestUrl && (
                 <div className="card" style={{ marginTop: 8, padding: 8, fontSize: '0.9em' }}>
-                  <div className="muted">{t("send.requestLink") || "Share this link with them:"}</div>
+                  <div className="muted">{t("send.requestLink")}</div>
                   <div style={{ wordBreak: 'break-all', marginTop: 4 }}>
                     <a href={requestUrl} target="_blank" rel="noreferrer">{requestUrl}</a>
                   </div>
@@ -1057,7 +1058,7 @@ export default function Send() {
 
         {(walletState.status === "error") && (
           <div className="error" style={{ marginTop: 16, padding: 12, borderRadius: 8, background: 'rgba(255,0,0,0.1)' }}>
-            {t("errors.apiUnreachable") || "The API is currently unreachable or timed out. Sending is disabled."}
+            {t("errors.apiUnreachable")}
           </div>
         )}
 
@@ -1067,7 +1068,7 @@ export default function Send() {
             onClick={doSend}
             disabled={sending || sendLocked || addressInvalid || overBalance || !!err || walletState.status === "error" || walletState.utxos.length === 0}
           >
-            {sending ? t("send.sending") : t("send.confirm")}
+            {sending ? t("send.sending") : t("send.submit")}
           </button>
         </div>
 
@@ -1087,7 +1088,7 @@ export default function Send() {
                     target="_blank"
                     rel="noopener noreferrer"
                     className="btn ghost small"
-                    title="View in Explorer"
+                    title={t("viewInExplorer")}
                   >
                     🔍
                   </a>

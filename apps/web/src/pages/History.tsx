@@ -348,7 +348,7 @@ export default function History() {
                           target="_blank"
                           rel="noopener noreferrer"
                           className="btn ghost small"
-                          title="View in Explorer"
+                          title={t("viewInExplorer")}
                         >
                           🔍
                         </a>
@@ -391,7 +391,7 @@ export default function History() {
                         target="_blank"
                         rel="noopener noreferrer"
                         className="btn ghost small"
-                        title="View in Explorer"
+                        title={t("viewInExplorer")}
                       >
                         🔍
                       </a>
@@ -407,37 +407,37 @@ export default function History() {
           <details className="details">
             <summary>{t("history.debugTitle")}</summary>
             <div>{t("api.base")}: <code>{API_BASE}</code></div>
-            <div style={{ marginTop: 8 }}><strong>history</strong></div>
+            <div style={{ marginTop: 8 }}><strong>{t("history.debug.historyLabel")}</strong></div>
             {historyDebug.lastRequestPath && (
-              <div>history.lastRequestPath: <code>{historyDebug.lastRequestPath}</code></div>
+              <div>{t("history.debug.lastRequestPath")}: <code>{historyDebug.lastRequestPath}</code></div>
             )}
             {historyDebug.lastRequestUrl && (
-              <div>history.lastRequestUrl: <code>{historyDebug.lastRequestUrl}</code></div>
+              <div>{t("history.debug.lastRequestUrl")}: <code>{historyDebug.lastRequestUrl}</code></div>
             )}
             {historyDebug.status !== null && (
-              <div>history.status: <code>{historyDebug.status}</code></div>
+              <div>{t("history.debug.status")}: <code>{historyDebug.status}</code></div>
             )}
             {historyDebug.responseText200 && (
-              <div>history.responseText200: <code>{historyDebug.responseText200}</code></div>
+              <div>{t("history.debug.responseSnippet")}: <code>{historyDebug.responseText200}</code></div>
             )}
             {(historyDebug.errorName || historyDebug.errorMessage) && (
-              <div>history.error: <code>{historyDebug.errorName || "Error"}</code> {historyDebug.errorMessage || ""}</div>
+              <div>{t("history.debug.error")}: <code>{historyDebug.errorName || t("errors.generic")}</code> {historyDebug.errorMessage || ""}</div>
             )}
-            <div style={{ marginTop: 8 }}><strong>utxos</strong></div>
+            <div style={{ marginTop: 8 }}><strong>{t("history.debug.utxosLabel")}</strong></div>
             {utxosDebug.lastRequestPath && (
-              <div>utxos.lastRequestPath: <code>{utxosDebug.lastRequestPath}</code></div>
+              <div>{t("history.debug.lastRequestPath")}: <code>{utxosDebug.lastRequestPath}</code></div>
             )}
             {utxosDebug.lastRequestUrl && (
-              <div>utxos.lastRequestUrl: <code>{utxosDebug.lastRequestUrl}</code></div>
+              <div>{t("history.debug.lastRequestUrl")}: <code>{utxosDebug.lastRequestUrl}</code></div>
             )}
             {utxosDebug.status !== null && (
-              <div>utxos.status: <code>{utxosDebug.status}</code></div>
+              <div>{t("history.debug.status")}: <code>{utxosDebug.status}</code></div>
             )}
             {utxosDebug.responseText200 && (
-              <div>utxos.responseText200: <code>{utxosDebug.responseText200}</code></div>
+              <div>{t("history.debug.responseSnippet")}: <code>{utxosDebug.responseText200}</code></div>
             )}
             {(utxosDebug.errorName || utxosDebug.errorMessage) && (
-              <div>utxos.error: <code>{utxosDebug.errorName || "Error"}</code> {utxosDebug.errorMessage || ""}</div>
+              <div>{t("history.debug.error")}: <code>{utxosDebug.errorName || t("errors.generic")}</code> {utxosDebug.errorMessage || ""}</div>
             )}
             {err && <div>{t("history.errorLabel")}: {err}</div>}
           </details>

@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { apiFetch } from "../lib/api";
 import AppLayout from "../components/layout/AppLayout";
 import PageCard from "../components/layout/PageCard";
 
 export default function Pay() {
+  const { t } = useTranslation();
   const { token } = useParams();
   const [info, setInfo] = useState<any>(null);
   useEffect(() => {
@@ -16,12 +18,12 @@ export default function Pay() {
         const j = await r.json().catch(() => ({}));
         if (!active) return;
         if (!r.ok) {
-          setInfo({ error: true, message: j?.error || "Link invalid." });
+          setInfo({ error: true, message: j?.error || t("pay.linkInvalid") });
           return;
         }
         setInfo(j);
       } catch {
-        if (active) setInfo({ error: true, message: "Unable to reach API." });
+        if (active) setInfo({ error: true, message: t("pay.apiUnreachable") });
       }
     };
 
@@ -32,16 +34,16 @@ export default function Pay() {
   }, [token]);
   return (
     <AppLayout>
-      <PageCard title="Payment">
+      <PageCard title={t("pay.title")}>
         <div className="card">
-          {info?.error ? <p>{info?.message || "Link invalid."}</p> :
+          {info?.error ? <p>{info?.message || t("pay.linkInvalid")}</p> :
             info ? (
               <div>
-                <p>Address: <code>{info.address}</code></p>
-                <p>Amount: <strong>{info.amount}</strong> PEPEW</p>
-                <p>Memo: {info.memo || '-'}</p>
+                <p>{t("pay.addressLabel")}: <code>{info.address}</code></p>
+                <p>{t("pay.amountLabel")}: <strong>{info.amount}</strong> PEPEW</p>
+                <p>{t("pay.memoLabel")}: {info.memo || '-'}</p>
               </div>
-            ) : <p>Loading...</p>
+            ) : <p>{t("loading")}</p>
           }
         </div>
       </PageCard>

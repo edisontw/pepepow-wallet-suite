@@ -17,7 +17,6 @@ import {
   withAddress
 } from "../lib/api";
 import { fmtPEPEWFromSats, satsToCoin } from "../lib/format";
-import { normalizeLang } from "../i18n";
 import { deriveFromMnemonic, generateMnemonic, validateMnemonic, PEPEPOW, pubkeyToP2PKH } from "@pepepow/wallet-core";
 import AppLayout from "../components/layout/AppLayout";
 import PageCard from "../components/layout/PageCard";
@@ -58,10 +57,7 @@ function formatUsdPrice(value: number | null) {
 }
 
 export default function WalletHome() {
-  const { t, i18n } = useTranslation();
-  const currentLang = normalizeLang(i18n.language);
-  const nextLang = currentLang === "en" ? "zh-TW" : "en";
-  const langLabel = currentLang === "en" ? t("lang.zh") : t("lang.en");
+  const { t } = useTranslation();
   const [address, setAddress] = useState(localStorage.getItem("pepew_address") || "");
   const [balanceSats, setBalanceSats] = useState<number | null>(null);
   const [balanceError, setBalanceError] = useState<string | null>(null);
@@ -79,6 +75,7 @@ export default function WalletHome() {
   const [claimStatus, setClaimStatus] = useState<string | null>(null);
   const [isDefaulting, setIsDefaulting] = useState(false);
   const [defaultStatus, setDefaultStatus] = useState<string | null>(null);
+  const [defaultStatusIsError, setDefaultStatusIsError] = useState(false);
   const [needsDefaultSync, setNeedsDefaultSync] = useState(false);
   const [isDefaultConfirmed, setIsDefaultConfirmed] = useState<boolean | null>(null);
   const [debugData, setDebugData] = useState<any>(null);
@@ -149,16 +146,16 @@ export default function WalletHome() {
   }, [address]);
 
   const handleClaim = async (requestId: string) => {
-    setClaimStatus(t("claim.processing") || "Claiming...");
+    setClaimStatus(t("claim.processing"));
     try {
       const res = await apiClaimPaymentRequest(requestId, address);
       if (res.ok) {
-        setClaimStatus(t("claim.success") || "Claimed successfully!");
+        setClaimStatus(t("claim.success"));
       } else {
-        setClaimStatus(res.error || "Claim failed");
+        setClaimStatus(res.error || t("claim.failed"));
       }
     } catch {
-      setClaimStatus("Network error during claim");
+      setClaimStatus(t("errors.networkError"));
     }
   };
 
@@ -167,10 +164,12 @@ export default function WalletHome() {
     if (!isTelegram) return;
     setIsDefaulting(true);
     setDefaultStatus(null);
+    setDefaultStatusIsError(false);
     try {
       const res = await apiSetDefaultAddress(address);
       if (res.ok) {
-        setDefaultStatus(t("home.defaultAddressSet") || "Default address set!");
+        setDefaultStatus(t("home.defaultAddressSet"));
+        setDefaultStatusIsError(false);
         setNeedsDefaultSync(false);
         setIsDefaultConfirmed(true);
         setJustSavedDefault(true);
@@ -178,13 +177,16 @@ export default function WalletHome() {
         void checkDefault();
       } else {
         if (res.error === "Unauthorized") {
-          setDefaultStatus(t("home.defaultSyncTelegramOnly") || "Open this wallet in Telegram to link your address.");
+          setDefaultStatus(t("home.defaultSyncTelegramOnly"));
+          setDefaultStatusIsError(true);
         } else {
-          setDefaultStatus(res.error || "Failed to set default");
+          setDefaultStatus(res.error || t("home.defaultSetFailed"));
+          setDefaultStatusIsError(true);
         }
       }
     } catch {
-      setDefaultStatus("Network error");
+      setDefaultStatus(t("errors.networkError"));
+      setDefaultStatusIsError(true);
     } finally {
       setIsDefaulting(false);
       // F1: Rotation logic
@@ -209,7 +211,10 @@ export default function WalletHome() {
         setJustSavedDefault(false);
       }, 1500);
 
-      setTimeout(() => setDefaultStatus(null), 3000);
+      setTimeout(() => {
+        setDefaultStatus(null);
+        setDefaultStatusIsError(false);
+      }, 3000);
     }
   };
 
@@ -492,17 +497,17 @@ export default function WalletHome() {
               className="btn ghost"
               style={{ display: "inline-flex", alignItems: "center", textDecoration: "none" }}
             >
-              Explorer
+              {t("viewInExplorer")}
             </a>
           </div>
           {isTelegram && (
             <div className="row" style={{ marginTop: 8 }}>
               <button className="btn secondary" onClick={setAsDefault} disabled={!address || isDefaulting}>
-                {isDefaulting ? "..." : isDefaultConfirmed ? (t("home.defaultAddressConfirmed") || "Linked to Telegram ✅") : (t("home.setDefault") || "Set as Default Receive Address")}
+                {isDefaulting ? "..." : isDefaultConfirmed ? t("home.defaultAddressConfirmed") : t("home.setDefault")}
               </button>
-              {defaultStatus && <small className={defaultStatus.includes("failed") ? "error" : "muted"}>{defaultStatus}</small>}
+              {defaultStatus && <small className={defaultStatusIsError ? "error" : "muted"}>{defaultStatus}</small>}
               {needsDefaultSync && !defaultStatus && !isDefaultConfirmed && (
-                <small className="muted">{t("home.defaultSyncHint") || "Set this address as your Telegram receive address."}</small>
+                <small className="muted">{t("home.defaultSyncHint")}</small>
               )}
             </div>
           )}
@@ -560,16 +565,12 @@ export default function WalletHome() {
         {reopenTip && (
           <div className="card" style={{ border: '2px dashed #ffaa00', marginTop: 20 }}>
             <div style={{ color: '#ffaa00', fontWeight: 'bold' }}>
-              {t("lang.zh") === "中文"
-                ? "設定已儲存，請關閉並重新開啟 Telegram Mini App 使其生效"
-                : "Setting saved. Please close and reopen the Telegram Mini App to take effect."}
+              {t("home.telegramReopenTip")}
             </div>
             <div className="row" style={{ marginTop: 10 }}>
-              <button className="btn secondary" onClick={() => window.location.reload()}>{t("history.refresh") || "Reload"}</button>
+              <button className="btn secondary" onClick={() => window.location.reload()}>{t("history.refresh")}</button>
               <button className="btn ghost" onClick={() => {
-                navigator.clipboard.writeText(t("lang.zh") === "中文"
-                  ? "設定已儲存，請關閉並重新開啟 Telegram Mini App 使其生效"
-                  : "Setting saved. Please close and reopen the Telegram Mini App to take effect.");
+                navigator.clipboard.writeText(t("home.telegramReopenTip"));
               }}>{t("copy")}</button>
             </div>
           </div>
@@ -577,7 +578,7 @@ export default function WalletHome() {
 
         {showDebug && debugData && (
           <div className="card muted" style={{ marginTop: 20, fontSize: '0.8em' }}>
-            <div style={{ fontWeight: 'bold' }}>Debug Info</div>
+            <div style={{ fontWeight: 'bold' }}>{t("home.debugTitle")}</div>
             {balanceDebug && (
               <pre style={{ whiteSpace: 'pre-wrap', overflow: 'auto', maxHeight: 200 }}>
                 {JSON.stringify({ balance: balanceDebug }, null, 2)}
@@ -591,7 +592,7 @@ export default function WalletHome() {
             <pre style={{ whiteSpace: 'pre-wrap', overflow: 'auto', maxHeight: 200 }}>
               {JSON.stringify(debugData, null, 2)}
             </pre>
-            <button className="btn ghost" onClick={() => setShowDebug(false)}>Hide Debug</button>
+            <button className="btn ghost" onClick={() => setShowDebug(false)}>{t("home.hideDebug")}</button>
           </div>
         )}
       </PageCard>

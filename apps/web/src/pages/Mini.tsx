@@ -122,11 +122,11 @@ export default function Mini() {
           <p style={{ fontWeight: 'bold', color: status === 'openInTelegram' ? '#ff4444' : 'inherit' }}>
             {statusDetail || t(`mini.${status}`)}
           </p>
-          {status === "openInTelegram" && <div style={{ fontSize: '0.8em', marginTop: 4 }}>[Mini route loaded]</div>}
+          {status === "openInTelegram" && <div style={{ fontSize: '0.8em', marginTop: 4 }}>{t("mini.routeLoaded")}</div>}
           {token && <p className="muted" style={{ wordBreak: "break-all" }}>{t("mini.tokenReady")}</p>}
           {debugEnabled && (
             <div className="muted" style={{ marginTop: 12 }}>
-              <div>debug</div>
+              <div>{t("mini.debugLabel")}</div>
               <pre style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>
                 {JSON.stringify({
                   hasTelegram: debugInfo?.hasTelegram ?? false,
@@ -137,7 +137,7 @@ export default function Mini() {
               </pre>
               {debugInfo?.hasTelegram && (debugInfo?.initDataLen ?? 0) === 0 && (
                 <div style={{ marginTop: 8 }}>
-                  Telegram WebApp detected but initData missing. Test on Telegram mobile app.
+                  {t("mini.initDataHint")}
                 </div>
               )}
             </div>

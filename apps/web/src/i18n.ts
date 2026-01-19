@@ -1,15 +1,23 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
+import { ru } from "./locales/ru";
 
-export type Lang = "en" | "zh-TW";
+export type Lang = "en" | "zh-TW" | "ru";
+export const SUPPORTED_LANGS: Lang[] = ["en", "zh-TW", "ru"];
 export const LANG_STORAGE_KEY = "lang";
 const DEFAULT_LANG: Lang = "en";
 
-const normalizeLang = (value?: string | null): Lang => {
-  if (!value) return DEFAULT_LANG;
+const resolveLang = (value?: string | null): Lang | null => {
+  if (!value) return null;
   const lowered = value.toLowerCase();
   if (lowered.startsWith("zh")) return "zh-TW";
-  return "en";
+  if (lowered.startsWith("ru")) return "ru";
+  if (lowered.startsWith("en")) return "en";
+  return null;
+};
+
+const normalizeLang = (value?: string | null): Lang => {
+  return resolveLang(value) ?? DEFAULT_LANG;
 };
 
 const resources = {
@@ -30,15 +38,26 @@ const resources = {
       hide: "隱藏",
       dark: "深色",
       light: "淺色",
+      loading: "讀取中...",
+      viewInExplorer: "在區塊瀏覽器查看",
+      header: {
+        wallet: "錢包",
+        primaryNav: "主要導覽",
+        toggleTheme: "切換主題"
+      },
       nav: {
         home: "首頁",
         send: "發送",
         history: "紀錄",
-        mini: "Mini"
+        mini: "Mini",
+        homeShort: "主",
+        sendShort: "發",
+        historyShort: "紀"
       },
       lang: {
         en: "EN",
-        zh: "中文"
+        zh: "中文",
+        ru: "RU"
       },
       api: {
         base: "API_BASE",
@@ -49,7 +68,11 @@ const resources = {
       },
       errors: {
         apiUnreachable: "無法連線 API",
-        apiNotFound: "API endpoint 不存在"
+        apiNotFound: "API endpoint 不存在",
+        networkError: "網路錯誤",
+        unexpected: "未預期的錯誤",
+        generic: "錯誤",
+        unknown: "未知錯誤"
       },
       home: {
         save: "儲存",
@@ -75,7 +98,11 @@ const resources = {
         defaultAddressSet: "預設地址已設定！",
         defaultAddressConfirmed: "已綁定 Telegram ✅",
         defaultSyncHint: "建立/匯入錢包後，請按「設為預設收款地址」綁定 Telegram。",
-        defaultSyncTelegramOnly: "請在 Telegram Mini App 內開啟錢包以綁定地址。"
+        defaultSyncTelegramOnly: "請在 Telegram Mini App 內開啟錢包以綁定地址。",
+        defaultSetFailed: "設定預設地址失敗",
+        telegramReopenTip: "設定已儲存，請關閉並重新開啟 Telegram Mini App 使其生效",
+        debugTitle: "除錯資訊",
+        hideDebug: "隱藏除錯"
       },
       send: {
         title: "發送（完整簽名流程）",
@@ -126,7 +153,15 @@ const resources = {
           recipientInvalid: "收款地址格式不正確",
           senderAddressMissing: "請先設定你的地址",
           senderAddressInvalid: "你的地址格式不正確",
-          telegramResolveBlocked: "對方尚未完成 Telegram 綁定，無法直接轉帳"
+          telegramResolveBlocked: "對方尚未完成 Telegram 綁定，無法直接轉帳",
+          requestCreateFailed: "建立請求失敗",
+          requestNetworkError: "建立請求時網路錯誤",
+          utxoLoading: "UTXO 資料仍在載入...",
+          utxoFetchFailed: "UTXO 取得失敗：{{error}}",
+          utxoEmpty: "沒有可用的 UTXO（餘額為 0 或 API 回傳空值）",
+          utxoIncomplete: "UTXO 資料不完整：偵測到 {{count}} 筆無效 UTXO（缺少 scriptHex/txid/vout）。請重新整理。",
+          txBuildMissingOutput: "建立交易失敗：輸出為空",
+          txBuildInvalidHex: "建立交易失敗：HEX 輸出無效"
         },
         tgTransfer: "發送給 Telegram 使用者",
         resolve: "解析",
@@ -138,11 +173,21 @@ const resources = {
         resolveAuthExpired: "Telegram 授權已過期，請關閉並重新開啟 Mini App。",
         resolveUnavailable: "解析服務暫時無法使用。",
         createRequest: "建立付款邀請",
-        requestLink: "請分享此連結給對方："
+        requestLink: "請分享此連結給對方：",
+        defaultMemo: "來自錢包的付款"
       },
       claim: {
         processing: "領取中...",
-        success: "領取成功！"
+        success: "領取成功！",
+        title: "領取付款",
+        missingId: "缺少請求 ID",
+        status: "狀態",
+        expires: "到期",
+        yourAddress: "你的收款地址",
+        button: "領取 PEPEW",
+        alreadyProcessed: "此請求已處理或已過期。",
+        fetchFailed: "取得請求失敗",
+        failed: "領取失敗"
       },
       history: {
         title: "紀錄",
@@ -157,7 +202,16 @@ const resources = {
         readFailed: "讀取失敗",
         confirmations: "確認數",
         utxosTitle: "UTXOs（進階）",
-        utxosEmpty: "沒有可用的 UTXO"
+        utxosEmpty: "沒有可用的 UTXO",
+        debug: {
+          historyLabel: "紀錄",
+          utxosLabel: "UTXOs",
+          lastRequestPath: "最後請求路徑",
+          lastRequestUrl: "最後請求 URL",
+          status: "狀態",
+          responseSnippet: "回應（前 200 字元）",
+          error: "錯誤"
+        }
       },
       mini: {
         title: "PEPEPOW Mini App",
@@ -166,7 +220,23 @@ const resources = {
         missingInitData: "缺少 Telegram initData",
         authFailed: "授權失敗",
         loggedIn: "已登入，可使用迷你錢包功能。",
-        tokenReady: "JWT 已取得"
+        tokenReady: "JWT 已取得",
+        routeLoaded: "[Mini 路由已載入]",
+        debugLabel: "除錯",
+        initDataHint: "偵測到 Telegram WebApp，但缺少 initData。請在 Telegram 手機版測試。"
+      },
+      pay: {
+        title: "付款",
+        linkInvalid: "連結無效。",
+        apiUnreachable: "無法連線 API。",
+        addressLabel: "地址",
+        amountLabel: "金額",
+        memoLabel: "備註"
+      },
+      errorBoundary: {
+        title: "發生錯誤",
+        description: "請重新整理頁面或稍後再試。",
+        reload: "重新整理"
       }
     }
   },
@@ -187,15 +257,26 @@ const resources = {
       hide: "Hide",
       dark: "Dark",
       light: "Light",
+      loading: "Loading...",
+      viewInExplorer: "View in Explorer",
+      header: {
+        wallet: "Wallet",
+        primaryNav: "Primary",
+        toggleTheme: "Toggle theme"
+      },
       nav: {
         home: "Home",
         send: "Send",
         history: "History",
-        mini: "Mini"
+        mini: "Mini",
+        homeShort: "H",
+        sendShort: "S",
+        historyShort: "Tx"
       },
       lang: {
         en: "EN",
-        zh: "中文"
+        zh: "中文",
+        ru: "RU"
       },
       api: {
         base: "API_BASE",
@@ -206,7 +287,11 @@ const resources = {
       },
       errors: {
         apiUnreachable: "Unable to reach API",
-        apiNotFound: "API endpoint not found"
+        apiNotFound: "API endpoint not found",
+        networkError: "Network error",
+        unexpected: "Unexpected error",
+        generic: "Error",
+        unknown: "Unknown error"
       },
       home: {
         save: "Save",
@@ -232,7 +317,11 @@ const resources = {
         defaultAddressSet: "Default address set!",
         defaultAddressConfirmed: "Linked to Telegram ✅",
         defaultSyncHint: "After creating/importing a wallet, tap Set as Default to link this address to Telegram.",
-        defaultSyncTelegramOnly: "Open this wallet in Telegram Mini App to link your address."
+        defaultSyncTelegramOnly: "Open this wallet in Telegram Mini App to link your address.",
+        defaultSetFailed: "Failed to set default",
+        telegramReopenTip: "Setting saved. Please close and reopen the Telegram Mini App to take effect.",
+        debugTitle: "Debug Info",
+        hideDebug: "Hide Debug"
       },
       send: {
         title: "Send (full signing flow)",
@@ -283,7 +372,15 @@ const resources = {
           recipientInvalid: "Recipient address is invalid",
           senderAddressMissing: "Your address is required",
           senderAddressInvalid: "Your address is invalid",
-          telegramResolveBlocked: "Telegram user has no linked address. Resolve or create a payment request."
+          telegramResolveBlocked: "Telegram user has no linked address. Resolve or create a payment request.",
+          requestCreateFailed: "Failed to create request",
+          requestNetworkError: "Network error creating request",
+          utxoLoading: "UTXO data is still loading...",
+          utxoFetchFailed: "UTXO fetch failed: {{error}}",
+          utxoEmpty: "No UTXOs available (Balance is 0 or API returned empty)",
+          utxoIncomplete: "UTXO data incomplete: {{count}} invalid UTXOs detected (missing scriptHex/txid/vout). Please refresh.",
+          txBuildMissingOutput: "Failed to build transaction: output is undefined",
+          txBuildInvalidHex: "Failed to build transaction: invalid hex output"
         },
         tgTransfer: "Send to Telegram User",
         resolve: "Resolve",
@@ -295,11 +392,21 @@ const resources = {
         resolveAuthExpired: "Telegram auth expired. Please close and reopen the Mini App.",
         resolveUnavailable: "Resolve service temporarily unavailable.",
         createRequest: "Create Payment Request",
-        requestLink: "Share this link with them:"
+        requestLink: "Share this link with them:",
+        defaultMemo: "Payment from Wallet"
       },
       claim: {
         processing: "Claiming...",
-        success: "Claimed successfully!"
+        success: "Claimed successfully!",
+        title: "Claim Payment",
+        missingId: "Missing Request ID",
+        status: "Status",
+        expires: "Expires",
+        yourAddress: "Your Receiving Address",
+        button: "Claim PEPEW",
+        alreadyProcessed: "This request has already been processed or expired.",
+        fetchFailed: "Failed to fetch request",
+        failed: "Claim failed"
       },
       history: {
         title: "History",
@@ -314,7 +421,16 @@ const resources = {
         readFailed: "Failed to load",
         confirmations: "Confirmations",
         utxosTitle: "UTXOs (Advanced)",
-        utxosEmpty: "No UTXOs available"
+        utxosEmpty: "No UTXOs available",
+        debug: {
+          historyLabel: "History",
+          utxosLabel: "UTXOs",
+          lastRequestPath: "Last request path",
+          lastRequestUrl: "Last request URL",
+          status: "Status",
+          responseSnippet: "Response (200 chars)",
+          error: "Error"
+        }
       },
       mini: {
         title: "PEPEPOW Mini App",
@@ -323,20 +439,49 @@ const resources = {
         missingInitData: "Missing Telegram initData",
         authFailed: "Authorization failed",
         loggedIn: "Logged in. Mini wallet ready.",
-        tokenReady: "JWT acquired"
+        tokenReady: "JWT acquired",
+        routeLoaded: "[Mini route loaded]",
+        debugLabel: "debug",
+        initDataHint: "Telegram WebApp detected but initData missing. Test on Telegram mobile app."
+      },
+      pay: {
+        title: "Payment",
+        linkInvalid: "Link invalid.",
+        apiUnreachable: "Unable to reach API.",
+        addressLabel: "Address",
+        amountLabel: "Amount",
+        memoLabel: "Memo"
+      },
+      errorBoundary: {
+        title: "Something went wrong",
+        description: "Please reload the page or try again later.",
+        reload: "Reload"
       }
     }
-  }
+  },
+  ru
 };
 
 const storedLang = typeof localStorage === "undefined" ? null : localStorage.getItem(LANG_STORAGE_KEY);
-const initialLang = normalizeLang(storedLang);
+const queryLang = resolveLang(
+  typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("lang")
+);
+const telegramLang = resolveLang(
+  typeof window === "undefined"
+    ? null
+    : (window as any)?.Telegram?.WebApp?.initDataUnsafe?.user?.language_code
+);
+const initialLang = queryLang ?? resolveLang(storedLang) ?? telegramLang ?? DEFAULT_LANG;
+
+if (queryLang && typeof localStorage !== "undefined") {
+  localStorage.setItem(LANG_STORAGE_KEY, queryLang);
+}
 
 i18n.use(initReactI18next).init({
   resources,
   lng: initialLang,
   fallbackLng: DEFAULT_LANG,
-  supportedLngs: ["en", "zh-TW"],
+  supportedLngs: SUPPORTED_LANGS,
   interpolation: { escapeValue: false }
 });
 
