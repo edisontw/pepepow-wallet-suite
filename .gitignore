@@ -50,3 +50,7 @@ certs/
 release_*/
 wallet.dat
 /tmp/rawtx.hex
+
+# SQLite WAL files
+*.db-wal
+*.db-shm

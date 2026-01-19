@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { apiFetch, API_BASE } from "../lib/api";
+import { apiFetch, API_BASE, API_ENDPOINTS } from "../lib/api";
 
 type ApiStatus = "checking" | "ok" | "fail";
 
@@ -12,7 +12,7 @@ export default function ApiStatusBar() {
     let active = true;
     const run = async () => {
       try {
-        const r = await apiFetch("/wallet/healthz");
+        const r = await apiFetch(API_ENDPOINTS.wallet.healthz);
         const j = await r.json().catch(() => ({}));
         if (!active) return;
         if (r.ok) {

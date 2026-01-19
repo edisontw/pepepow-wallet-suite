@@ -3,7 +3,7 @@ import { RPC } from '../rpc.js';
 
 function normalizeLimit(value: any) {
   const n = Number(value);
-  if (!Number.isFinite(n)) return 20;
+  if (!Number.isFinite(n)) return 10;
   return Math.min(Math.max(Math.floor(n), 1), 200);
 }
 
@@ -44,38 +44,53 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
       return { txs: [], source: 'pepew-api', error: error || 'address tx index unavailable' };
     }
 
-    const sliced = txids.slice(-limit).reverse();
+    const sliced = txids.slice(-10).reverse();
     const txs: Array<{
       txid: string;
       time: number | string | null;
       confirmations: number | null;
       valueIn: number | null;
       valueOut: number | null;
+      netAmount: number | null;
     }> = [];
 
-    for (const txid of sliced) {
-      try {
-        const tx = await RPC.getRawTransactionVerbose(txid);
-        const confirmations = typeof tx?.confirmations === 'number'
-          ? tx.confirmations
-          : (typeof tx?.blockheight === 'number' && height ? height - tx.blockheight + 1 : null);
-        const time = tx?.time ?? tx?.blocktime ?? null;
-        const valueOut = Array.isArray(tx?.vout)
-          ? Math.round(tx.vout.reduce((sum: number, v: any) => sum + (typeof v?.value === 'number' ? v.value : 0), 0) * 1e8)
-          : null;
+    // Safety timeout for the entire loop
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('History loop timeout')), 1500)
+    );
 
-        let valueIn: number | null = null;
-        if (Array.isArray(tx?.vin)) {
-          const hasVinValue = tx.vin.some((vin: any) => typeof vin?.value === 'number');
-          if (hasVinValue) {
-            valueIn = Math.round(tx.vin.reduce((sum: number, vin: any) => sum + (typeof vin?.value === 'number' ? vin.value : 0), 0) * 1e8);
+    try {
+      await Promise.race([
+        (async () => {
+          for (const txid of sliced) {
+            try {
+              const tx = await RPC.getRawTransactionVerbose(txid);
+              const confirmations = typeof tx?.confirmations === 'number'
+                ? tx.confirmations
+                : (typeof tx?.blockheight === 'number' && height ? height - tx.blockheight + 1 : null);
+              const time = tx?.time ?? tx?.blocktime ?? null;
+              const valueOut = Array.isArray(tx?.vout)
+                ? Math.round(tx.vout.reduce((sum: number, v: any) => sum + (typeof v?.value === 'number' ? v.value : 0), 0) * 1e8)
+                : null;
+
+              let valueIn: number | null = null;
+              if (Array.isArray(tx?.vin)) {
+                const hasVinValue = tx.vin.some((vin: any) => typeof vin?.value === 'number');
+                if (hasVinValue) {
+                  valueIn = Math.round(tx.vin.reduce((sum: number, vin: any) => sum + (typeof vin?.value === 'number' ? vin.value : 0), 0) * 1e8);
+                }
+              }
+
+              txs.push({ txid, time, confirmations, valueIn, valueOut, netAmount: null });
+            } catch {
+              txs.push({ txid, time: null, confirmations: null, valueIn: null, valueOut: null, netAmount: null });
+            }
           }
-        }
-
-        txs.push({ txid, time, confirmations, valueIn, valueOut });
-      } catch {
-        txs.push({ txid, time: null, confirmations: null, valueIn: null, valueOut: null });
-      }
+        })(),
+        timeoutPromise
+      ]);
+    } catch (err) {
+      console.warn(`[history] Partial response due to: ${err}`);
     }
 
     return { txs, source: 'pepew-api' };
@@ -105,43 +120,52 @@ export const historyRoutes: FastifyPluginAsync = async (app) => {
       return { txs: [], source: 'pepew-api', error: error || 'address tx index unavailable' };
     }
 
-    const sliced = txids.slice(-limit).reverse();
+    const sliced = txids.slice(-10).reverse();
     const txs: Array<{
       txid: string;
       time: number | string | null;
       confirmations: number | null;
       valueIn: number | null;
       valueOut: number | null;
+      netAmount: number | null;
     }> = [];
 
-    // Optimize: Fetch txs in parallel (with limit in real app, here simple Promise.all or similar)
-    // For now, sequential to avoid hammering RPC too hard unless we add concurrency control
-    // User requested RPC protection, so we should be careful. 
-    // We already keep the sequential loop from original code for safety, 
-    // but usually getting raw tx verbose is fast.
-    for (const txid of sliced) {
-      try {
-        const tx = await RPC.getRawTransactionVerbose(txid);
-        const confirmations = typeof tx?.confirmations === 'number'
-          ? tx.confirmations
-          : (typeof tx?.blockheight === 'number' && height ? height - tx.blockheight + 1 : null);
-        const time = tx?.time ?? tx?.blocktime ?? null;
-        const valueOut = Array.isArray(tx?.vout)
-          ? Math.round(tx.vout.reduce((sum: number, v: any) => sum + (typeof v?.value === 'number' ? v.value : 0), 0) * 1e8)
-          : null;
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('History loop timeout')), 1500)
+    );
 
-        let valueIn: number | null = null;
-        if (Array.isArray(tx?.vin)) {
-          const hasVinValue = tx.vin.some((vin: any) => typeof vin?.value === 'number');
-          if (hasVinValue) {
-            valueIn = Math.round(tx.vin.reduce((sum: number, vin: any) => sum + (typeof vin?.value === 'number' ? vin.value : 0), 0) * 1e8);
+    try {
+      await Promise.race([
+        (async () => {
+          for (const txid of sliced) {
+            try {
+              const tx = await RPC.getRawTransactionVerbose(txid);
+              const confirmations = typeof tx?.confirmations === 'number'
+                ? tx.confirmations
+                : (typeof tx?.blockheight === 'number' && height ? height - tx.blockheight + 1 : null);
+              const time = tx?.time ?? tx?.blocktime ?? null;
+              const valueOut = Array.isArray(tx?.vout)
+                ? Math.round(tx.vout.reduce((sum: number, v: any) => sum + (typeof v?.value === 'number' ? v.value : 0), 0) * 1e8)
+                : null;
+
+              let valueIn: number | null = null;
+              if (Array.isArray(tx?.vin)) {
+                const hasVinValue = tx.vin.some((vin: any) => typeof vin?.value === 'number');
+                if (hasVinValue) {
+                  valueIn = Math.round(tx.vin.reduce((sum: number, vin: any) => sum + (typeof vin?.value === 'number' ? vin.value : 0), 0) * 1e8);
+                }
+              }
+
+              txs.push({ txid, time, confirmations, valueIn, valueOut, netAmount: null });
+            } catch {
+              txs.push({ txid, time: null, confirmations: null, valueIn: null, valueOut: null, netAmount: null });
+            }
           }
-        }
-
-        txs.push({ txid, time, confirmations, valueIn, valueOut });
-      } catch {
-        txs.push({ txid, time: null, confirmations: null, valueIn: null, valueOut: null });
-      }
+        })(),
+        timeoutPromise
+      ]);
+    } catch (err) {
+      console.warn(`[history] Partial response due to: ${err}`);
     }
 
     return { txs, source: 'pepew-api' };

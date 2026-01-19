@@ -9,12 +9,14 @@ interface AppLayoutProps {
 }
 
 export default function AppLayout({ children, compact }: AppLayoutProps) {
-  const isTelegram = typeof window !== "undefined" && Boolean((window as any)?.Telegram?.WebApp);
+  const telegramWebApp = typeof window !== "undefined"
+    ? (window as any)?.Telegram?.WebApp
+    : undefined;
+  const isTelegram = Boolean(telegramWebApp?.initData);
   const isCompact = Boolean(compact || isTelegram);
 
   useEffect(() => {
-    const telegramWebApp = (window as any)?.Telegram?.WebApp;
-    if (!telegramWebApp) return;
+    if (!telegramWebApp?.initData) return;
     // Reserved for future Mini App UX integrations.
     // telegramWebApp.expand();
     // telegramWebApp.setHeaderColor("#0b0f14");

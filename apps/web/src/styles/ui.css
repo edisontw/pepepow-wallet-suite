@@ -524,13 +524,43 @@ textarea.input {
 
 .tx-row {
   display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
+  justify-content: space-between;
   align-items: center;
-  padding: 10px 12px;
-  border-radius: 12px;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.02);
+  transition: background 0.2s ease;
+}
+
+.tx-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.tx-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.tx-info code {
+  font-size: 0.95rem;
+  color: var(--accent);
+}
+
+.tx-amount {
+  font-family: var(--font-mono);
+  font-size: 1.05rem;
+  white-space: nowrap;
+}
+
+.tx-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .utxo-list {

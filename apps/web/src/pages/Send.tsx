@@ -1,21 +1,30 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Buffer } from "buffer";
 import { useTranslation } from "react-i18next";
-import { buildAndSignP2PKH, selectUtxos, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
-import { apiFetch, getApiUrl } from "../lib/api";
+import { addressToScript, buildAndSignP2PKH, selectUtxos, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
+import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS, withAddress } from "../lib/api";
 import { broadcastTx, fetchRawTx, TxApiError } from "../lib/tx";
 import { fmtPEPEWFromSats, satsToCoin } from "../lib/format";
+import { triggerRefresh } from "../lib/refresh";
+import { hasPendingSpendTxid, recordPendingSpend } from "../lib/pending";
+import { walletStore, WalletState } from "../lib/walletStore";
 import AppLayout from "../components/layout/AppLayout";
 import PageCard from "../components/layout/PageCard";
 
-type U = { txid: string; vout: number; amount: number; };
+type U = { txid: string; vout: number; valueSats: number; scriptHex: string; };
 
 const DEFAULT_PATH = "m/44'/5'/0'/0/0";
 const COIN_MULTIPLIER = 100000000n;
 const MIN_SEND_SATS = 100000000;
+const DUST_THRESHOLD_SATS = 546;
 const FEE_FALLBACK = "0.0001";
 const RECENT_RECIPIENTS_KEY = "pepew_recentRecipients";
 const MAX_RECENT_RECIPIENTS = 6;
+const SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
+const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g;
+const LAST_RAWTX_KEY = "pepew_last_broadcast";
+const LAST_RAWTX_TTL_MS = 2 * 60 * 1000;
 
 function parseCoinToSats(value: string) {
   const trimmed = value.trim();
@@ -54,25 +63,139 @@ function loadRecentRecipients() {
   }
 }
 
+function normalizeAddressInput(value: string) {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const withoutZeroWidth = trimmed.replace(ZERO_WIDTH_RE, "");
+  const withoutScheme = withoutZeroWidth
+    .replace(/^(pepepow|pepew):\/\//i, "")
+    .replace(/^(pepepow|pepew):/i, "");
+  const withoutQuery = withoutScheme.split("?")[0] || "";
+  return withoutQuery.trim();
+}
+
+function hexToBytes(hex: string) {
+  if (!hex || typeof hex !== "string") return null;
+  if (hex.length % 2 !== 0) return null;
+  if (!/^[0-9a-fA-F]*$/.test(hex)) return null;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = hex.slice(i * 2, i * 2 + 2);
+    bytes[i] = Number.parseInt(byte, 16);
+  }
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256HexFromHexString(hex: string) {
+  if (typeof crypto?.subtle === "undefined") return null;
+  const bytes = hexToBytes(hex);
+  if (!bytes) return null;
+  const hashBuffer = await crypto.subtle.digest("SHA-256", bytes);
+  return bytesToHex(new Uint8Array(hashBuffer));
+}
+
+async function computeTxidFromRawTx(rawTx: string) {
+  if (typeof crypto?.subtle === "undefined") return null;
+  const bytes = hexToBytes(rawTx);
+  if (!bytes) return null;
+  try {
+    const hash1 = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    const hash2 = new Uint8Array(await crypto.subtle.digest("SHA-256", hash1));
+    return bytesToHex(new Uint8Array(Array.from(hash2).reverse()));
+  } catch {
+    return null;
+  }
+}
+
+type LastBroadcastCache = {
+  hash: string;
+  ts: number;
+  txid?: string;
+};
+
+function loadLastBroadcastCache(now = Date.now()): LastBroadcastCache | null {
+  if (typeof localStorage === "undefined") return null;
+  const raw = localStorage.getItem(LAST_RAWTX_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.hash !== "string" || typeof parsed.ts !== "number") return null;
+    if (now - parsed.ts > LAST_RAWTX_TTL_MS) {
+      localStorage.removeItem(LAST_RAWTX_KEY);
+      return null;
+    }
+    return parsed as LastBroadcastCache;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastBroadcastCache(entry: LastBroadcastCache) {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(LAST_RAWTX_KEY, JSON.stringify(entry));
+}
+
 export default function Send() {
   const { t } = useTranslation();
+  const [searchParams] = useSearchParams();
   const [address, setAddress] = useState(localStorage.getItem("pepew_address") || "");
-  const [to, setTo] = useState("");
-  const [amount, setAmount] = useState("");
+  const [to, setTo] = useState(searchParams.get("to") || "");
+  const [amount, setAmount] = useState(searchParams.get("amount") || "");
   const [fee, setFee] = useState("");
   const [subtractFee, setSubtractFee] = useState(false);
   const [mnemo] = useState(localStorage.getItem("pepew_mnemonic") || "");
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [utxos, setUtxos] = useState<U[]>([]);
-  const [utxoError, setUtxoError] = useState<string | null>(null);
+  const [sendLocked, setSendLocked] = useState(false);
+  const [lastTxid, setLastTxid] = useState<string | null>(null);
+  const [sendStatusNote, setSendStatusNote] = useState<string | null>(null);
+  const [copiedTxid, setCopiedTxid] = useState<string | null>(null);
+  const [tgUserQuery, setTgUserQuery] = useState(searchParams.get("to") || "");
+  const [resolveStatus, setResolveStatus] = useState<"idle" | "loading" | "ok" | "not_started" | "not_found" | "error">("idle");
+  const [resolveMessage, setResolveMessage] = useState<string | null>(null);
+  const [resolveResult, setResolveResult] = useState<{
+    ok: boolean;
+    resolved: boolean;
+    address?: string;
+    reason?: "user_not_found" | "no_default_address" | "invalid_default_address";
+  } | null>(null);
+  const [requestUrl, setRequestUrl] = useState<string | null>(null);
+  const [requestLoading, setRequestLoading] = useState(false);
   const [feeEstimate, setFeeEstimate] = useState<string | null>(null);
   const [feeEstimateSource, setFeeEstimateSource] = useState<string | null>(null);
   const [feeEstimateError, setFeeEstimateError] = useState<string | null>(null);
   const [feeNotice, setFeeNotice] = useState<string | null>(null);
   const [feeTouched, setFeeTouched] = useState(false);
   const [recentRecipients, setRecentRecipients] = useState<string[]>(loadRecentRecipients());
+  const [sendAttempted, setSendAttempted] = useState(false);
+  const [walletState, setWalletState] = useState<WalletState>(walletStore.getState());
+  const resolveSeq = useRef(0);
+  const mountedRef = useRef(true);
+  const sendInFlightRef = useRef(false);
+  const lastSuccessSnapshotRef = useRef<{
+    to: string;
+    amount: string;
+    fee: string;
+    subtractFee: boolean;
+    address: string;
+  } | null>(null);
+  const normalizedTo = useMemo(() => normalizeAddressInput(to), [to]);
+  const normalizedAddress = useMemo(() => normalizeAddressInput(address), [address]);
+
+  useEffect(() => {
+    return walletStore.subscribe(setWalletState);
+  }, []);
+
+  useEffect(() => {
+    walletStore.setAddress(address);
+  }, [address]);
 
   useEffect(() => {
     if (typeof localStorage === "undefined") return;
@@ -80,61 +203,29 @@ export default function Send() {
   }, [recentRecipients]);
 
   useEffect(() => {
-    let active = true;
-    const run = async () => {
-      if (!address) return;
-      setUtxoError(null);
-      const path = `/wallet/utxos?address=${encodeURIComponent(address)}`;
-      const url = getApiUrl(path);
-      console.info("[send] utxos request", { address, url });
-      try {
-        const r = await apiFetch(path);
-        const data = await r.json().catch(() => null);
-        if (!active) return;
-        console.info("[send] utxos response", {
-          status: r.status,
-          statusText: r.statusText,
-          error: data?.error,
-        });
-        if (!r.ok) {
-          setUtxos([]);
-          const statusLabel = `HTTP ${r.status}${r.statusText ? ` ${r.statusText}` : ""}`;
-          const detail = typeof data?.error === "string"
-            ? data.error
-            : typeof data?.message === "string"
-              ? data.message
-              : typeof data === "string"
-                ? data
-                : statusLabel;
-          setUtxoError(`${t("send.errors.utxoApiError")}: ${detail}`);
-          return;
-        }
-        const rawUtxos = Array.isArray(data) ? data : Array.isArray(data?.utxos) ? data.utxos : [];
-        const mapped = rawUtxos.map((u: any) => ({
-          txid: u.txid || u.txId || u.tx,
-          vout: Number(u.vout ?? u.n ?? u.outputIndex ?? u.output_index),
-          amount: Number(u.satoshis ?? u.amount ?? u.value),
-        })).filter((u: any) =>
-          u.txid && Number.isFinite(u.vout) && Number.isFinite(u.amount)
-        );
-        const availableSats = mapped.reduce((sum: number, u: U) => sum + Number(u.amount || 0), 0);
-        const availableCoins = availableSats / 1e8;
-        console.info("[send] utxos parsed", { count: mapped.length, availableSats, availableCoins });
-        setUtxos(mapped);
-      } catch (err) {
-        if (active) {
-          console.warn("[send] utxos fetch failed", err);
-          setUtxos([]);
-          setUtxoError(t("errors.apiUnreachable"));
-        }
-      }
-    };
-
-    void run();
+    mountedRef.current = true;
     return () => {
-      active = false;
+      mountedRef.current = false;
     };
-  }, [address, t]);
+  }, []);
+
+  useEffect(() => {
+    if (!sendLocked) return;
+    const snapshot = lastSuccessSnapshotRef.current;
+    if (!snapshot) return;
+    if (snapshot.to !== to
+      || snapshot.amount !== amount
+      || snapshot.fee !== fee
+      || snapshot.subtractFee !== subtractFee
+      || snapshot.address !== address) {
+      setSendLocked(false);
+      setResult(null);
+      setLastTxid(null);
+      setSendStatusNote(null);
+      setErr(null);
+    }
+  }, [sendLocked, to, amount, fee, subtractFee, address]);
+
 
   useEffect(() => {
     let active = true;
@@ -142,7 +233,7 @@ export default function Send() {
       setFeeEstimateError(null);
       setFeeNotice(null);
       try {
-        const r = await apiFetch("/wallet/fee/estimate");
+        const r = await apiFetch(API_ENDPOINTS.wallet.feeEstimate);
         const j = await r.json().catch(() => ({}));
         if (!active) return;
         if (!r.ok) {
@@ -197,7 +288,174 @@ export default function Send() {
     setRecentRecipients((prev) => prev.filter((item) => item !== addr));
   };
 
-  const availableSats = utxos.reduce((sum, u) => sum + Number(u.amount || 0), 0);
+  const resolveUser = useCallback(async (query: string) => {
+    const isId = /^\d+$/.test(query);
+    const params = new URLSearchParams();
+    if (isId) {
+      params.append("toTgUserId", query);
+    } else {
+      params.append("username", query.replace(/^@/, ""));
+    }
+    const r = await apiFetch(API_ENDPOINTS.v1.resolve(params));
+    const payload = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, payload };
+  }, []);
+
+  const runResolve = useCallback(async (query: string) => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setResolveStatus("idle");
+      setResolveMessage(null);
+      setResolveResult(null);
+      return;
+    }
+    const debug = new URLSearchParams(window.location.search).get("debug") === "1";
+    const seq = resolveSeq.current + 1;
+    resolveSeq.current = seq;
+    setResolveStatus("loading");
+    setResolveMessage(null);
+    setResolveResult(null);
+    setErr(null);
+
+    try {
+      if (debug) console.info(`[send] resolve request for ${trimmed}`);
+      const res = await resolveUser(trimmed);
+      if (resolveSeq.current !== seq) return;
+      if (debug) console.info(`[send] resolve response`, { status: res.status, payload: res.payload });
+
+      if (res.status === 401) {
+        setResolveStatus("error");
+        setResolveMessage(t("send.resolveAuthExpired"));
+        return;
+      }
+      if (res.status === 429 || res.status >= 500) {
+        setResolveStatus("error");
+        setResolveMessage(t("send.resolveUnavailable"));
+        return;
+      }
+
+      if (!res.ok) {
+        const code = typeof res.payload?.error === "string"
+          ? res.payload.error
+          : typeof res.payload?.code === "string"
+            ? res.payload.code
+            : "";
+        if (String(code).toUpperCase() === "NOT_STARTED") {
+          setResolveStatus("not_started");
+          setResolveMessage(t("send.tgUserNotFound"));
+        } else {
+          setResolveStatus("not_found");
+          setResolveMessage(t("send.resolveNotFound"));
+        }
+        return;
+      }
+
+      const payload = res.payload;
+      if (payload?.ok === false) {
+        const code = typeof payload?.error === "string"
+          ? payload.error
+          : typeof payload?.code === "string"
+            ? payload.code
+            : "";
+        if (String(code).toUpperCase() === "NOT_STARTED") {
+          setResolveStatus("not_started");
+          setResolveMessage(t("send.tgUserNotFound"));
+        } else {
+          setResolveStatus("not_found");
+          setResolveMessage(t("send.resolveNotFound"));
+        }
+        return;
+      }
+
+      setResolveResult(payload);
+      if (payload?.resolved && payload?.address) {
+        setResolveStatus("ok");
+        setResolveMessage(null);
+        setTo(payload.address);
+        return;
+      }
+
+      if (payload?.reason === "user_not_found") {
+        setResolveStatus("not_started");
+        setResolveMessage(t("send.tgUserNotFound"));
+      } else if (payload?.reason === "no_default_address") {
+        setResolveStatus("not_found");
+        setResolveMessage(t("send.tgNoDefaultAddress"));
+      } else if (payload?.reason === "invalid_default_address") {
+        setResolveStatus("not_found");
+        setResolveMessage(t("send.tgInvalidDefaultAddress"));
+      } else {
+        setResolveStatus("not_found");
+        setResolveMessage(t("send.resolveNotFound"));
+      }
+    } catch (e: any) {
+      if (resolveSeq.current !== seq) return;
+      if (debug) console.error(`[send] resolve error`, e);
+      setResolveStatus("error");
+      setResolveMessage(t("send.resolveUnavailable"));
+    }
+  }, [resolveUser, t]);
+
+  const handleResolve = () => {
+    void runResolve(tgUserQuery);
+  };
+
+  const isTelegram = !!(window as any).Telegram?.WebApp?.initData;
+
+  useEffect(() => {
+    if (!isTelegram) return;
+    const initialTo = searchParams.get("to");
+    if (initialTo && !to) {
+      void runResolve(initialTo);
+    }
+  }, [isTelegram, runResolve, searchParams, to]);
+
+  useEffect(() => {
+    if (!isTelegram) return;
+    const query = tgUserQuery.trim();
+    if (!query) {
+      setResolveStatus("idle");
+      setResolveMessage(null);
+      setResolveResult(null);
+      return;
+    }
+    setResolveStatus("loading");
+    setResolveMessage(null);
+    setResolveResult(null);
+    const timer = window.setTimeout(() => {
+      void runResolve(query);
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [isTelegram, runResolve, tgUserQuery]);
+
+  const handleCreateRequest = async () => {
+    const query = tgUserQuery.trim();
+    if (!query) return;
+    setRequestLoading(true);
+    setRequestUrl(null);
+    try {
+      const isId = /^\d+$/.test(query);
+      const res = await apiCreatePaymentRequest({
+        toTgUserId: isId ? query : "",
+        toUsername: isId ? "" : query.replace(/^@/, ""),
+        amountSats: amountSats || undefined,
+        memo: "Payment from Wallet",
+      });
+      if (res.ok) {
+        const urlBase = window.location.origin;
+        const link = `${urlBase}/?requestId=${res.requestId}`;
+        setRequestUrl(link);
+      } else {
+        setErr(res.error || "Failed to create request");
+      }
+    } catch {
+      setErr("Network error creating request");
+    } finally {
+      setRequestLoading(false);
+    }
+  };
+
+  const availableSats = walletStore.getDisplayBalance() ?? 0;
   const amountSats = parseCoinToSats(amount);
   const feeSats = parseCoinToSats(fee);
   const amountValid = amountSats !== null;
@@ -214,6 +472,46 @@ export default function Send() {
     : null;
   const overBalance = totalSats !== null && totalSats > availableSats;
   const invalidRecipient = recipientSats !== null && recipientSats <= 0;
+  const debugEnabled = import.meta.env.DEV || (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debug") === "1");
+  const networkMeta = {
+    pubKeyHash: PEPEPOW.pubKeyHash,
+    scriptHash: PEPEPOW.scriptHash,
+    bech32: PEPEPOW.bech32,
+    wif: PEPEPOW.wif
+  };
+
+  const validateAddressInput = (input: string) => {
+    const trimmed = input.trim();
+    if (!trimmed) return { ok: false as const, reason: "missing" as const };
+    try {
+      const info = addressToScript(trimmed, PEPEPOW);
+      return { ok: true as const, info };
+    } catch (e: any) {
+      return { ok: false as const, reason: "invalid" as const, error: e?.message || String(e) };
+    }
+  };
+
+  const recipientValidation = useMemo(() => validateAddressInput(normalizedTo), [normalizedTo]);
+  const changeValidation = useMemo(() => validateAddressInput(normalizedAddress), [normalizedAddress]);
+  const recipientAddressError = (sendAttempted || to.trim())
+    ? recipientValidation.ok
+      ? null
+      : recipientValidation.reason === "missing"
+        ? t("send.errors.recipientMissing")
+        : t("send.errors.recipientInvalid")
+    : null;
+  const changeAddressError = (sendAttempted || address.trim())
+    ? changeValidation.ok
+      ? null
+      : changeValidation.reason === "missing"
+        ? t("send.errors.senderAddressMissing")
+        : t("send.errors.senderAddressInvalid")
+    : null;
+  const resolveBlocked = isTelegram
+    && tgUserQuery.trim().length > 0
+    && !to
+    && (resolveStatus === "not_started" || resolveStatus === "not_found" || resolveStatus === "error");
+  const addressInvalid = !recipientValidation.ok || !changeValidation.ok;
 
   const balanceLabel = fmtPEPEWFromSats(address ? availableSats : null);
   const feeLabel = feeValid ? fmtPEPEWFromSats(feeSats) : fmtPEPEWFromSats(null);
@@ -227,11 +525,103 @@ export default function Send() {
     setAmount(formatSatsInput(maxSats));
   };
 
-  async function doSend() {
+  const resetSendState = () => {
+    setSendLocked(false);
+    setResult(null);
+    setLastTxid(null);
+    setSendStatusNote(null);
+    setErr(null);
+    setSendAttempted(false);
+    setTo("");
+    setAmount("");
+    setSubtractFee(false);
+    setFeeTouched(false);
+    setFee(feeEstimate || "");
+    setTgUserQuery("");
+    setResolveStatus("idle");
+    setResolveMessage(null);
+    setResolveResult(null);
+    setRequestUrl(null);
+  };
+
+  const copyTxid = async (txid: string) => {
+    if (!txid) return;
     try {
+      await navigator.clipboard.writeText(txid);
+      setCopiedTxid(txid);
+      setTimeout(() => setCopiedTxid(null), 1400);
+    } catch {
+      setCopiedTxid(null);
+    }
+  };
+
+
+  const mapBroadcastError = (detail?: string) => {
+    if (!detail) return null;
+    const message = detail.toLowerCase();
+    if (message.includes("dust")) {
+      return t("send.errors.amountDust");
+    }
+    if (message.includes("fee too low")
+      || message.includes("insufficient fee")
+      || message.includes("min relay fee")
+      || message.includes("mempool min fee")
+      || message.includes("min relay tx fee")) {
+      return t("send.errors.feeTooLow");
+    }
+    if (message.includes("insufficient funds")
+      || message.includes("insufficient balance")
+      || message.includes("bad-txns-in-belowout")
+      || message.includes("value out of range")
+      || message.includes("negative")) {
+      return t("send.errors.insufficientBalance");
+    }
+    if (message.includes("missing inputs")
+      || message.includes("inputs missing")
+      || message.includes("missing-inputs")
+      || message.includes("already spent")) {
+      return t("send.errors.utxoPending");
+    }
+    return null;
+  };
+
+  async function doSend() {
+    if (sendLocked) {
+      setSendStatusNote(t("send.alreadyBroadcast"));
+      return;
+    }
+    if (sendInFlightRef.current) return;
+    sendInFlightRef.current = true;
+    try {
+      setSendAttempted(true);
       setSending(true);
       setErr(null);
       setResult(null);
+      setLastTxid(null);
+      setSendStatusNote(null);
+
+      // 3️⃣ 加一道防呆：確保沒有 UTXO 時不會進到組交易邏輯
+      const st = walletStore.getState();
+      const utxosForCheck = st.utxos;
+      if (!utxosForCheck || utxosForCheck.length === 0) {
+        if (st.status === "loading") {
+          setErr("UTXO data is still loading...");
+        } else if (st.status === "error") {
+          setErr(`UTXO fetch failed: ${st.rawUtxoSumError || st.error || "Unknown error"}`);
+        } else {
+          setErr("No UTXOs available (Balance is 0 or API returned empty)");
+        }
+        setSending(false);
+        return;
+      }
+
+      const invalidUtxos = utxosForCheck.filter(u => u.invalid);
+      if (invalidUtxos.length > 0) {
+        setErr(`UTXO data incomplete: ${invalidUtxos.length} invalid UTXOs detected (missing scriptHex/txid/vout). Please refresh.`);
+        setSending(false);
+        return;
+      }
+
       const trimmedMnemonic = mnemo.trim();
       if (!trimmedMnemonic) {
         setErr(t("send.errors.mnemonicMissing"));
@@ -252,59 +642,265 @@ export default function Send() {
         setErr(t("send.errors.amountUnderFee"));
         return;
       }
+      if (recipientSats < DUST_THRESHOLD_SATS) {
+        setErr(t("send.errors.amountDust"));
+        return;
+      }
       if (recipientSats < MIN_SEND_SATS) {
         setErr(t("send.errors.amountTooLow", { min: 1 }));
         return;
       }
       const totalSats = subtractFee ? amountSats : amountSats + feeSats;
-      const availableSats = utxos.reduce((sum, u) => sum + Number(u.amount || 0), 0);
-      if (totalSats > availableSats) {
-        setErr(t("send.errors.insufficientBalance"));
+      const usableUtxos = walletStore.getState().utxos;
+      const availSatsRaw = usableUtxos.reduce((sum, u) => sum + Number(u.valueSats || 0), 0);
+      const sendTo = normalizeAddressInput(to);
+      const sendFrom = normalizeAddressInput(address);
+      if (!sendTo) {
+        setErr(t("send.errors.recipientMissing"));
+        return;
+      }
+      if (!sendFrom) {
+        setErr(t("send.errors.senderAddressMissing"));
+        return;
+      }
+      if (!recipientValidation.ok) {
+        setErr(recipientValidation.reason === "missing"
+          ? t("send.errors.recipientMissing")
+          : t("send.errors.recipientInvalid"));
+        return;
+      }
+      if (!changeValidation.ok) {
+        setErr(changeValidation.reason === "missing"
+          ? t("send.errors.senderAddressMissing")
+          : t("send.errors.senderAddressInvalid"));
+        return;
+      }
+      if (resolveBlocked) {
+        setErr(t("send.errors.telegramResolveBlocked"));
         return;
       }
       const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
       const target = totalSats;
-      const chosen = utxos.map(u => ({ txid: u.txid, vout: u.vout, value: Number(u.amount) }));
-      const { picked } = selectUtxos(chosen as any, target);
+      const chosen = usableUtxos.map(u => ({
+        txid: u.txid,
+        vout: u.vout,
+        value: Number(u.valueSats),
+        amount: Number(u.valueSats),
+        scriptPubKey: u.scriptHex
+      }));
+      const { picked, total } = selectUtxos(chosen as any, target);
       if (!picked?.length) {
         setErr(t("send.errors.insufficientUtxo"));
         return;
       }
+      const totalIn = Number(total);
+      let changeSats = totalIn - recipientSats - feeSats;
+      if (changeSats < 0) {
+        setErr(t("send.errors.insufficientBalance"));
+        return;
+      }
+      let effectiveFeeSats = feeSats;
+      if (changeSats > 0 && changeSats < DUST_THRESHOLD_SATS) {
+        effectiveFeeSats += changeSats;
+        changeSats = 0;
+      }
+      let toScriptHex = "";
+      let toScriptLen = 0;
+      try {
+        const info = addressToScript(sendTo, PEPEPOW);
+        toScriptHex = info.script.toString("hex");
+        toScriptLen = info.script.length;
+      } catch (e: any) {
+        console.warn("[send] toScript failed", { error: e?.message || String(e), toAddress: sendTo });
+      }
+
+      console.info("[SEND_ASSERT]", {
+        fromAddress: sendFrom,
+        toAddress: sendTo,
+        recipientSats,
+        feeSats,
+        effectiveFeeSats,
+        totalInSats: totalIn,
+        changeSats,
+        utxoCount: picked.length,
+        utxos: picked.map(u => ({
+          txid: u.txid,
+          vout: u.vout,
+          value: u.value,
+          scriptHex: u.scriptPubKey || (u as any).scriptHex || "MISSING"
+        }))
+      });
 
       const inputs = [];
       for (const u of picked) {
+        // buildAndSignP2PKH requires nonWitnessUtxo (full raw tx) as hex string
+        // We must fetch the raw transaction for each UTXO
+        if (!u.txid || u.vout === undefined || (!u.amount && !u.value)) {
+          console.error("[SEND_ASSERT] Invalid UTXO structure", u);
+          throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
+        }
+
         try {
+          if (debugEnabled) console.info("[send] fetching raw tx for signing", u.txid);
           const hex = await fetchRawTx(u.txid);
-          inputs.push({ ...u, nonWitnessUtxo: Buffer.from(hex, "hex") });
+          if (!hex || typeof hex !== "string" || hex.length === 0) {
+            throw new Error(`fetchRawTx returned empty for ${u.txid}`);
+          }
+          // Pass hex string directly, NOT Buffer - buildAndSignP2PKH will convert it
+          inputs.push({
+            txid: u.txid,
+            vout: u.vout,
+            value: Number(u.amount || u.value),
+            nonWitnessUtxo: hex  // hex string, not Buffer
+          });
         } catch (e: any) {
+          console.error("[SEND_ASSERT] fetchRawTx failed", { txid: u.txid, error: e.message });
           if (e instanceof TxApiError && e.status === 404) {
             setErr(t("send.errors.txRawNotFound", { txid: u.txid }));
-          } else if (e instanceof TxApiError && e.detail) {
-            setErr(`${t("send.errors.txRawFailed", { txid: u.txid })}: ${e.detail}`);
           } else {
-            setErr(t("send.errors.txRawFailed", { txid: u.txid }));
+            setErr(`${t("send.errors.txRawFailed", { txid: u.txid })}: ${e.message || String(e)}`);
           }
           return;
         }
+      }
+
+      if (debugEnabled) {
+        const inspect = (label: string, addr: string) => {
+          try {
+            const info = addressToScript(addr, PEPEPOW);
+            console.info("[send] address script", {
+              label,
+              address: addr,
+              type: info.type,
+              scriptHex: info.script.toString("hex"),
+            });
+          } catch (e: any) {
+            console.warn("[send] address script failed", { label, address: addr, error: e?.message });
+          }
+        };
+        inspect("recipient", sendTo);
+        inspect("change", sendFrom);
       }
 
       const raw = buildAndSignP2PKH({
         network: PEPEPOW,
         utxos: inputs as any,
         wif,
-        to,
+        to: sendTo,
         amount: recipientSats,
-        changeAddress: address,
-        fee: feeSats
+        changeAddress: sendFrom,
+        fee: effectiveFeeSats
       });
+
+      if (!raw) {
+        console.error("[SEND_ASSERT] buildAndSignP2PKH returned empty/undefined");
+        setErr("Failed to build transaction: output is undefined");
+        return;
+      }
+      if (typeof raw !== "string" || raw.length < 20) {
+        console.error("[SEND_ASSERT] invalid raw tx hex", { raw });
+        setErr("Failed to build transaction: invalid hex output");
+        return;
+      }
+
+      const rawTxLen = raw.length;
+      const rawTxHash = raw ? await sha256HexFromHexString(raw) : null;
+      const rawTxHash16 = rawTxHash ? rawTxHash.slice(0, 16) : "n/a";
+      const localTxid = await computeTxidFromRawTx(raw);
+      console.info("[send] raw tx result", { rawTxLen, rawTxHash16, localTxid });
+
+      const cached = loadLastBroadcastCache();
+      const cachedMatch = !!cached
+        && ((rawTxHash && cached.hash === rawTxHash)
+          || (localTxid && cached.txid === localTxid));
+      const pendingMatch = localTxid ? hasPendingSpendTxid(localTxid) : false;
+
+      if (pendingMatch || cachedMatch) {
+        const txidToShow = localTxid || cached?.txid || null;
+        if (txidToShow) {
+          setResult(txidToShow);
+          setLastTxid(txidToShow);
+        }
+        setSendStatusNote(t("send.alreadyBroadcast"));
+        setSendLocked(true);
+        lastSuccessSnapshotRef.current = {
+          to,
+          amount,
+          fee,
+          subtractFee,
+          address
+        };
+        return;
+      }
 
       try {
         const j = await broadcastTx(raw);
-        setResult(j.result || j.txid || JSON.stringify(j));
-        addRecentRecipient(to);
+        const txid = j.result || j.txid;
+        const txidString = typeof txid === "string" ? txid : (localTxid || null);
+        setResult(txidString || JSON.stringify(j));
+        setLastTxid(txidString);
+        setSendLocked(true);
+        setSendStatusNote(null);
+        lastSuccessSnapshotRef.current = {
+          to,
+          amount,
+          fee,
+          subtractFee,
+          address
+        };
+        if (txidString) {
+          saveLastBroadcastCache({
+            hash: rawTxHash || "",
+            ts: Date.now(),
+            txid: txidString
+          });
+        }
+        addRecentRecipient(sendTo);
+        const spendSats = recipientSats + effectiveFeeSats;
+        const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
+
+        if (alreadyPending) {
+          setSendStatusNote(t("send.alreadyBroadcast"));
+        }
+
+        if (debugEnabled) {
+          console.log("[Send] TX Success Debug:", {
+            oldSpendableSats: availableSats,
+            sendAmountSats: recipientSats,
+            feeSats: effectiveFeeSats,
+            optimisticDeltaSats: spendSats,
+            newSpendableSatsOptimistic: availableSats - spendSats,
+            lastBroadcastTxid: txid
+          });
+        }
+
+        if (!alreadyPending && Number.isFinite(spendSats) && spendSats > 0) {
+          walletStore.applyOptimistic(spendSats);
+          recordPendingSpend({
+            address: sendFrom,
+            sats: spendSats,
+            txid: txidString || undefined,
+            balanceBeforeSats: Number.isFinite(availableSats) ? availableSats : undefined
+          });
+        }
+        const spentOutpoints = picked
+          .map((u) => `${u.txid}:${u.vout}`)
+          .filter((key) => key && !key.endsWith(":undefined"));
+        // walletStore.markSpentOutpoints(spentOutpoints); // DISABLED to avoid double-deduction
+        if (!alreadyPending) {
+          triggerRefresh({ reason: "send", txid: txidString || undefined });
+          walletStore.scheduleRefresh();
+        }
       } catch (e: any) {
-        if (e instanceof TxApiError && e.detail) {
-          setErr(e.detail);
+        if (e instanceof TxApiError) {
+          const mapped = mapBroadcastError(e.detail);
+          if (mapped) {
+            setErr(mapped);
+          } else if (e.detail) {
+            setErr(e.detail);
+          } else {
+            setErr(t("send.errors.broadcastFailed"));
+          }
         } else {
           setErr(t("send.errors.broadcastFailed"));
         }
@@ -313,6 +909,7 @@ export default function Send() {
     } catch (e: any) {
       setErr(String(e.message || e));
     } finally {
+      sendInFlightRef.current = false;
       setSending(false);
     }
   }
@@ -326,6 +923,7 @@ export default function Send() {
             <input className="input" value={address} onChange={e => setAddress(e.target.value)} placeholder="PMXw..." />
             <button className="btn secondary" onClick={() => localStorage.setItem('pepew_address', address)}>{t("send.saveAddress")}</button>
           </div>
+          {changeAddressError && <div className="error" style={{ marginTop: 6 }}>{changeAddressError}</div>}
         </div>
 
         <div className="card">
@@ -339,6 +937,7 @@ export default function Send() {
                 placeholder="P..."
                 autoComplete="off"
               />
+              {recipientAddressError && <div className="error" style={{ marginTop: 6 }}>{recipientAddressError}</div>}
               <div style={{ marginTop: 10 }}>
                 <div className="muted">{t("send.recentRecipients")}</div>
                 {recentRecipients.length ? (
@@ -358,7 +957,7 @@ export default function Send() {
               </div>
             </div>
             <div>
-              <label className="field-label">{t("send.amountLabel")}</label>
+              <label className="field-label" style={{ marginTop: 16 }}>{t("send.amountLabel")}</label>
               <div className="row">
                 <input
                   className="input"
@@ -387,12 +986,49 @@ export default function Send() {
               </label>
             </div>
           </div>
+
+          {isTelegram && (
+            <div className="card" style={{ marginTop: 20 }}>
+              <label className="field-label">{t("send.tgTransfer") || "Send to Telegram User"}</label>
+              <div className="row">
+                <input
+                  className="input"
+                  value={tgUserQuery}
+                  onChange={e => setTgUserQuery(e.target.value)}
+                  placeholder="@username or ID"
+                />
+                <button className="btn secondary" onClick={handleResolve} disabled={resolveStatus === "loading" || !tgUserQuery.trim()}>
+                  {resolveStatus === "loading" ? "..." : t("send.resolve") || "Resolve"}
+                </button>
+              </div>
+              {resolveMessage && (
+                <div style={{ marginTop: 8 }}>
+                  <small className={resolveStatus === "error" ? "error" : "muted"}>
+                    {resolveMessage}
+                  </small>
+                  {resolveResult && !resolveResult.resolved && (
+                    <button className="btn ghost" style={{ marginLeft: 8 }} onClick={handleCreateRequest} disabled={requestLoading}>
+                      {requestLoading ? "..." : t("send.createRequest") || "Create Payment Request"}
+                    </button>
+                  )}
+                </div>
+              )}
+              {requestUrl && (
+                <div className="card" style={{ marginTop: 8, padding: 8, fontSize: '0.9em' }}>
+                  <div className="muted">{t("send.requestLink") || "Share this link with them:"}</div>
+                  <div style={{ wordBreak: 'break-all', marginTop: 4 }}>
+                    <a href={requestUrl} target="_blank" rel="noreferrer">{requestUrl}</a>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           <div className="note" style={{ marginTop: 10 }}>
             <div>{t("send.feeEstimate")} {feeEstimateLabel}</div>
             {feeEstimateSource && <div>{t("send.sourceLabel")}: {feeEstimateSource}</div>}
             {feeEstimateError && <div className="error">{feeEstimateError}</div>}
             {feeNotice && <div className="muted">{feeNotice}</div>}
-            {utxoError && <div className="error">{utxoError}</div>}
+            {walletState.error && <div className="error">{walletState.error}</div>}
           </div>
         </div>
 
@@ -419,18 +1055,53 @@ export default function Send() {
           {overBalance && <div className="error" style={{ marginTop: 8 }}>{t("send.errors.insufficientBalance")}</div>}
         </div>
 
-        <div className="card">
-          <div className="row">
-            <button className="btn" disabled={sending || overBalance || invalidRecipient} onClick={doSend}>
-              {sending ? t("send.sending") : "SEND"}
-            </button>
+        {(walletState.status === "error") && (
+          <div className="error" style={{ marginTop: 16, padding: 12, borderRadius: 8, background: 'rgba(255,0,0,0.1)' }}>
+            {t("errors.apiUnreachable") || "The API is currently unreachable or timed out. Sending is disabled."}
           </div>
-          {err && <p className="error">{err}</p>}
-          {result && <p>✅ {t("send.broadcasted")}: <code>{result}</code></p>}
+        )}
 
-          <div className="muted" style={{ marginTop: 12, fontSize: "0.85em" }}>
-            {t("send.pathLabel")}: <code>{DEFAULT_PATH}</code>
+        <div style={{ marginTop: 24 }}>
+          <button
+            className="btn primary full"
+            onClick={doSend}
+            disabled={sending || sendLocked || addressInvalid || overBalance || !!err || walletState.status === "error" || walletState.utxos.length === 0}
+          >
+            {sending ? t("send.sending") : t("send.confirm")}
+          </button>
+        </div>
+
+        {err && <div className="error" style={{ marginTop: 12 }}>{err}</div>}
+        {result && (
+          <div className="card" style={{ marginTop: 12 }}>
+            <div>✅ {t("send.broadcasted")}: <code>{result}</code></div>
+            {sendStatusNote && <div className="muted" style={{ marginTop: 6 }}>{sendStatusNote}</div>}
+            <div className="row" style={{ marginTop: 8 }}>
+              {lastTxid && (
+                <>
+                  <button className="btn ghost small" onClick={() => copyTxid(lastTxid)}>
+                    {copiedTxid === lastTxid ? t("copied") : t("copy")}
+                  </button>
+                  <a
+                    href={`https://explorer.pepepow.net/tx/${lastTxid}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn ghost small"
+                    title="View in Explorer"
+                  >
+                    🔍
+                  </a>
+                </>
+              )}
+              <button className="btn secondary" onClick={resetSendState}>
+                {t("send.newTransfer")}
+              </button>
+            </div>
           </div>
+        )}
+
+        <div className="muted" style={{ marginTop: 12, fontSize: "0.85em" }}>
+          {t("send.pathLabel")}: <code>{DEFAULT_PATH}</code>
         </div>
       </PageCard>
     </AppLayout>

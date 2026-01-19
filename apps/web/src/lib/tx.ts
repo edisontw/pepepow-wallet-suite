@@ -1,4 +1,4 @@
-import { apiFetch } from "./api";
+import { apiFetch, API_ENDPOINTS, withTxid } from "./api";
 
 export class TxApiError extends Error {
   status: number;
@@ -13,7 +13,7 @@ export class TxApiError extends Error {
 }
 
 export async function fetchRawTx(txid: string): Promise<string> {
-  const r = await apiFetch(`/wallet/tx/raw?txid=${encodeURIComponent(txid)}`);
+  const r = await apiFetch(withTxid(API_ENDPOINTS.wallet.txRaw, txid));
   const text = await r.text();
   if (!r.ok) {
     throw new TxApiError(`fetchRawTx failed: ${r.status}`, r.status, text || undefined);
@@ -22,7 +22,7 @@ export async function fetchRawTx(txid: string): Promise<string> {
 }
 
 export async function fetchTxInfo(txid: string): Promise<any> {
-  const r = await apiFetch(`/v1/tx/${encodeURIComponent(txid)}`);
+  const r = await apiFetch(API_ENDPOINTS.v1.txInfo(txid));
   const payload = await r.json().catch(() => ({}));
   if (!r.ok) {
     const detail = typeof payload?.error === "string" ? payload.error : undefined;
@@ -32,14 +32,18 @@ export async function fetchTxInfo(txid: string): Promise<any> {
 }
 
 export async function broadcastTx(rawTx: string): Promise<any> {
-  const r = await apiFetch("/wallet/tx/broadcast", {
+  const r = await apiFetch(API_ENDPOINTS.wallet.txBroadcast, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rawTx }),
   });
   const payload = await r.json().catch(() => ({}));
   if (!r.ok) {
-    const detail = typeof payload?.error === "string" ? payload.error : undefined;
+    const detail = typeof payload?.message === "string"
+      ? payload.message
+      : typeof payload?.error === "string"
+        ? payload.error
+        : undefined;
     throw new TxApiError(`broadcastTx failed: ${r.status}`, r.status, detail);
   }
   return payload;

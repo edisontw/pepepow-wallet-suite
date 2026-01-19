@@ -63,45 +63,53 @@ export const utxoRoutes: FastifyPluginAsync = async (app) => {
     const height = await RPC.getBlockCount().catch(() => undefined);
     if (height) reply.header('x-block-height', String(height));
 
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('UTXO lookup timeout')), 2000)
+    );
+
     try {
+      await Promise.race([
+        (async () => {
+          // rpc.ts getAddressUtxos accepts (address: string) => [{ addresses: [address] }]
+          // We need to call rpcCall manually or update RPC helper.
+          // Let's call rpcCall manually here to be safe and quick.
+          const param = { addresses };
+          const res = await RPC.call<any>('getaddressutxos', [param]).catch(() => null);
 
-      // rpc.ts getAddressUtxos accepts (address: string) => [{ addresses: [address] }]
-      // We need to call rpcCall manually or update RPC helper.
-      // Let's call rpcCall manually here to be safe and quick.
-      const param = { addresses };
-      const res = await RPC.call<any>('getaddressutxos', [param]).catch(() => null);
+          if (res && Array.isArray(res)) {
+            // Map to standard format and ensure confirmations
+            const mapped = res.map((u: any) => ({
+              address: u.address,
+              txid: u.txid,
+              outputIndex: u.outputIndex,
+              script: u.script,
+              satoshis: u.satoshis, // getaddressutxos returns satoshis usually
+              height: u.height,
+              confirmations: (typeof u.height === 'number' && height) ? (height - u.height + 1) : 0
+            }));
+            return { utxos: mapped, source: 'addressindex' };
+          }
 
-      if (res && Array.isArray(res)) {
-        // Map to standard format and ensure confirmations
-        const mapped = res.map((u: any) => ({
-          address: u.address,
-          txid: u.txid,
-          outputIndex: u.outputIndex,
-          script: u.script,
-          satoshis: u.satoshis, // getaddressutxos returns satoshis usually
-          height: u.height,
-          confirmations: (typeof u.height === 'number' && height) ? (height - u.height + 1) : 0
-        }));
-        return { utxos: mapped, source: 'addressindex' };
-      }
-    } catch { }
-
-    // Fallback: listunspent supports multiple addresses
-    try {
-      const lus = await RPC.listUnspent(0, 9999999, addresses);
-      if (Array.isArray(lus)) {
-        const mapped = lus.map((u: any) => ({
-          address: u.address,
-          txid: u.txid,
-          outputIndex: u.vout,
-          script: u.scriptPubKey,
-          satoshis: Math.round(Number(u.amount) * 1e8),
-          height: u.confirmations ? (height ? (height - u.confirmations + 1) : null) : null,
-          confirmations: u.confirmations
-        }));
-        return { utxos: mapped, source: 'listunspent' };
-      }
-    } catch { }
+          // Fallback: listunspent supports multiple addresses
+          const lus = await RPC.listUnspent(0, 9999999, addresses);
+          if (Array.isArray(lus)) {
+            const mapped = lus.map((u: any) => ({
+              address: u.address,
+              txid: u.txid,
+              outputIndex: u.vout,
+              script: u.scriptPubKey,
+              satoshis: Math.round(Number(u.amount) * 1e8),
+              height: u.confirmations ? (height ? (height - u.confirmations + 1) : null) : null,
+              confirmations: u.confirmations
+            }));
+            return { utxos: mapped, source: 'listunspent' };
+          }
+        })(),
+        timeoutPromise
+      ]);
+    } catch (err) {
+      console.warn(`[utxo] Multi-address lookup timeout or error: ${err}`);
+    }
 
     return { utxos: [] };
   });

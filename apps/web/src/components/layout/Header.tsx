@@ -25,9 +25,7 @@ export default function Header({ compact }: HeaderProps) {
     { to: "/history", label: t("nav.history"), short: "Tx" },
   ];
 
-  const visibleItems = compact
-    ? navItems.filter((item) => item.to === "/" || item.to === "/send")
-    : navItems;
+  const visibleItems = navItems;
 
   const isActive = (path: string) => {
     if (path === "/") return location.pathname === "/";
@@ -47,7 +45,11 @@ export default function Header({ compact }: HeaderProps) {
         <nav className="nav-links" aria-label="Primary">
           {visibleItems.map((item) => {
             const active = isActive(item.to);
-            const shortLabel = item.label.length <= 3 ? item.label : item.short;
+            const shortLabel = compact
+              ? item.label
+              : item.label.length <= 3
+                ? item.label
+                : item.short;
             return (
               <Link
                 key={item.to}

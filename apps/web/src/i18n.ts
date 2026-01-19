@@ -48,7 +48,8 @@ const resources = {
         checking: "檢查中"
       },
       errors: {
-        apiUnreachable: "無法連線 API"
+        apiUnreachable: "無法連線 API",
+        apiNotFound: "API endpoint 不存在"
       },
       home: {
         save: "儲存",
@@ -63,11 +64,18 @@ const resources = {
         walletCreateFailed: "建立錢包失敗",
         mnemonicMissing: "請先輸入助記詞",
         mnemonicInvalid: "助記詞無效或無法導出地址",
+        mnemonicHint: "請輸入 12 或 24 個有效助記詞。",
         usdLabel: "USD",
         usdNote: "CoinMarketCap",
         usdUnavailable: "CMC 無法取得",
         usdNetworkError: "網路錯誤",
-        payUrlLabel: "URL"
+        pendingSpend: "待確認支出",
+        payUrlLabel: "URL",
+        setDefault: "設為預設收款地址",
+        defaultAddressSet: "預設地址已設定！",
+        defaultAddressConfirmed: "已綁定 Telegram ✅",
+        defaultSyncHint: "建立/匯入錢包後，請按「設為預設收款地址」綁定 Telegram。",
+        defaultSyncTelegramOnly: "請在 Telegram Mini App 內開啟錢包以綁定地址。"
       },
       send: {
         title: "發送（完整簽名流程）",
@@ -95,21 +103,46 @@ const resources = {
         submit: "Sign & broadcast",
         utxosTitle: "UTXOs（偵測到 {{count}} 筆）",
         broadcasted: "已廣播",
+        newTransfer: "新的轉帳",
+        alreadyBroadcast: "已廣播，請等待 UTXO 更新。",
         errors: {
           mnemonicMissing: "請先輸入助記詞",
           amountInvalid: "請輸入正確的金額",
           amountTooLow: "最低轉帳金額為 {{min}} PEPEW",
           amountUnderFee: "金額必須大於手續費",
+          amountDust: "金額過小（dust），請提高金額。",
           feeInvalid: "請輸入正確的手續費",
+          feeTooLow: "手續費過低，請提高。",
           insufficientBalance: "餘額不足（含手續費）",
           insufficientUtxo: "可用 UTXO 不足",
+          utxoPending: "UTXO 尚未更新，請稍候再試",
           txRawFailed: "無法取得原始交易: {{txid}}",
           txRawNotFound: "找不到原始交易（節點可能未啟用 txindex 或交易不可查）：{{txid}}",
           broadcastFailed: "廣播失敗",
           utxoFailed: "UTXO 取得失敗",
           utxoApiError: "UTXO API 錯誤",
-          feeEstimateFailed: "手續費估算失敗"
-        }
+          feeEstimateFailed: "手續費估算失敗",
+          recipientMissing: "請輸入收款地址",
+          recipientInvalid: "收款地址格式不正確",
+          senderAddressMissing: "請先設定你的地址",
+          senderAddressInvalid: "你的地址格式不正確",
+          telegramResolveBlocked: "對方尚未完成 Telegram 綁定，無法直接轉帳"
+        },
+        tgTransfer: "發送給 Telegram 使用者",
+        resolve: "解析",
+        notResolved: "對方尚未設定地址。",
+        tgUserNotFound: "對方尚未 /start 與機器人建立連結",
+        tgNoDefaultAddress: "對方尚未設定預設地址",
+        tgInvalidDefaultAddress: "對方預設地址無效，請對方更新",
+        resolveNotFound: "找不到使用者，請嘗試 @username 或 Telegram ID。",
+        resolveAuthExpired: "Telegram 授權已過期，請關閉並重新開啟 Mini App。",
+        resolveUnavailable: "解析服務暫時無法使用。",
+        createRequest: "建立付款邀請",
+        requestLink: "請分享此連結給對方："
+      },
+      claim: {
+        processing: "領取中...",
+        success: "領取成功！"
       },
       history: {
         title: "紀錄",
@@ -172,7 +205,8 @@ const resources = {
         checking: "CHECKING"
       },
       errors: {
-        apiUnreachable: "Unable to reach API"
+        apiUnreachable: "Unable to reach API",
+        apiNotFound: "API endpoint not found"
       },
       home: {
         save: "Save",
@@ -187,11 +221,18 @@ const resources = {
         walletCreateFailed: "Wallet creation failed",
         mnemonicMissing: "Enter mnemonic first",
         mnemonicInvalid: "Invalid mnemonic or unable to derive address",
+        mnemonicHint: "Enter 12 or 24 valid words.",
         usdLabel: "USD",
         usdNote: "CoinMarketCap",
         usdUnavailable: "CMC unavailable",
         usdNetworkError: "network error",
-        payUrlLabel: "URL"
+        pendingSpend: "Pending spend",
+        payUrlLabel: "URL",
+        setDefault: "Set as Default Receive Address",
+        defaultAddressSet: "Default address set!",
+        defaultAddressConfirmed: "Linked to Telegram ✅",
+        defaultSyncHint: "After creating/importing a wallet, tap Set as Default to link this address to Telegram.",
+        defaultSyncTelegramOnly: "Open this wallet in Telegram Mini App to link your address."
       },
       send: {
         title: "Send (full signing flow)",
@@ -219,21 +260,46 @@ const resources = {
         submit: "Sign & broadcast",
         utxosTitle: "UTXOs ({{count}} found)",
         broadcasted: "Broadcasted",
+        newTransfer: "New transfer",
+        alreadyBroadcast: "Already broadcast. Please wait for UTXOs to update.",
         errors: {
           mnemonicMissing: "Enter mnemonic first",
           amountInvalid: "Enter a valid amount",
           amountTooLow: "Minimum send amount is {{min}} PEPEW",
           amountUnderFee: "Amount must be greater than the fee",
+          amountDust: "Amount too small (dust). Increase amount.",
           feeInvalid: "Enter a valid fee",
+          feeTooLow: "Fee too low. Try higher fee.",
           insufficientBalance: "Insufficient balance (including fee)",
           insufficientUtxo: "Insufficient UTXOs",
+          utxoPending: "UTXO not updated yet. Please wait and try again.",
           txRawFailed: "Unable to fetch raw tx: {{txid}}",
           txRawNotFound: "Raw transaction not found (node may have txindex disabled): {{txid}}",
           broadcastFailed: "Broadcast failed",
           utxoFailed: "Failed to fetch UTXOs",
           utxoApiError: "UTXO API error",
-          feeEstimateFailed: "Fee estimate failed"
-        }
+          feeEstimateFailed: "Fee estimate failed",
+          recipientMissing: "Recipient address required",
+          recipientInvalid: "Recipient address is invalid",
+          senderAddressMissing: "Your address is required",
+          senderAddressInvalid: "Your address is invalid",
+          telegramResolveBlocked: "Telegram user has no linked address. Resolve or create a payment request."
+        },
+        tgTransfer: "Send to Telegram User",
+        resolve: "Resolve",
+        notResolved: "User hasn't set an address.",
+        tgUserNotFound: "User hasn't started the bot yet. Ask them to /start.",
+        tgNoDefaultAddress: "User hasn't set a default address.",
+        tgInvalidDefaultAddress: "User's default address is invalid; ask them to update it.",
+        resolveNotFound: "User not found. Try @username or Telegram ID.",
+        resolveAuthExpired: "Telegram auth expired. Please close and reopen the Mini App.",
+        resolveUnavailable: "Resolve service temporarily unavailable.",
+        createRequest: "Create Payment Request",
+        requestLink: "Share this link with them:"
+      },
+      claim: {
+        processing: "Claiming...",
+        success: "Claimed successfully!"
       },
       history: {
         title: "History",

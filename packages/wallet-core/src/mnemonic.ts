@@ -6,6 +6,10 @@ export function generateMnemonic(strength: 128|256 = 128) {
   return bip39.generateMnemonic(strength);
 }
 
+export function validateMnemonic(mnemonic: string) {
+  return bip39.validateMnemonic(mnemonic);
+}
+
 export async function mnemonicToSeed(mnemonic: string) {
   return bip39.mnemonicToSeed(mnemonic);
 }
