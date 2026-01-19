@@ -1,7 +1,3 @@
-Here’s a clean, professional **English version**, keeping the original structure and intent intact:
-
----
-
 ## 1️⃣ Core Design Principles (Non-negotiable)
 
 ### 🔐 Non-custodial (**Highest Priority**)
@@ -204,12 +200,3 @@ Schema design ✔ already reasonable
 * Optional Redis / ZMQ
 * Well-documented common failure scenarios
 
-👉 This section does **not** need rewriting — **reference only**
-
----
-
-If you want, I can next:
-
-* Turn this into **ARCHITECTURE.md**
-* Convert it into a **developer onboarding doc**
-* Or rewrite it as a **“rules for contributors”** spec
