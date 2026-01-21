@@ -8,11 +8,25 @@ import { broadcastTx, fetchRawTx, TxApiError } from "../lib/tx";
 import { fmtPEPEWFromSats, satsToCoin } from "../lib/format";
 import { triggerRefresh } from "../lib/refresh";
 import { hasPendingSpendTxid, recordPendingSpend } from "../lib/pending";
-import { walletStore, WalletState } from "../lib/walletStore";
+import { walletStore, WalletState, type Utxo } from "../lib/walletStore";
 import AppLayout from "../components/layout/AppLayout";
 import PageCard from "../components/layout/PageCard";
+import {
+  buildConsolidationTx,
+  estimateP2PKHTxBytes,
+  type ConsolidationInput,
+  MAX_CONSOLIDATE_INPUTS,
+  MAX_CONSOLIDATE_TX_BYTES,
+  selectConsolidationUtxos
+} from "../utils/consolidate";
 
-type U = { txid: string; vout: number; valueSats: number; scriptHex: string; };
+type ConsolidationPreview = {
+  selected: Utxo[];
+  totalInSats: number;
+  outputSats: number;
+  feeSats: number;
+  estimatedBytes: number;
+};
 
 const DEFAULT_PATH = "m/44'/5'/0'/0/0";
 const COIN_MULTIPLIER = 100000000n;
@@ -175,10 +189,14 @@ export default function Send() {
   const [feeTouched, setFeeTouched] = useState(false);
   const [recentRecipients, setRecentRecipients] = useState<string[]>(loadRecentRecipients());
   const [sendAttempted, setSendAttempted] = useState(false);
+  const [consolidating, setConsolidating] = useState(false);
+  const [consolidateOpen, setConsolidateOpen] = useState(false);
+  const [consolidatePreview, setConsolidatePreview] = useState<ConsolidationPreview | null>(null);
   const [walletState, setWalletState] = useState<WalletState>(walletStore.getState());
   const resolveSeq = useRef(0);
   const mountedRef = useRef(true);
   const sendInFlightRef = useRef(false);
+  const consolidateInFlightRef = useRef(false);
   const lastSuccessSnapshotRef = useRef<{
     to: string;
     amount: string;
@@ -532,6 +550,9 @@ export default function Send() {
     setSendStatusNote(null);
     setErr(null);
     setSendAttempted(false);
+    setConsolidating(false);
+    setConsolidateOpen(false);
+    setConsolidatePreview(null);
     setTo("");
     setAmount("");
     setSubtractFee(false);
@@ -584,6 +605,263 @@ export default function Send() {
     }
     return null;
   };
+
+  const prepareConsolidationPreview = () => {
+    const st = walletStore.getState();
+    const utxosForCheck = st.utxos;
+    if (!utxosForCheck || utxosForCheck.length === 0) {
+      if (st.status === "loading") {
+        setErr(t("send.errors.utxoLoading"));
+      } else if (st.status === "error") {
+        const detail = st.rawUtxoSumError || st.error || t("errors.unknown");
+        setErr(t("send.errors.utxoFetchFailed", { error: detail }));
+      } else {
+        setErr(t("send.errors.utxoEmpty"));
+      }
+      return null;
+    }
+
+    const invalidUtxos = utxosForCheck.filter(u => u.invalid);
+    if (invalidUtxos.length > 0) {
+      setErr(t("send.errors.utxoIncomplete", { count: invalidUtxos.length }));
+      return null;
+    }
+
+    const trimmedMnemonic = mnemo.trim();
+    if (!trimmedMnemonic) {
+      setErr(t("send.errors.mnemonicMissing"));
+      return null;
+    }
+
+    const sendFrom = normalizeAddressInput(address);
+    if (!sendFrom) {
+      setErr(t("send.errors.senderAddressMissing"));
+      return null;
+    }
+    if (!changeValidation.ok) {
+      setErr(changeValidation.reason === "missing"
+        ? t("send.errors.senderAddressMissing")
+        : t("send.errors.senderAddressInvalid"));
+      return null;
+    }
+
+    if (feeSats === null || feeSats < 0) {
+      setErr(t("send.errors.feeInvalid"));
+      return null;
+    }
+
+    const selected = selectConsolidationUtxos(utxosForCheck, MAX_CONSOLIDATE_INPUTS);
+    if (!selected.length) {
+      setErr(t("send.errors.insufficientUtxo"));
+      return null;
+    }
+
+    const totalInSats = selected.reduce((sum, u) => sum + Number(u.valueSats || 0), 0);
+    const outputSats = totalInSats - feeSats;
+    if (outputSats <= 0) {
+      setErr(t("send.errors.amountUnderFee"));
+      return null;
+    }
+    if (outputSats < DUST_THRESHOLD_SATS) {
+      setErr(t("send.errors.amountDust"));
+      return null;
+    }
+
+    // Guardrail: avoid building a tx that's too large to relay reliably.
+    const estimatedBytes = estimateP2PKHTxBytes(selected.length, 1);
+    if (estimatedBytes > MAX_CONSOLIDATE_TX_BYTES) {
+      setErr(t("send.errors.consolidateTooLarge"));
+      return null;
+    }
+
+    return {
+      selected,
+      totalInSats,
+      outputSats,
+      feeSats,
+      estimatedBytes
+    };
+  };
+
+  const openConsolidateConfirm = () => {
+    setErr(null);
+    const preview = prepareConsolidationPreview();
+    if (!preview) return;
+    setConsolidatePreview(preview);
+    setConsolidateOpen(true);
+  };
+
+  const closeConsolidateConfirm = () => {
+    setConsolidateOpen(false);
+    setConsolidatePreview(null);
+  };
+
+  async function doConsolidate() {
+    if (consolidateInFlightRef.current) return;
+    const preview = consolidatePreview ?? prepareConsolidationPreview();
+    if (!preview) return;
+    consolidateInFlightRef.current = true;
+    setConsolidating(true);
+    setErr(null);
+    setResult(null);
+    setLastTxid(null);
+    setSendStatusNote(null);
+    setConsolidateOpen(false);
+
+    try {
+      const trimmedMnemonic = mnemo.trim();
+      if (!trimmedMnemonic) {
+        setErr(t("send.errors.mnemonicMissing"));
+        return;
+      }
+
+      const sendFrom = normalizeAddressInput(address);
+      if (!sendFrom) {
+        setErr(t("send.errors.senderAddressMissing"));
+        return;
+      }
+      if (!changeValidation.ok) {
+        setErr(changeValidation.reason === "missing"
+          ? t("send.errors.senderAddressMissing")
+          : t("send.errors.senderAddressInvalid"));
+        return;
+      }
+
+      const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
+      const inputs: ConsolidationInput[] = [];
+      for (const u of preview.selected) {
+        if (!u.txid || u.vout === undefined || !Number.isFinite(u.valueSats)) {
+          console.error("[CONSOLIDATE_ASSERT] Invalid UTXO structure", u);
+          throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
+        }
+        try {
+          if (debugEnabled) console.info("[consolidate] fetching raw tx for signing", u.txid);
+          const hex = await fetchRawTx(u.txid);
+          if (!hex || typeof hex !== "string" || hex.length === 0) {
+            throw new Error(`fetchRawTx returned empty for ${u.txid}`);
+          }
+          inputs.push({
+            txid: u.txid,
+            vout: u.vout,
+            value: Number(u.valueSats),
+            nonWitnessUtxo: hex
+          });
+        } catch (e: any) {
+          console.error("[CONSOLIDATE_ASSERT] fetchRawTx failed", { txid: u.txid, error: e.message });
+          if (e instanceof TxApiError && e.status === 404) {
+            setErr(t("send.errors.txRawNotFound", { txid: u.txid }));
+          } else {
+            setErr(`${t("send.errors.txRawFailed", { txid: u.txid })}: ${e.message || String(e)}`);
+          }
+          return;
+        }
+      }
+
+      const { rawTx, totalInSats, outputSats } = buildConsolidationTx({
+        network: PEPEPOW,
+        inputs,
+        wif,
+        address: sendFrom,
+        feeSats: preview.feeSats
+      });
+
+      if (!rawTx) {
+        console.error("[CONSOLIDATE_ASSERT] buildConsolidationTx returned empty/undefined");
+        setErr(t("send.errors.txBuildMissingOutput"));
+        return;
+      }
+      if (typeof rawTx !== "string" || rawTx.length < 20) {
+        console.error("[CONSOLIDATE_ASSERT] invalid raw tx hex", { rawTx });
+        setErr(t("send.errors.txBuildInvalidHex"));
+        return;
+      }
+
+      const rawTxLen = rawTx.length;
+      const rawTxHash = rawTx ? await sha256HexFromHexString(rawTx) : null;
+      const rawTxHash16 = rawTxHash ? rawTxHash.slice(0, 16) : "n/a";
+      const localTxid = await computeTxidFromRawTx(rawTx);
+      console.info("[consolidate] raw tx result", {
+        rawTxLen,
+        rawTxHash16,
+        localTxid,
+        inputCount: preview.selected.length,
+        totalInSats,
+        outputSats
+      });
+
+      const cached = loadLastBroadcastCache();
+      const cachedMatch = !!cached
+        && ((rawTxHash && cached.hash === rawTxHash)
+          || (localTxid && cached.txid === localTxid));
+      const pendingMatch = localTxid ? hasPendingSpendTxid(localTxid) : false;
+
+      if (pendingMatch || cachedMatch) {
+        const txidToShow = localTxid || cached?.txid || null;
+        if (txidToShow) {
+          setResult(txidToShow);
+          setLastTxid(txidToShow);
+        }
+        setSendStatusNote(t("send.alreadyBroadcast"));
+        return;
+      }
+
+      try {
+        const j = await broadcastTx(rawTx);
+        const txid = j.result || j.txid;
+        const txidString = typeof txid === "string" ? txid : (localTxid || null);
+        setResult(txidString || JSON.stringify(j));
+        setLastTxid(txidString);
+        setSendStatusNote(null);
+        if (txidString) {
+          saveLastBroadcastCache({
+            hash: rawTxHash || "",
+            ts: Date.now(),
+            txid: txidString
+          });
+        }
+        const spendSats = preview.feeSats;
+        const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
+
+        if (alreadyPending) {
+          setSendStatusNote(t("send.alreadyBroadcast"));
+        }
+
+        if (!alreadyPending && Number.isFinite(spendSats) && spendSats > 0) {
+          walletStore.applyOptimistic(spendSats);
+          recordPendingSpend({
+            address: sendFrom,
+            sats: spendSats,
+            txid: txidString || undefined,
+            balanceBeforeSats: Number.isFinite(availableSats) ? availableSats : undefined
+          });
+        }
+        if (!alreadyPending) {
+          triggerRefresh({ reason: "consolidate", txid: txidString || undefined });
+          walletStore.scheduleRefresh();
+        }
+      } catch (e: any) {
+        if (e instanceof TxApiError) {
+          const mapped = mapBroadcastError(e.detail);
+          if (mapped) {
+            setErr(mapped);
+          } else if (e.detail) {
+            setErr(e.detail);
+          } else {
+            setErr(t("send.errors.broadcastFailed"));
+          }
+        } else {
+          setErr(t("send.errors.broadcastFailed"));
+        }
+        return;
+      }
+    } catch (e: any) {
+      setErr(String(e.message || e));
+    } finally {
+      consolidateInFlightRef.current = false;
+      setConsolidating(false);
+      setConsolidatePreview(null);
+    }
+  }
 
   async function doSend() {
     if (sendLocked) {
@@ -1056,6 +1334,23 @@ export default function Send() {
           {overBalance && <div className="error" style={{ marginTop: 8 }}>{t("send.errors.insufficientBalance")}</div>}
         </div>
 
+        <div className="card">
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <div>
+              <div className="section-title">{t("send.utilitiesTitle")}</div>
+              <div className="muted" style={{ marginTop: 6 }}>{t("send.consolidateHint")}</div>
+            </div>
+            <button
+              className="btn secondary"
+              onClick={openConsolidateConfirm}
+              title={t("send.consolidateHint")}
+              disabled={sending || consolidating || walletState.status === "error" || !changeValidation.ok || walletState.utxos.length === 0}
+            >
+              {t("send.consolidate")}
+            </button>
+          </div>
+        </div>
+
         {(walletState.status === "error") && (
           <div className="error" style={{ marginTop: 16, padding: 12, borderRadius: 8, background: 'rgba(255,0,0,0.1)' }}>
             {t("errors.apiUnreachable")}
@@ -1066,7 +1361,7 @@ export default function Send() {
           <button
             className="btn primary full"
             onClick={doSend}
-            disabled={sending || sendLocked || addressInvalid || overBalance || !!err || walletState.status === "error" || walletState.utxos.length === 0}
+            disabled={sending || consolidating || sendLocked || addressInvalid || overBalance || !!err || walletState.status === "error" || walletState.utxos.length === 0}
           >
             {sending ? t("send.sending") : t("send.submit")}
           </button>
@@ -1105,6 +1400,26 @@ export default function Send() {
           {t("send.pathLabel")}: <code>{DEFAULT_PATH}</code>
         </div>
       </PageCard>
+
+      {consolidateOpen && consolidatePreview && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal-card">
+            <div className="section-title">{t("send.consolidateConfirmTitle")}</div>
+            <div className="note" style={{ marginTop: 12 }}>
+              <div>{t("send.consolidateConfirmCount", { count: consolidatePreview.selected.length })}</div>
+              <div>{t("send.consolidateConfirmFee")}: {fmtPEPEWFromSats(consolidatePreview.feeSats)}</div>
+            </div>
+            <div className="row" style={{ marginTop: 16, justifyContent: "flex-end" }}>
+              <button className="btn secondary" onClick={closeConsolidateConfirm} disabled={consolidating}>
+                {t("send.consolidateCancel")}
+              </button>
+              <button className="btn" onClick={doConsolidate} disabled={consolidating}>
+                {consolidating ? t("send.sending") : t("send.consolidateConfirmAction")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </AppLayout>
   );
 }
