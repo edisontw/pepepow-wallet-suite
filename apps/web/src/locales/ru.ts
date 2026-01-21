@@ -72,7 +72,7 @@ export const ru = {
       pendingSpend: "Ожидаемое списание",
       payUrlLabel: "URL",
       setDefault: "Сделать адресом получения по умолчанию",
-      defaultAddressSet: "Адрес по умолчанию установлен!",
+      defaultAddressSet: "Адрес по умолчанию установлен! Закройте окно кошелька и откройте его снова, чтобы изменения вступили в силу.",
       defaultAddressConfirmed: "Привязано к Telegram ✅",
       defaultSyncHint: "После создания/импорта кошелька нажмите «Сделать адресом по умолчанию», чтобы привязать этот адрес к Telegram.",
       defaultSyncTelegramOnly: "Откройте этот кошелек в Telegram Mini App, чтобы привязать адрес.",

@@ -170,6 +170,11 @@ export default function WalletHome() {
       if (res.ok) {
         setDefaultStatus(t("home.defaultAddressSet"));
         setDefaultStatusIsError(false);
+        // Keep Mini App address in sync so routing uses the new default immediately.
+        if (typeof localStorage !== "undefined") {
+          localStorage.setItem("pepew_address", address);
+        }
+        walletStore.setAddress(address);
         setNeedsDefaultSync(false);
         setIsDefaultConfirmed(true);
         setJustSavedDefault(true);

@@ -82,7 +82,3 @@ cp .env.example .env
 ## Development
 
 See [DEV_COMPASS.md](docs/DEV_COMPASS.md) for a guide to the codebase and internal dependencies.
-
-## License
-
-MIT License. See [LICENSE](LICENSE) (if available) for details.
