@@ -11,6 +11,11 @@ Welcome to the PepePow Trading Suite! This guide will help you get your first tr
     - **NestEx**
 3.  **PEPEW / USDT Balances**: Ensure you have enough funds on your exchange account for the strategy you intend to run.
 
+## Open PEPEPOW Tradetbot on Telegram.
+Search for @pepepow_tradetbot.
+Type /start.
+Input commands to run the tradebot.
+
 ## Step 1: Set Up Your API Keys
 
 Before starting any strategy, you must provide your API keys so the bot can trade on your behalf.
