@@ -8,6 +8,7 @@ A comprehensive, non-custodial wallet ecosystem for the PEPEPOW (PEPEW) blockcha
 - **Telegram Mini App**: Integrated wallet experience for Telegram users.
 - **Wallet API**: Backend service for fee estimation, transaction broadcasting, and user UX helpers.
 - **PEPEW API**: Indexer and chain data proxy for fast, read-only chain queries.
+- **Trading Bot Suite**: A powerful collection of services for automated trading (DCA, GRID, Market Making) on centralized exchanges.
 
 ## ⚠️ Critical Security Warning: Non-Custodial
 
@@ -41,6 +42,8 @@ This project follows a client-side signing model:
 - `services/wallet-api`: Node.js backend for the wallet.
 - `packages/wallet-core`: Shared logic for coin operations (BIP39/32/44).
 - `pepew-api`: Chain indexer service.
+- `services/trade-api`: Backend for automated trading strategies.
+- `services/trade-bot`: Telegram bot for managing trading strategies.
 - `docs/`: Technical documentation and runbooks.
 - `scripts/`: Deployment and maintenance scripts.
 
@@ -76,6 +79,11 @@ cp .env.example .env
 - [Security Statement](docs/security.md)
 - [Deployment Layout](docs/deploy_layout.md)
 - [API Reference](docs/pepew-api.md)
+- [Trading Suite Architecture](docs/TRADE_ARCHITECTURE.md)
+- [Trading Strategy Specifications](docs/TRADE_STRATEGIES_SPEC.md)
+- [Trade API Documentation](docs/trade-api.md)
+- [Trade Bot Documentation](docs/trade-bot.md)
+- [Trading Quick Start Guide](docs/TRADE_USER_QUICK_START.md)
 - [Nginx Hardening](docs/nginx-hardening-minimal.md)
 - [Publishing to GitHub](docs/publishing-to-github.md)
 
