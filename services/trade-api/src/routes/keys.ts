@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { z } from "zod";
-import { encryptKeyPair, isCryptoConfigured, getCryptoError } from "../crypto.js";
+import { encryptKeyPair, isCryptoConfigured, getCryptoError, decryptKeyPair } from "../crypto.js";
 import { upsertExchangeKey, listExchangeKeys, clearExchangeKey, getExchangeKey } from "../db.js";
 import { checkNestExToken } from "../exchanges/nestex.js";
+import { getNormalizedBalances } from "../lib/balanceHelper.js";
 import crypto from "crypto";
 
 const router = Router();
@@ -15,6 +16,13 @@ const SetKeysSchema = z.object({
     apiKey: z.string().min(1),
     apiSecret: z.string().min(1),
     validate: z.boolean().optional(),
+});
+
+const ValidateKeysSchema = z.object({
+    tgUserId: z.string().min(1),
+    exchange: ExchangeEnum,
+    apiKey: z.string().min(1),
+    apiSecret: z.string().min(1),
 });
 
 const ClearKeysSchema = z.object({
@@ -58,13 +66,19 @@ router.post("/v1/keys/set", async (req, res) => {
 
         console.log(`[keys] set success: user=${userIdHash} exchange=${parsed.exchange}`);
 
-        let validation: { ok: boolean; error?: string } | undefined;
+        let validation: { ok: boolean; error?: string; details?: any } | undefined;
         if (parsed.exchange === "nestex" && parsed.validate) {
             const rateLimitKey = `${parsed.tgUserId}:nestex`;
             const validationResult = await checkNestExToken(parsed.apiKey, parsed.apiSecret, rateLimitKey);
             validation = validationResult.ok
                 ? { ok: true }
                 : { ok: false, error: validationResult.error || "Check token failed" };
+        } else if (parsed.exchange === "dextrade" && parsed.validate) {
+            const { getDexTradeBalances } = await import("../exchanges/dextrade.js");
+            const result = await getDexTradeBalances(parsed.apiKey, parsed.apiSecret);
+            validation = result.ok
+                ? { ok: true, details: { assets: Object.keys(result.data || {}) } }
+                : { ok: false, error: result.error || "Balance fetch failed" };
         }
 
         res.json({
@@ -93,40 +107,81 @@ router.post("/v1/keys/set", async (req, res) => {
 });
 
 // GET /v1/keys/status
-router.get("/v1/keys/status", (req, res) => {
+router.get("/v1/keys/status", async (req, res) => {
     try {
         const tgUserId = req.query.tgUserId as string;
         if (!tgUserId) {
             return res.status(400).json({ ok: false, error: "tgUserId query param required" });
         }
 
+        const validate = req.query.validate === "1" || req.query.validate === "true";
+
         const exchange = req.query.exchange as string | undefined;
         if (exchange) {
             const parsedExchange = ExchangeEnum.parse(exchange);
             const record = getExchangeKey(tgUserId, parsedExchange);
-            return res.json({
-                ok: true,
-                keys: [record ? {
+            const keys: any[] = [];
+            if (record) {
+                const entry: any = {
                     exchange: record.exchange,
                     updatedAt: record.updated_at,
                     createdAt: record.created_at,
-                } : {
+                };
+                if (validate) {
+                    try {
+                        const decrypted = decryptKeyPair({
+                            keyCipher: record.key_cipher,
+                            secretCipher: record.secret_cipher,
+                            iv: record.iv,
+                            tag: record.tag,
+                        });
+                        const bal = await getNormalizedBalances(parsedExchange, decrypted.apiKey, decrypted.apiSecret, tgUserId);
+                        entry.validation = bal.ok
+                            ? { ok: true }
+                            : { ok: false, reason: bal.reason || "FETCH_FAILED", message: bal.error || "Balance fetch failed" };
+                    } catch (err: any) {
+                        entry.validation = { ok: false, reason: "DECRYPT_FAILED", message: err?.message || "Failed to decrypt API keys" };
+                    }
+                }
+                keys.push(entry);
+            } else {
+                keys.push({
                     exchange: parsedExchange,
                     updatedAt: null,
                     createdAt: null,
-                }],
-            });
+                });
+            }
+            return res.json({ ok: true, keys });
         }
 
         const records = listExchangeKeys(tgUserId);
-        res.json({
-            ok: true,
-            keys: records.map((record) => ({
+        const keys: any[] = [];
+        for (const record of records) {
+            const entry: any = {
                 exchange: record.exchange,
                 updatedAt: record.updated_at,
                 createdAt: record.created_at,
-            })),
-        });
+            };
+            if (validate) {
+                try {
+                    const decrypted = decryptKeyPair({
+                        keyCipher: record.key_cipher,
+                        secretCipher: record.secret_cipher,
+                        iv: record.iv,
+                        tag: record.tag,
+                    });
+                    const bal = await getNormalizedBalances(record.exchange as any, decrypted.apiKey, decrypted.apiSecret, tgUserId);
+                    entry.validation = bal.ok
+                        ? { ok: true }
+                        : { ok: false, reason: bal.reason || "FETCH_FAILED", message: bal.error || "Balance fetch failed" };
+                } catch (err: any) {
+                    entry.validation = { ok: false, reason: "DECRYPT_FAILED", message: err?.message || "Failed to decrypt API keys" };
+                }
+            }
+            keys.push(entry);
+        }
+
+        res.json({ ok: true, keys });
     } catch (err: any) {
         if (err instanceof z.ZodError) {
             return res.status(400).json({ ok: false, error: "Invalid exchange" });

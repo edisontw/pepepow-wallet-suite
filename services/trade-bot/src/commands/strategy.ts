@@ -1,5 +1,5 @@
 import { Context } from "grammy";
-import { ApiError, getStrategyStatus, StrategyConfig, StrategyFill, getNonKycBalance } from "../api.js";
+import { ApiError, getStrategyStatus, StrategyConfig, StrategyFill } from "../api.js";
 import { safeSend } from "../utils/telegram.js";
 import { safeText, truncateText } from "../utils/strings.js";
 import { ExchangeName } from "../lib/markets.js";
@@ -255,32 +255,43 @@ export async function handleStrategyStatus(ctx: Context): Promise<void> {
             return;
         }
 
-        // Fetch NonKYC REAL balance if any REAL strategies on NonKYC exist
-        const hasNonKycReal = realConfigs.some(c => c.exchange === "nonkyc");
-        let nonKycBalanceLine = "";
-
-        // Use debug balance if available (single source of truth)
-        if (data.debug) {
-            const usdtStr = data.debug.freeUSDT.toFixed(4);
-            const pepewStr = data.debug.freePEPEW.toExponential(2);
-            nonKycBalanceLine = `📊 NonKYC Balance: ${usdtStr} USDT | ${pepewStr} PEPEW\n`;
-        } else if (hasNonKycReal) {
-            try {
-                const balanceResp = await getNonKycBalance(tgUserId);
-                if (balanceResp.ok && balanceResp.freeUSDT !== undefined) {
-                    const usdtStr = balanceResp.freeUSDT.toFixed(4);
-                    const pepewStr = (balanceResp.freePEPEW ?? 0).toExponential(2);
-                    nonKycBalanceLine = `📊 NonKYC Balance: ${usdtStr} USDT | ${pepewStr} PEPEW\n`;
+        const balanceLines: string[] = [];
+        if (data.balances && data.balances.length > 0) {
+            for (const bal of data.balances) {
+                const label = exchangeLabel(bal.exchange as ExchangeName);
+                if (bal.ok) {
+                    const snap = bal.snapshot;
+                    const usdt = snap?.assets?.USDT;
+                    const bnb = snap?.assets?.BNB;
+                    const pepew = snap?.assets?.PEPEW;
+                    const updatedTs = snap?.ts || bal.lastOkTs || null;
+                    const parts: string[] = [];
+                    if (usdt) parts.push(`USDT ${usdt.free.toFixed(4)}/${usdt.total.toFixed(4)}`);
+                    if (bnb) parts.push(`BNB ${bnb.free.toFixed(4)}/${bnb.total.toFixed(4)}`);
+                    if (pepew) parts.push(`PEPEW ${pepew.free.toExponential(2)}/${pepew.total.toExponential(2)}`);
+                    if (!parts.length) {
+                        parts.push(`${bal.assets.USDT.toFixed(4)} USDT`);
+                        parts.push(`${bal.assets.PEPEW.toExponential(2)} PEPEW`);
+                    }
+                    balanceLines.push(`📊 ${label} Balance: ${parts.join(" | ")} | updated ${formatDateTime(updatedTs)}`);
+                } else {
+                    const reason = bal.errCode || bal.reason || "BALANCE_FETCH_FAILED";
+                    const detail = bal.error ? truncateText(safeText(bal.error), 120) : "";
+                    const lastOk = bal.lastOkTs ? formatDateTime(bal.lastOkTs) : "-";
+                    balanceLines.push(`📊 ${label} Balance: (unavailable: ${reason}) (lastOk: ${lastOk})${detail ? ` - ${detail}` : ""}`);
                 }
-            } catch (err) {
-                // Silently fail - balance is optional info
             }
+        } else if (data.debug) {
+            // Fallback to debug balance if balances array missing
+            const usdtStr = data.debug.freeQuote.toFixed(4);
+            const pepewStr = data.debug.freePEPEW.toExponential(2);
+            balanceLines.push(`📊 NonKYC Balance: ${usdtStr} USDT/BNB | ${pepewStr} PEPEW`);
         }
 
         // Compact config display: 2 lines per config
         const lines: string[] = [];
-        if (nonKycBalanceLine) {
-            lines.push(nonKycBalanceLine);
+        if (balanceLines.length > 0) {
+            lines.push(...balanceLines);
         }
         lines.push("Your strategies:", "");
         realConfigs.forEach((cfg, index) => {
@@ -300,7 +311,7 @@ export async function handleStrategyStatus(ctx: Context): Promise<void> {
                 `${index + 1}) ${cfg.strategy}  ${exchangeDisplay}  ${cfg.pair}  ${cfg.tradeMode}  ${status}`
             );
             // Line 2: Compact params with pipe separators
-            const sharedBal = data.debug ? { freeUSDT: data.debug.freeUSDT, freePEPEW: data.debug.freePEPEW } : null;
+            const sharedBal = data.debug ? { freeUSDT: data.debug.freeQuote, freePEPEW: data.debug.freePEPEW } : null;
             lines.push(`   ${formatCompactParams(cfg, sharedBal)}`);
 
             // Line 3: Last action if present
@@ -368,7 +379,7 @@ export async function handleStrategyStatus(ctx: Context): Promise<void> {
             lines.push(`- Source: ${d.balance_source}`);
             lines.push(`- Cache: ${d.isCached ? "YES" : "NO"} (${formatInterval(Math.floor(d.cacheAgeMs / 1000))} old)`);
             lines.push(`- Symbols Found: [${d.symbolsFound.join(", ")}]`);
-            lines.push(`- Free USDT: ${d.freeUSDT.toFixed(6)}`);
+            lines.push(`- Free USDT/BNB: ${d.freeQuote.toFixed(6)}`);
             lines.push(`- Free PEPEW: ${d.freePEPEW.toExponential(6)}`);
         }
 

@@ -26,6 +26,15 @@ import {
     handleMmCallback,
     handleMmTextInput,
 } from "./commands/mm.js";
+import {
+    handleDevmm,
+    handleDevmmStart,
+    handleDevmmStop,
+    handleDevmmStatus,
+    handleDevmmReport,
+    handleDevmmCallback,
+    handleDevmmTextInput,
+} from "./commands/devmm.js";
 import { handleStrategyStatus } from "./commands/strategy.js";
 import {
     handleKeys,
@@ -72,6 +81,11 @@ bot.command("grid_stop", handleGridStop);
 bot.command("mm", handleMm);
 bot.command("mm_start", handleMmStart);
 bot.command("mm_stop", handleMmStop);
+bot.command("devmm", handleDevmm);
+bot.command("devmm_start", handleDevmmStart);
+bot.command("devmm_stop", handleDevmmStop);
+bot.command("devmm_status", handleDevmmStatus);
+bot.command("devmm_report", handleDevmmReport);
 bot.command("strategy_status", handleStrategyStatus);
 bot.command("keys", handleKeys);
 bot.command("keys_status", handleKeysStatus);
@@ -82,6 +96,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (await handleDcaCallback(ctx)) return;
     if (await handleGridCallback(ctx)) return;
     if (await handleMmCallback(ctx)) return;
+    if (await handleDevmmCallback(ctx)) return;
     await ctx.answerCallbackQuery();
 });
 
@@ -90,6 +105,7 @@ bot.on("message:text", async (ctx) => {
     if (await handleDcaTextInput(ctx)) return;
     if (await handleGridTextInput(ctx)) return;
     if (await handleMmTextInput(ctx)) return;
+    if (await handleDevmmTextInput(ctx)) return;
 });
 
 // Error handler

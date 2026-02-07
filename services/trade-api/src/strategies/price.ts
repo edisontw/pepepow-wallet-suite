@@ -8,6 +8,14 @@ export type PriceResult = {
     exchange: string;
 };
 
+export type TopOfBookResult = {
+    bestBid: number | null;
+    bestAsk: number | null;
+    source: "ticker" | "orderbook" | "unknown";
+    exchange: string;
+    forcedMid?: boolean;
+};
+
 function selectPrice(ticker: { last: number | null; bid: number | null; ask: number | null }): PriceResult | null {
     if (ticker.last !== null && ticker.last > 0) {
         return { price: ticker.last, source: "last", exchange: "" };
@@ -25,7 +33,10 @@ function selectPrice(ticker: { last: number | null; bid: number | null; ask: num
 }
 
 export async function fetchExchangePrice(exchange: ExchangeName, pair: string): Promise<PriceResult | null> {
-    const symbol = normalizePairSymbol(exchange, pair) || pair;
+    const symbol = normalizePairSymbol(exchange, pair);
+    if (!symbol) {
+        throw new Error(`UNSUPPORTED_PAIR: exchangeId=${exchange} canonicalPair=${pair}`);
+    }
     const priceSource = getPriceSource(exchange, symbol);
     if (!priceSource) {
         console.error(`[strategy] Unsupported market: exchange=${exchange} pair=${pair}`);
@@ -65,6 +76,80 @@ export async function fetchExchangePrice(exchange: ExchangeName, pair: string): 
         if (exchange === "dextrade") {
             throw err;
         }
+        return null;
+    }
+}
+
+export async function fetchExchangeTopOfBook(exchange: ExchangeName, pair: string): Promise<TopOfBookResult | null> {
+    const symbol = normalizePairSymbol(exchange, pair);
+    if (!symbol) {
+        throw new Error(`UNSUPPORTED_PAIR: exchangeId=${exchange} canonicalPair=${pair}`);
+    }
+    const priceSource = getPriceSource(exchange, symbol);
+    if (!priceSource) {
+        return null;
+    }
+
+    try {
+        if (priceSource === "nonkyc") {
+            const normalized = normalizePairSymbol(exchange, symbol);
+            if (normalized !== "PEPEW_BNB" && normalized !== "PEPEW_USDT") {
+                return null;
+            }
+            const result = await fetchNonKycTicker(normalized);
+            return {
+                bestBid: result.ticker.bid ?? null,
+                bestAsk: result.ticker.ask ?? null,
+                source: "ticker",
+                exchange: priceSource,
+            };
+        }
+        if (priceSource === "dextrade") {
+            const result = await fetchDexTradeTicker();
+            const last = result.ticker.last ?? null;
+            let bestBid = result.ticker.bid ?? null;
+            let bestAsk = result.ticker.ask ?? null;
+            let forcedMid = false;
+
+            if ((!bestBid || bestBid <= 0) && Number.isFinite(last) && (last as number) > 0) {
+                bestBid = last;
+                forcedMid = true;
+            }
+            if ((!bestAsk || bestAsk <= 0) && Number.isFinite(last) && (last as number) > 0) {
+                bestAsk = last;
+                forcedMid = true;
+            }
+            return {
+                bestBid,
+                bestAsk,
+                source: "ticker",
+                exchange: priceSource,
+                forcedMid,
+            };
+        }
+        if (priceSource === "nestex") {
+            const { fetchNestExOrderbookTop } = await import("../lib/price/sources/nestex.js");
+            const book = await fetchNestExOrderbookTop();
+            if (book.bestBid !== null || book.bestAsk !== null) {
+                return {
+                    bestBid: book.bestBid,
+                    bestAsk: book.bestAsk,
+                    source: "orderbook",
+                    exchange: priceSource,
+                };
+            }
+            const result = await fetchNestExTicker();
+            return {
+                bestBid: result.ticker.bid ?? null,
+                bestAsk: result.ticker.ask ?? null,
+                source: "ticker",
+                exchange: priceSource,
+            };
+        }
+
+        return null;
+    } catch (err: any) {
+        console.error(`[strategy] top-of-book fetch failed for ${exchange}: ${err?.message || err}`);
         return null;
     }
 }

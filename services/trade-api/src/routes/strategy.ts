@@ -6,6 +6,7 @@ import {
     getRecentStrategyFills,
     upsertStrategyConfig,
     setStrategyEnabledById,
+    setStrategyDisabledWithReason,
     getStrategyConfigById,
     getExchangeKey,
     getLatestFailure,
@@ -19,13 +20,16 @@ import {
     updateGridOrderStatus,
 } from "../db.js";
 import { ExchangeName, formatPairDisplay, normalizePairSymbol, validatePair, getExchangeSymbol } from "../lib/markets.js";
+import { listExchangeSpecs, getExchangeSpec, normalizeExchangeId } from "../registry/exchanges.js";
+import { parsePair } from "../registry/pairs.js";
 import { classifyExchangeError } from "../exchanges/errors.js";
 import { decryptKeyPair } from "../crypto.js";
-import { computeFundsRequirement, getNonKycNormalizedBalance, checkFundsStatus } from "../lib/fundsCheck.js";
+import { computeFundsRequirement, getExchangeNormalizedBalance, checkFundsStatus, performFundsCheck } from "../lib/fundsCheck.js";
 import { fetchExchangePrice } from "../strategies/price.js";
 import { cancelNonKycOrder, listNonKycOpenOrders } from "../exchanges/nonkyc.js";
 import { getMarketRules, roundToTick, normalizePrice } from "../strategies/gridRunner.js";
 import { cancelOutstandingOrders } from "../strategies/strategyHelper.js";
+import { getLastBalanceMeta, getNormalizedBalances, NormalizedBalance } from "../lib/balanceHelper.js";
 
 const router = Router();
 
@@ -53,6 +57,7 @@ const StrategyUpsertSchema = z.object({
 
 const StrategyToggleSchema = z.object({
     tgUserId: z.string().min(1),
+    reason: z.string().min(1).max(64).optional(),
 });
 
 function safeParseJson(value: string): any {
@@ -63,6 +68,71 @@ function safeParseJson(value: string): any {
     }
 }
 
+async function collectBalanceSummaryForUser(tgUserId: string): Promise<Array<{
+    exchangeId: ExchangeName;
+    ok: boolean;
+    errCode?: string;
+    error?: string;
+    lastOkTs?: number;
+    snapshot?: any;
+    assets: { USDT: number; BNB: number; PEPEW: number };
+}>> {
+    const supportedExchanges: ExchangeName[] = ["nonkyc", "dextrade", "nestex"];
+    const balances: Array<{
+        exchangeId: ExchangeName;
+        ok: boolean;
+        errCode?: string;
+        error?: string;
+        lastOkTs?: number;
+        snapshot?: any;
+        assets: { USDT: number; BNB: number; PEPEW: number };
+    }> = [];
+
+    for (const ex of supportedExchanges) {
+        const keyRecord = getExchangeKey(tgUserId, ex);
+        if (!keyRecord) {
+            balances.push({
+                exchangeId: ex,
+                ok: false,
+                errCode: "NO_KEYS",
+                error: "No API keys configured",
+                assets: { USDT: 0, BNB: 0, PEPEW: 0 },
+            });
+            continue;
+        }
+
+        try {
+            const decrypted = decryptKeyPair({
+                keyCipher: keyRecord.key_cipher,
+                secretCipher: keyRecord.secret_cipher,
+                iv: keyRecord.iv,
+                tag: keyRecord.tag,
+            });
+            const bal = await getNormalizedBalances(ex, decrypted.apiKey, decrypted.apiSecret, tgUserId);
+            const meta = getLastBalanceMeta(ex, decrypted.apiKey, tgUserId);
+            balances.push({
+                exchangeId: ex,
+                ok: bal.ok,
+                errCode: bal.errCode || bal.reason || meta.lastErrCode,
+                error: bal.error || meta.lastErrMsg,
+                lastOkTs: bal.lastOkTs || meta.lastOkTs,
+                snapshot: bal.snapshot,
+                assets: bal.assets,
+            });
+        } catch (err: any) {
+            balances.push({
+                exchangeId: ex,
+                ok: false,
+                errCode: "BALANCE_FETCH_FAILED",
+                error: err?.message || String(err),
+                assets: { USDT: 0, BNB: 0, PEPEW: 0 },
+            });
+        }
+    }
+
+    return balances;
+}
+
 // POST /v1/strategy/config/upsert
 router.post("/v1/strategy/config/upsert", (req, res) => {
     try {
@@ -70,11 +140,38 @@ router.post("/v1/strategy/config/upsert", (req, res) => {
         const tradeMode = "REAL";
         const strategy = parsed.strategy;
 
-        const normalizedSymbol = normalizePairSymbol(parsed.exchange as ExchangeName, parsed.pair);
-        if (!normalizedSymbol || !validatePair(parsed.exchange as ExchangeName, normalizedSymbol)) {
-            return res.status(400).json({ ok: false, error: "Unsupported exchange/pair" });
+        let normalizedExchangeId: ExchangeName;
+        let pairDisplay: string;
+        try {
+            const requestedExchangeId = parsed.exchange;
+            normalizedExchangeId = normalizeExchangeId(requestedExchangeId);
+            const resolvedSpec = getExchangeSpec(normalizedExchangeId);
+            if (requestedExchangeId !== normalizedExchangeId || resolvedSpec.adapterKey !== normalizedExchangeId) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "EXCHANGE_RESOLVE_GUARD_FAILED",
+                    details: {
+                        requestedExchangeId,
+                        normalizedExchangeId,
+                        resolvedExchangeId: resolvedSpec.exchangeId,
+                        adapterKey: resolvedSpec.adapterKey,
+                    },
+                });
+            }
+
+            const parsedPair = parsePair(parsed.pair);
+            const normalizedSymbol = normalizePairSymbol(normalizedExchangeId, parsedPair.canonicalPair);
+            if (!normalizedSymbol || !validatePair(normalizedExchangeId, normalizedSymbol)) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "UNSUPPORTED_PAIR",
+                    message: `UNSUPPORTED_PAIR: exchangeId=${normalizedExchangeId} canonicalPair=${parsedPair.canonicalPair}`,
+                });
+            }
+            pairDisplay = formatPairDisplay(normalizedExchangeId, normalizedSymbol);
+        } catch (err: any) {
+            return res.status(400).json({ ok: false, error: err?.code || "INVALID_PAIR", message: err?.message || "Invalid pair" });
         }
-        const pairDisplay = formatPairDisplay(parsed.exchange as ExchangeName, normalizedSymbol);
 
         let paramsJson = parsed.paramsJson;
         if (!paramsJson && parsed.params) {
@@ -86,7 +183,7 @@ router.post("/v1/strategy/config/upsert", (req, res) => {
 
         const config = upsertStrategyConfig({
             tgUserId: parsed.tgUserId,
-            exchange: parsed.exchange,
+            exchange: normalizedExchangeId,
             pair: pairDisplay,
             tradeMode,
             strategy,
@@ -191,7 +288,9 @@ router.post("/v1/strategy/config/:id/disable", (req, res) => {
             return res.status(400).json({ ok: false, error: "Invalid config id" });
         }
         const parsed = StrategyToggleSchema.parse(req.body);
-        const updated = setStrategyEnabledById(configId, parsed.tgUserId, false);
+        const updated = parsed.reason
+            ? setStrategyDisabledWithReason(configId, parsed.tgUserId, parsed.reason)
+            : setStrategyEnabledById(configId, parsed.tgUserId, false);
         const config = getStrategyConfigById(configId);
 
         if (!updated || !config) {
@@ -237,43 +336,37 @@ router.get("/v1/strategy/status", async (req, res) => {
         const orders = getRecentStrategyOrders(tgUserId, 20);
         const fills = getRecentStrategyFills(tgUserId, 10);
 
-        // Fetch shared balance if there are NonKYC strategies
-        const hasNonKyc = configs.some(c => c.exchange === "nonkyc");
-        let sharedBalance: any = null;
-        if (hasNonKyc) {
-            const keyRecord = getExchangeKey(tgUserId, "nonkyc");
-            if (keyRecord) {
-                try {
-                    const decrypted = decryptKeyPair({
-                        keyCipher: keyRecord.key_cipher,
-                        secretCipher: keyRecord.secret_cipher,
-                        iv: keyRecord.iv,
-                        tag: keyRecord.tag,
-                    });
-                    const balanceResult = await getNonKycNormalizedBalance(decrypted.apiKey, decrypted.apiSecret);
-                    if (balanceResult) {
-                        sharedBalance = balanceResult;
-                        if (process.env.TRADE_DEBUG_STATUS === "1") {
-                            console.log(`[strategy] status: fetched shared balance for NonKYC REAL: USDT=${sharedBalance.data.freeUSDT}, PEPEW=${sharedBalance.data.freePEPEW}`);
-                        }
-                    }
-                } catch (err) {
-                    console.warn(`[strategy] status: failed to fetch shared balance: ${err}`);
-                }
-            }
-        }
+        const balanceSummary = await collectBalanceSummaryForUser(tgUserId);
+        const balances: NormalizedBalance[] = balanceSummary.map((b) => ({
+            ok: b.ok,
+            exchange: b.exchangeId,
+            assets: b.assets,
+            reason: b.errCode,
+            errCode: b.errCode,
+            error: b.error,
+            lastOkTs: b.lastOkTs,
+            snapshot: b.snapshot,
+        }));
+
+        // Shared balance logic (legacy support for NonKYC debug)
+        const nonKycBal = balances.find(b => b.exchange === "nonkyc" && b.ok);
+        const sharedBalance = nonKycBal ? {
+            data: { freeQuote: nonKycBal.assets.USDT || nonKycBal.assets.BNB, freePEPEW: nonKycBal.assets.PEPEW },
+            metadata: { fetchedAt: Date.now(), cacheAgeMs: 0, isCached: false, symbolsFound: ["USDT", "BNB", "PEPEW"] }
+        } : null;
 
         const debugEnabled = process.env.TRADE_DEBUG_STATUS === "1" || req.query.debug === "1";
 
         res.json({
             ok: true,
+            balances,
             debug: (debugEnabled && sharedBalance) ? {
-                balance_source: "NonKYC",
+                balance_source: "Multi",
                 fetchedAt: sharedBalance.metadata.fetchedAt,
                 cacheAgeMs: sharedBalance.metadata.cacheAgeMs,
                 isCached: sharedBalance.metadata.isCached,
                 symbolsFound: sharedBalance.metadata.symbolsFound,
-                freeUSDT: sharedBalance.data.freeUSDT,
+                freeQuote: sharedBalance.data.freeQuote,
                 freePEPEW: sharedBalance.data.freePEPEW,
             } : null,
             configs: configs.map((config) => {
@@ -285,19 +378,18 @@ router.get("/v1/strategy/status", async (req, res) => {
                 const localOpen = config.strategy === "GRID" ? getOpenGridOrders(config.id).length : 0;
                 const openBuyCount = config.strategy === "DCA" ? (params.openBuy ?? 0) : 0;
 
-
-                // If this is a NonKYC REAL strategy and we have a shared balance,
-                // we could override/augment the lastAction if it says "have 0"
-                // but for now let's just ensure the data is consistent.
-
                 const failureDetails = failure?.details_json ? safeParseJson(failure.details_json) ?? failure.details_json : null;
                 const failureCategory = failure && failure.category === "UNKNOWN"
-                    ? classifyExchangeError(config.exchange, {
+                    ? classifyExchangeError(config.exchange as ExchangeName, {
                         httpStatus: failure.last_http_status ?? undefined,
                         message: failure.message,
                         code: failure.last_exchange_code ?? undefined,
                     }).category
                     : failure?.category;
+
+                // Find balance for this specific config's exchange
+                const exBal = balances.find(b => b.exchange === config.exchange);
+
                 return {
                     id: config.id,
                     tgUserId: config.tg_user_id,
@@ -311,29 +403,29 @@ router.get("/v1/strategy/status", async (req, res) => {
                     updatedAt: config.updated_at,
                     params: safeParseJson(config.params_json),
                     notes: config.notes,
-                    // New failure/backoff fields
                     disabledReason: config.disabled_reason,
                     consecutiveFailures: config.consecutive_failures,
                     lastAction: (lastEvent?.message || null),
                     lastActionAt: lastEvent?.ts || null,
-                    // Consistency check: if last action says "have 0" but shared balance has funds
-                    inventoryWarning: (config.exchange === "nonkyc" && lastEvent?.message?.includes("have 0") && sharedBalance)
+                    inventoryWarning: (exBal && exBal.ok && lastEvent?.message?.includes("have 0"))
                         ? (function () {
                             const msg = lastEvent?.message || "";
-                            if (msg.includes("BUY") && sharedBalance.data.freeUSDT > 0) {
-                                return `DISCREPANCY DETECTED: Action reports "have 0 USDT" but current balance is ${sharedBalance.data.freeUSDT.toFixed(2)} USDT.`;
+                            const isBNB = config.pair.toUpperCase().endsWith("BNB");
+                            const freeQuote = exBal.assets.USDT || exBal.assets.BNB || 0;
+                            if (msg.includes("BUY") && freeQuote > 0) {
+                                return `DISCREPANCY DETECTED: Action reports "have 0 ${isBNB ? "BNB" : "USDT"}" but current balance is ${freeQuote.toFixed(4)}.`;
                             }
-                            if (msg.includes("SELL") && sharedBalance.data.freePEPEW > 0) {
-                                return `DISCREPANCY DETECTED: Action reports "have 0 PEPEW" but current balance is ${sharedBalance.data.freePEPEW.toExponential(2)} PEPEW.`;
+                            if (msg.includes("SELL") && exBal.assets.PEPEW > 0) {
+                                return `DISCREPANCY DETECTED: Action reports "have 0 PEPEW" but current balance is ${exBal.assets.PEPEW.toExponential(2)} PEPEW.`;
                             }
                             return null;
                         })()
                         : null,
-                    currentInventory: (config.exchange === "nonkyc" && sharedBalance)
+                    currentInventory: (exBal && exBal.ok)
                         ? {
-                            PEPEW: sharedBalance.data.freePEPEW,
-                            USDT: sharedBalance.data.freeUSDT,
-                            fetchedAt: sharedBalance.metadata.fetchedAt
+                            PEPEW: exBal.assets.PEPEW,
+                            Quote: exBal.assets.USDT || exBal.assets.BNB || 0,
+                            fetchedAt: Date.now()
                         }
                         : null,
                     lastFailure: failure ? {
@@ -407,24 +499,13 @@ router.post("/v1/strategy/funds-check", async (req, res) => {
     try {
         const parsed = FundsCheckSchema.parse(req.body);
 
-        // Only NonKYC REAL mode supports balance checking for now
-        if (parsed.exchange !== "nonkyc") {
-            return res.json({
-                ok: true,
-                status: "PASS",
-                messages: ["Funds check only available for NonKYC exchange"],
-                need: { needUSDT: 0, needPEPEW: 0, notes: [] },
-                available: null,
-            });
-        }
-
         // Get API keys
         const keyRecord = getExchangeKey(parsed.tgUserId, parsed.exchange);
         if (!keyRecord) {
             return res.status(400).json({
                 ok: false,
                 error: "MISSING_KEYS",
-                message: "No API keys set for NonKYC. Use /keys first.",
+                message: `No API keys set for ${parsed.exchange}. Use /keys first.`,
             });
         }
 
@@ -446,40 +527,32 @@ router.post("/v1/strategy/funds-check", async (req, res) => {
             });
         }
 
-        // Get current price for PEPEW calculations
-        let midPrice: number | undefined;
-        try {
-            const priceResult = await fetchExchangePrice(parsed.exchange as ExchangeName, parsed.pair);
-            midPrice = priceResult?.price;
-        } catch {
-            console.warn(`[strategy] funds-check: price fetch failed for ${parsed.pair}`);
-        }
+        const { performFundsCheck } = await import("../lib/fundsCheck.js");
+        const check = await performFundsCheck(
+            parsed.strategy,
+            parsed.params,
+            parsed.exchange as ExchangeName,
+            parsed.pair,
+            accessKey,
+            secretKey
+        );
 
-        // Compute requirements
-        const need = computeFundsRequirement(parsed.strategy, parsed.params, midPrice);
-
-        // Fetch balance
-        const balanceResult = await getNonKycNormalizedBalance(accessKey, secretKey);
-        if (!balanceResult) {
+        if (!check) {
             return res.status(500).json({
                 ok: false,
                 error: "BALANCE_FETCH_FAILED",
-                message: "Could not fetch NonKYC account balance",
+                message: `Could not fetch ${parsed.exchange} account balance`,
             });
         }
-        const available = balanceResult.data;
 
-        // Check status
-        const check = checkFundsStatus(need, available);
-
-        console.log(`[strategy] funds-check: user=${parsed.tgUserId.slice(0, 8)}... strategy=${parsed.strategy} status=${check.status}`);
+        console.log(`[strategy] funds-check: user=${parsed.tgUserId.slice(0, 8)}... strategy=${parsed.strategy} exchange=${parsed.exchange} status=${check.status}`);
 
         res.json({
             ok: true,
             status: check.status,
             messages: check.messages,
-            need,
-            available,
+            need: check.need,
+            available: check.available,
         });
     } catch (err: any) {
         if (err instanceof z.ZodError) {
@@ -490,7 +563,96 @@ router.post("/v1/strategy/funds-check", async (req, res) => {
     }
 });
 
-// GET /v1/balance/nonkyc?tgUserId=...
+// GET /v1/balance?tgUserId=...&exchange=...
+router.get("/v1/balance", async (req, res) => {
+    try {
+        const tgUserId = (req.query.tgUserId || req.query.tg_user_id) as string;
+        const exchange = req.query.exchange as ExchangeName;
+
+        if (!tgUserId || !exchange) {
+            return res.status(400).json({ ok: false, error: "tgUserId and exchange query params required" });
+        }
+
+        const keyRecord = getExchangeKey(tgUserId, exchange);
+        if (!keyRecord) {
+            return res.status(400).json({
+                ok: false,
+                error: "MISSING_KEYS",
+                message: `No API keys set for ${exchange}`,
+            });
+        }
+
+        let accessKey: string, secretKey: string;
+        try {
+            const decrypted = decryptKeyPair({
+                keyCipher: keyRecord.key_cipher,
+                secretCipher: keyRecord.secret_cipher,
+                iv: keyRecord.iv,
+                tag: keyRecord.tag,
+            });
+            accessKey = decrypted.apiKey;
+            secretKey = decrypted.apiSecret;
+        } catch {
+            return res.status(400).json({
+                ok: false,
+                error: "DECRYPT_FAILED",
+                message: "Failed to decrypt API keys",
+            });
+        }
+
+        const balanceResult = await getNormalizedBalances(exchange, accessKey, secretKey, tgUserId);
+        if (!balanceResult.ok) {
+            return res.status(500).json(balanceResult);
+        }
+
+        res.json(balanceResult);
+    } catch (err: any) {
+        console.error(`[strategy] balance error: ${err.message}`);
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// GET /v1/balances/summary?tgUserId=...
+router.get("/v1/balances/summary", async (req, res) => {
+    try {
+        const tgUserId = (req.query.tgUserId || req.query.tg_user_id) as string;
+        if (!tgUserId) {
+            return res.status(400).json({ ok: false, error: "tgUserId query param required" });
+        }
+        const balances = await collectBalanceSummaryForUser(tgUserId);
+        return res.json({
+            ok: true,
+            exchanges: balances.map((b) => ({
+                exchangeId: b.exchangeId,
+                ok: b.ok,
+                errCode: b.errCode || null,
+                errMsgShort: b.error ? String(b.error).slice(0, 220) : null,
+                lastOkTs: b.lastOkTs || null,
+                snapshot: b.snapshot || null,
+                assets: b.assets,
+            })),
+        });
+    } catch (err: any) {
+        console.error(`[strategy] balances summary error: ${err.message}`);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// GET /v1/registry/exchanges
+router.get("/v1/registry/exchanges", (_req, res) => {
+    const exchanges = listExchangeSpecs().map((spec) => ({
+        exchangeId: spec.exchangeId,
+        displayName: spec.displayName,
+        adapterKey: spec.adapterKey,
+        pairs: spec.pairs,
+        symbolMapping: spec.symbolMapping,
+        limits: spec.limits,
+        precision: spec.precision,
+    }));
+    res.json({ ok: true, exchanges });
+});
+
+// GET /v1/balance/nonkyc?tgUserId=... (DEPRECATED: use /v1/balance)
 router.get("/v1/balance/nonkyc", async (req, res) => {
     try {
         const tgUserId = (req.query.tgUserId || req.query.tg_user_id) as string;
@@ -525,20 +687,16 @@ router.get("/v1/balance/nonkyc", async (req, res) => {
             });
         }
 
-        const balanceResult = await getNonKycNormalizedBalance(accessKey, secretKey, false); // Don't use cache
-        if (!balanceResult) {
-            return res.status(500).json({
-                ok: false,
-                error: "BALANCE_FETCH_FAILED",
-                message: "Could not fetch NonKYC account balance",
-            });
+        const balanceResult = await getNormalizedBalances("nonkyc", accessKey, secretKey, tgUserId);
+        if (!balanceResult.ok) {
+            return res.status(500).json(balanceResult);
         }
 
         res.json({
             ok: true,
             exchange: "nonkyc",
-            freeUSDT: balanceResult.data.freeUSDT,
-            freePEPEW: balanceResult.data.freePEPEW,
+            freeQuote: balanceResult.assets.USDT || balanceResult.assets.BNB,
+            freePEPEW: balanceResult.assets.PEPEW,
             fetchedAt: Date.now(),
         });
     } catch (err: any) {
@@ -562,17 +720,24 @@ router.post("/v1/strategy/config/:id/cancel-orders", async (req, res) => {
             return res.status(404).json({ ok: false, error: "Strategy config not found" });
         }
 
-        // Use unified cancellation mechanism
-        const result = await cancelOutstandingOrders(configId);
-
-        // Also call legacy cancel for DB cleanup just in case (e.g. non-registry orders)
-        cancelOpenStrategyOrders(configId);
-        if (config.strategy === "GRID") cancelOpenGridOrders(configId);
-
+        // Respond immediately; run cancellation in background.
         res.json({
             ok: true,
-            ...result,
-            message: `Cancelled ${result.cancelled}/${result.total} orders, ${result.failed} failed.`,
+            queued: true,
+            message: "Cancellation queued",
+        });
+
+        setImmediate(async () => {
+            try {
+                const result = await cancelOutstandingOrders(configId);
+                cancelOpenStrategyOrders(configId);
+                if (config.strategy === "GRID") cancelOpenGridOrders(configId);
+                console.log(
+                    `[strategy] cancel-orders done config=${configId} cancelled=${result.cancelled} failed=${result.failed} alreadyClosed=${result.alreadyClosed}`
+                );
+            } catch (err: any) {
+                console.error(`[strategy] cancel-orders async error: ${err?.message || err}`);
+            }
         });
 
     } catch (err: any) {

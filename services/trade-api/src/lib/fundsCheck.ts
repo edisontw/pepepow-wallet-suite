@@ -8,14 +8,10 @@
 import { getNonkycBalances } from "../exchanges/nonkyc.js";
 import { fetchExchangePrice } from "../strategies/price.js";
 import { ExchangeName } from "./markets.js";
+import { getNormalizedBalances } from "./balanceHelper.js";
 
-// Cache for balance lookups (to avoid hitting API on every strategy status check)
-let balanceCache: {
-    data: { freeUSDT: number; freePEPEW: number } | null;
-    fetchedAt: number;
-} | null = null;
-
-const BALANCE_CACHE_TTL_MS = 30_000; // 30 seconds
+// No shared global cache here anymore to avoid cross-user state leakage.
+// Individual requests can use local caching within a single execution if needed.
 
 /**
  * Normalize asset symbol to internal canonical form.
@@ -37,7 +33,8 @@ function keyFingerprint(key: string): string {
 }
 
 export interface FundsRequirement {
-    needUSDT: number;
+    needQuote: number;
+    quoteAsset: "USDT" | "BNB";
     needPEPEW: number;
     notes: string[];
 }
@@ -55,55 +52,68 @@ export interface FundsCheckResult {
 export function computeFundsRequirement(
     strategy: "DCA" | "GRID" | "MM",
     params: Record<string, any>,
+    quoteAsset: "USDT" | "BNB" = "USDT",
     midPrice?: number
 ): FundsRequirement {
     const notes: string[] = [];
     const BUFFER = 1.05; // 5% safety buffer
 
     if (strategy === "DCA") {
-        // DCA: needs quote_per_order * buffer for each buy
-        const quotePerOrder = params.budget || params.quote_per_order || 1;
+        // DCA: needs budget * buffer for each buy
+        const budget = params.budget || params.quote_per_order || 1;
         return {
-            needUSDT: quotePerOrder * BUFFER,
+            needQuote: budget * BUFFER,
+            quoteAsset,
             needPEPEW: 0,
-            notes: [`DCA buy-only: ${quotePerOrder} USDT/order + 5% buffer`],
+            notes: [`DCA buy-only: ${budget} ${quoteAsset}/order + 5% buffer`],
+        };
+    }
+
+    // GRID: needs total budget for buy orders
+    // Use either total_quote_budget or compute from quote_per_order * levels
+    let totalBudget = params.total_quote_budget || 0;
+    const levels = params.grid_levels || 1;
+    const perOrder = params.quote_per_order || params.per_order_quote || 0;
+
+    if (totalBudget === 0 && perOrder > 0) {
+        totalBudget = perOrder * levels;
+    }
+
+    const allowSell = params.allow_sell ?? false;
+
+    if (allowSell && midPrice && midPrice > 0) {
+        // If grid can sell, need some base inventory too
+        const baseNeeded = totalBudget / midPrice;
+        notes.push(`GRID two-sided: commitment ${totalBudget} ${quoteAsset} + ~${baseNeeded.toExponential(2)} PEPEW`);
+        return {
+            needQuote: totalBudget * BUFFER,
+            quoteAsset,
+            needPEPEW: baseNeeded * BUFFER,
+            notes,
         };
     }
 
     if (strategy === "GRID") {
-        // GRID: needs total budget for buy orders
-        // Conservative: assume buy-only grid (most common)
-        const totalBudget = params.total_quote_budget || 10;
-        const allowSell = params.allow_sell ?? false;
-
-        if (allowSell && midPrice && midPrice > 0) {
-            // If grid can sell, need some base inventory too
-            const halfBudget = totalBudget / 2;
-            const estimatedBase = halfBudget / midPrice;
-            notes.push(`GRID two-sided: assumes 50% buy / 50% sell`);
-            return {
-                needUSDT: halfBudget * BUFFER,
-                needPEPEW: estimatedBase * BUFFER,
-                notes,
-            };
-        }
-
-        notes.push(`GRID buy-only: ${totalBudget} USDT total budget + 5% buffer`);
+        notes.push(`GRID buy-only: commitment ${totalBudget} ${quoteAsset}`);
         return {
-            needUSDT: totalBudget * BUFFER,
+            needQuote: totalBudget * BUFFER,
+            quoteAsset,
             needPEPEW: 0,
             notes,
         };
     }
 
     if (strategy === "MM") {
-        const orderQuote = params.order_quote || 2;
+        const orderQuote = params.quote_per_order || params.order_quote || 2;
+        const ordersPerSide = params.orders_per_side || 1;
+        const totalPerSide = orderQuote * ordersPerSide;
         const mode = params.mode || "TWO_SIDED";
 
         if (mode === "ONE_SIDED_BUY") {
-            notes.push(`MM ONE_SIDED_BUY: ${orderQuote} USDT/order + 5% buffer`);
+            notes.push(`MM ONE_SIDED_BUY: ${ordersPerSide} orders @ ${orderQuote} ${quoteAsset} + 5% buffer`);
             return {
-                needUSDT: orderQuote * BUFFER,
+                needQuote: totalPerSide * BUFFER,
+                quoteAsset,
                 needPEPEW: 0,
                 notes,
             };
@@ -113,15 +123,17 @@ export function computeFundsRequirement(
             if (!midPrice || midPrice <= 0) {
                 notes.push(`MM ONE_SIDED_SELL: price unavailable, estimating conservatively`);
                 return {
-                    needUSDT: 0,
+                    needQuote: 0,
+                    quoteAsset,
                     needPEPEW: 1e9 * BUFFER, // 1B PEPEW as conservative estimate
                     notes,
                 };
             }
-            const baseNeeded = orderQuote / midPrice;
+            const baseNeeded = totalPerSide / midPrice;
             notes.push(`MM ONE_SIDED_SELL: ${baseNeeded.toExponential(2)} PEPEW + 5% buffer`);
             return {
-                needUSDT: 0,
+                needQuote: 0,
+                quoteAsset,
                 needPEPEW: baseNeeded * BUFFER,
                 notes,
             };
@@ -131,120 +143,89 @@ export function computeFundsRequirement(
         if (!midPrice || midPrice <= 0) {
             notes.push(`MM TWO_SIDED: price unavailable, can't compute PEPEW requirement`);
             return {
-                needUSDT: orderQuote * BUFFER,
+                needQuote: totalPerSide * BUFFER,
+                quoteAsset,
                 needPEPEW: 0, // Can't calculate without price
                 notes,
             };
         }
 
-        const baseNeeded = orderQuote / midPrice;
-        notes.push(`MM TWO_SIDED: ${orderQuote} USDT buy + ${baseNeeded.toExponential(2)} PEPEW sell + 5% buffer`);
+        const baseNeeded = totalPerSide / midPrice;
+        notes.push(`MM TWO_SIDED: ${totalPerSide} ${quoteAsset} buy + ${baseNeeded.toExponential(2)} PEPEW sell + 5% buffer`);
         return {
-            needUSDT: orderQuote * BUFFER,
+            needQuote: totalPerSide * BUFFER,
+            quoteAsset,
             needPEPEW: baseNeeded * BUFFER,
             notes,
         };
     }
 
     // Unknown strategy
-    return { needUSDT: 0, needPEPEW: 0, notes: ["Unknown strategy type"] };
+    return { needQuote: 0, quoteAsset, needPEPEW: 0, notes: ["Unknown strategy type"] };
 }
 
 /**
- * Fetch and normalize NonKYC account balance (single source of truth)
+ * Fetch and normalize account balance for any supported exchange
  */
-export async function getNonKycNormalizedBalance(
+export async function getExchangeNormalizedBalance(
+    exchange: ExchangeName,
     accessKey: string,
     secretKey: string,
+    quoteAsset: "USDT" | "BNB" = "USDT",
     useCache = true
 ): Promise<{
-    data: { freeUSDT: number; freePEPEW: number };
+    data: { freeQuote: number; freePEPEW: number; freeUSDT?: number; freeBNB?: number };
     metadata: {
         fetchedAt: number;
         cacheAgeMs: number;
         isCached: boolean;
         symbolsFound: string[];
+        quoteAsset: string;
+        exchange: string;
     }
 } | null> {
-    const now = Date.now();
-
-    // Return cached data if fresh
-    if (useCache && balanceCache && now - balanceCache.fetchedAt < BALANCE_CACHE_TTL_MS && balanceCache.data) {
-        if (process.env.TRADE_DEBUG_STATUS === "1") {
-            console.log(`[fundsCheck] balance CACHE hit: age=${now - balanceCache.fetchedAt}ms`);
-        }
-        return {
-            data: balanceCache.data,
-            metadata: {
-                fetchedAt: balanceCache.fetchedAt,
-                cacheAgeMs: now - balanceCache.fetchedAt,
-                isCached: true,
-                symbolsFound: ["USDT", "PEPEW"], // Simplified for cache
-            }
-        };
-    }
-
     try {
-        // Log key fingerprint for debugging (to verify same key used for orders vs balance)
         if (process.env.TRADE_DEBUG_STATUS === "1" || !useCache) {
-            console.log(`[fundsCheck] balance FETCH request key_fingerprint=${keyFingerprint(accessKey)} cache_requested=${useCache}`);
+            console.log(`[fundsCheck] balance FETCH request exchange=${exchange} key_fingerprint=${keyFingerprint(accessKey)} quote=${quoteAsset} cache_requested=${useCache}`);
         }
 
-        const result = await getNonkycBalances(accessKey, secretKey);
-        if (!result.ok || !result.data) {
-            console.warn(`[fundsCheck] balance fetch failed: ${result.error || "unknown"}`);
+        const bal = await getNormalizedBalances(exchange, accessKey, secretKey, undefined, useCache);
+
+        if (!bal.ok) {
+            console.error(`[fundsCheck] failed to fetch balances for ${exchange}: ${bal.error || bal.reason}`);
             return null;
         }
 
-        // Parse balance data - NonKYC returns array of { currency, available, reserved }
-        const balances = Array.isArray(result.data) ? result.data : [];
+        const freeQuote = quoteAsset === "BNB" ? bal.assets.BNB : bal.assets.USDT;
+        const freePEPEW = bal.assets.PEPEW;
+        const now = Date.now();
 
-        let freeUSDT = 0;
-        let freePEPEW = 0;
-
-        const symbolsFound: string[] = [];
-        for (const bal of balances) {
-            // Use normalizeAssetSymbol to handle aliases (e.g., PEPEPOW -> PEPEW)
-            const rawCurrency = String(bal.currency || bal.asset || "");
-            const currency = normalizeAssetSymbol(rawCurrency);
-            const available = Number(bal.available || bal.free || 0);
-
-            symbolsFound.push(rawCurrency);
-
-            if (currency === "USDT") {
-                freeUSDT = available;
-            } else if (currency === "PEPEW") {
-                freePEPEW = available;
+        return {
+            data: {
+                freeQuote,
+                freePEPEW,
+                ...bal.assets
+            },
+            metadata: {
+                quoteAsset,
+                exchange,
+                fetchedAt: bal.cachedAt || now,
+                cacheAgeMs: bal.cachedAt ? (now - bal.cachedAt) : 0,
+                isCached: !!bal.cachedAt,
+                symbolsFound: Object.keys(bal.assets)
             }
-        }
-
-        if (process.env.TRADE_DEBUG_STATUS === "1") {
-            console.log(`[fundsCheck] balance normalized: USDT=${freeUSDT.toFixed(4)}, PEPEW=${freePEPEW.toExponential(2)} (symbols found: ${symbolsFound.length})`);
-        }
-
-        const data = { freeUSDT, freePEPEW };
-        balanceCache = { data, fetchedAt: now };
-
-        const metadata = {
-            fetchedAt: now,
-            cacheAgeMs: 0,
-            isCached: false,
-            symbolsFound,
         };
-
-        return { data, metadata };
-
     } catch (err: any) {
-        console.error(`[fundsCheck] balance fetch error: ${err?.message || err}`);
+        console.error(`[fundsCheck] error for ${exchange}: ${err.message}`);
         return null;
     }
 }
 
 /**
- * Clear the balance cache (call when needed to force refresh)
+ * Clear the balance cache (No-op since cache is removed)
  */
 export function clearBalanceCache(): void {
-    balanceCache = null;
+    // balanceCache = null;
 }
 
 /**
@@ -252,22 +233,24 @@ export function clearBalanceCache(): void {
  */
 export function checkFundsStatus(
     need: FundsRequirement,
-    available: { freeUSDT: number; freePEPEW: number }
+    available: { freeQuote: number; freePEPEW: number }
 ): { status: "PASS" | "WARN" | "FAIL"; messages: string[] } {
     const messages: string[] = [];
     const WARN_BUFFER = 1.2; // 20% buffer for "marginal" warning
 
-    const usdtOk = available.freeUSDT >= need.needUSDT;
-    const usdtMarginal = available.freeUSDT >= need.needUSDT && available.freeUSDT < need.needUSDT * WARN_BUFFER;
+    const quoteOk = available.freeQuote >= need.needQuote;
+    const quoteMarginal = available.freeQuote >= need.needQuote && available.freeQuote < (need.needQuote * WARN_BUFFER);
     const pepewOk = need.needPEPEW === 0 || available.freePEPEW >= need.needPEPEW;
-    const pepewMarginal = need.needPEPEW > 0 && available.freePEPEW >= need.needPEPEW && available.freePEPEW < need.needPEPEW * WARN_BUFFER;
+    const pepewMarginal = need.needPEPEW > 0 && available.freePEPEW >= need.needPEPEW && available.freePEPEW < (need.needPEPEW * WARN_BUFFER);
 
-    if (!usdtOk) {
-        messages.push(`USDT: need ${need.needUSDT.toFixed(2)}, have ${available.freeUSDT.toFixed(2)} ❌`);
-    } else if (usdtMarginal) {
-        messages.push(`USDT: need ${need.needUSDT.toFixed(2)}, have ${available.freeUSDT.toFixed(2)} ⚠️ (marginal)`);
-    } else if (need.needUSDT > 0) {
-        messages.push(`USDT: need ${need.needUSDT.toFixed(2)}, have ${available.freeUSDT.toFixed(2)} ✓`);
+    const qAsset = need.quoteAsset;
+
+    if (!quoteOk) {
+        messages.push(`${qAsset}: need ${need.needQuote.toFixed(qAsset === "BNB" ? 4 : 2)}, have ${available.freeQuote.toFixed(qAsset === "BNB" ? 4 : 2)} ❌`);
+    } else if (quoteMarginal) {
+        messages.push(`${qAsset}: need ${need.needQuote.toFixed(qAsset === "BNB" ? 4 : 2)}, have ${available.freeQuote.toFixed(qAsset === "BNB" ? 4 : 2)} ⚠️ (marginal)`);
+    } else if (need.needQuote > 0) {
+        messages.push(`${qAsset}: need ${need.needQuote.toFixed(qAsset === "BNB" ? 4 : 2)}, have ${available.freeQuote.toFixed(qAsset === "BNB" ? 4 : 2)} ✓`);
     }
 
     if (!pepewOk) {
@@ -278,10 +261,10 @@ export function checkFundsStatus(
         messages.push(`PEPEW: need ${need.needPEPEW.toExponential(2)}, have ${available.freePEPEW.toExponential(2)} ✓`);
     }
 
-    if (!usdtOk || !pepewOk) {
+    if (!quoteOk || !pepewOk) {
         return { status: "FAIL", messages };
     }
-    if (usdtMarginal || pepewMarginal) {
+    if (quoteMarginal || pepewMarginal) {
         return { status: "WARN", messages };
     }
     return { status: "PASS", messages };
@@ -307,15 +290,22 @@ export async function performFundsCheck(
         console.warn(`[fundsCheck] price fetch failed, proceeding without midPrice`);
     }
 
+    const quoteAsset = (pair.toUpperCase().endsWith("BNB") || pair.toUpperCase().endsWith("_BNB")) ? "BNB" : "USDT";
+
     // Compute requirements
-    const need = computeFundsRequirement(strategy, params, midPrice);
+    const need = computeFundsRequirement(strategy, params, quoteAsset, midPrice);
 
     // Fetch balance
-    const balanceResult = await getNonKycNormalizedBalance(accessKey, secretKey);
+    const balanceResult = await getExchangeNormalizedBalance(exchange, accessKey, secretKey, quoteAsset);
     if (!balanceResult) {
         return null; // Could not fetch balance
     }
-    const available = balanceResult.data;
+
+    // Normalize balance object for checkFundsStatus
+    const available = {
+        freeQuote: balanceResult.data.freeQuote,
+        freePEPEW: balanceResult.data.freePEPEW
+    };
 
     // Compare
     const check = checkFundsStatus(need, available);
@@ -323,6 +313,6 @@ export async function performFundsCheck(
     return {
         ...check,
         need,
-        available,
-    };
+        available: { freeUSDT: (balanceResult.data as any).freeUSDT || 0, freePEPEW: balanceResult.data.freePEPEW }, // Carry over USDT for backward compatibility if needed, or update interface
+    } as any;
 }

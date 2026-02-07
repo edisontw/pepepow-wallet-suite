@@ -190,6 +190,141 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_strategy_order_lookup ON strategy_order(exchange, pair);
 `);
 
+// DevMM (Dev Fee Market Making) tables
+db.exec(`
+  CREATE TABLE IF NOT EXISTS devmm_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exchange TEXT NOT NULL,
+    tg_user_id TEXT,
+    symbol TEXT NOT NULL DEFAULT 'PEPEW/USDT',
+    min_notional_usdt REAL NOT NULL,
+    order_quote_usdt REAL NOT NULL,
+    buy_offset_pct REAL NOT NULL DEFAULT 0.02,
+    sell_offset_pct REAL NOT NULL DEFAULT 0.01,
+    refresh_seconds INTEGER NOT NULL DEFAULT 45,
+    refresh_jitter_seconds INTEGER NOT NULL DEFAULT 15,
+    cooldown_minutes INTEGER NOT NULL DEFAULT 15,
+    cap_ratio REAL NOT NULL DEFAULT 0.10,
+    cap_day_min_usdt REAL NOT NULL DEFAULT 10,
+    inventory_target_usdt_share REAL NOT NULL DEFAULT 0.20,
+    inventory_min_usdt_share REAL NOT NULL DEFAULT 0.10,
+    inventory_resume_usdt_share REAL NOT NULL DEFAULT 0.15,
+    inventory_max_usdt_share REAL NOT NULL DEFAULT 0.30,
+    trend_guard_pct REAL NOT NULL DEFAULT 0.08,
+    trend_pause_minutes INTEGER NOT NULL DEFAULT 60,
+    spread_min_pct REAL NOT NULL DEFAULT 0.002,
+    spread_max_pct REAL NOT NULL DEFAULT 0.03,
+    is_enabled INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(exchange, symbol)
+  );
+
+  CREATE TABLE IF NOT EXISTS devmm_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exchange TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'STOPPED',
+    pause_reason TEXT,
+    last_action TEXT,
+    last_action_at INTEGER,
+    last_error TEXT,
+    last_error_at INTEGER,
+    used_turnover_today_usdt REAL NOT NULL DEFAULT 0,
+    used_turnover_hour_usdt REAL NOT NULL DEFAULT 0,
+    hour_bucket TEXT,
+    day_bucket TEXT,
+    last_bid REAL,
+    last_ask REAL,
+    last_mid REAL,
+    last_ref REAL,
+    usdt_balance REAL,
+    pepew_balance REAL,
+    usdt_share REAL,
+    open_buy_order_id TEXT,
+    open_sell_order_id TEXT,
+    cooldown_until INTEGER,
+    vol24h_usdt REAL,
+    vol24h_updated_at INTEGER,
+    ref_samples TEXT,
+    last_tick_at INTEGER,
+    last_decision TEXT,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(exchange, symbol)
+  );
+
+  CREATE TABLE IF NOT EXISTS devmm_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    exchange TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price REAL NOT NULL,
+    qty_pepew REAL NOT NULL,
+    quote_usdt REAL NOT NULL,
+    fee_usdt REAL,
+    order_id TEXT,
+    trade_id TEXT,
+    day_bucket TEXT NOT NULL,
+    week_bucket TEXT NOT NULL,
+    month_bucket TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_devmm_fills_day ON devmm_fills(exchange, day_bucket);
+  CREATE INDEX IF NOT EXISTS idx_devmm_fills_week ON devmm_fills(exchange, week_bucket);
+  CREATE INDEX IF NOT EXISTS idx_devmm_fills_month ON devmm_fills(exchange, month_bucket);
+  CREATE INDEX IF NOT EXISTS idx_devmm_fills_ts ON devmm_fills(exchange, ts);
+`);
+
+// Migration: add tg_user_id column to devmm_config if it doesn't exist
+try {
+    const columns = db.prepare("PRAGMA table_info(devmm_config)").all() as { name: string }[];
+    const hasTgUserId = columns.some(col => col.name === "tg_user_id");
+    if (!hasTgUserId) {
+        db.exec("ALTER TABLE devmm_config ADD COLUMN tg_user_id TEXT");
+        console.log("[db] Migration: added tg_user_id column to devmm_config");
+    }
+} catch (e) {
+    console.warn("[db] Migration check for devmm_config tg_user_id failed:", e);
+}
+
+// Migration: add symbol to devmm_state if it doesn't exist (previously it might have been missing or just exchange was unique)
+try {
+    const columns = db.prepare("PRAGMA table_info(devmm_state)").all() as { name: string }[];
+    const hasSymbol = columns.some(col => col.name === "symbol");
+    if (!hasSymbol) {
+        db.exec("ALTER TABLE devmm_state ADD COLUMN symbol TEXT NOT NULL DEFAULT 'PEPEW/USDT'");
+        console.log("[db] Migration: added symbol column to devmm_state");
+    }
+} catch (e) {
+    console.warn("[db] Migration check for devmm_state symbol failed:", e);
+}
+
+// Migration: Ensure UNIQUE(exchange, symbol) index exists for devmm_config and devmm_state
+try {
+    // We check if the unique constraint/index on just 'exchange' exists and try to replace it or just add the new one.
+    // In SQLite, adding a new unique index is safer than trying to drop the old one if it was part of CREATE TABLE.
+    db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_devmm_config_exchange_symbol ON devmm_config(exchange, symbol);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_devmm_state_exchange_symbol ON devmm_state(exchange, symbol);
+    `);
+    console.log("[db] Migration: Ensure unique indexes (exchange, symbol) exist for DevMM");
+} catch (e) {
+    console.warn("[db] Migration: failed to create unique indexes for DevMM:", e);
+}
+
+// Migration: add last_tick_at and last_decision to devmm_state if they don't exist
+try {
+    const columns = db.prepare("PRAGMA table_info(devmm_state)").all() as { name: string }[];
+    const hasLastTickAt = columns.some(col => col.name === "last_tick_at");
+    if (!hasLastTickAt) {
+        db.exec("ALTER TABLE devmm_state ADD COLUMN last_tick_at INTEGER");
+        db.exec("ALTER TABLE devmm_state ADD COLUMN last_decision TEXT");
+        console.log("[db] Migration: added last_tick_at and last_decision columns to devmm_state");
+    }
+} catch (e) {
+    console.warn("[db] Migration check for devmm_state tick info failed:", e);
+}
+
 console.log(`[db] Opened database at ${dbPath}`);
 
 function migrateLegacyDcaConfigs(): void {
@@ -622,6 +757,14 @@ export function setStrategyEnabledById(configId: number, tgUserId: string, enabl
         : db.prepare(
             "UPDATE trade_strategy_config SET enabled = 0, updated_at = ? WHERE id = ? AND tg_user_id = ?"
         ).run(now, configId, tgUserId);
+    return result.changes > 0;
+}
+
+export function setStrategyDisabledWithReason(configId: number, tgUserId: string, reason: string): boolean {
+    const now = Date.now();
+    const result = db.prepare(
+        "UPDATE trade_strategy_config SET enabled = 0, disabled_reason = ?, updated_at = ? WHERE id = ? AND tg_user_id = ?"
+    ).run(reason, now, configId, tgUserId);
     return result.changes > 0;
 }
 
@@ -1422,6 +1565,412 @@ export function cleanupOldFailures(olderThanDays = 30): number {
         "DELETE FROM strategy_failure WHERE last_seen_at < ?"
     ).run(cutoff);
     return result.changes;
+}
+
+// ============= DevMM Types =============
+
+export type DevmmExchange = "nonkyc" | "dextrade" | "nestex";
+export type DevmmStatus = "ACTIVE" | "DEGRADED" | "PAUSED" | "STOPPED";
+
+export interface DevmmConfig {
+    id: number;
+    exchange: DevmmExchange;
+    symbol: string;
+    min_notional_usdt: number;
+    order_quote_usdt: number;
+    buy_offset_pct: number;
+    sell_offset_pct: number;
+    refresh_seconds: number;
+    refresh_jitter_seconds: number;
+    cooldown_minutes: number;
+    cap_ratio: number;
+    cap_day_min_usdt: number;
+    inventory_target_usdt_share: number;
+    inventory_min_usdt_share: number;
+    inventory_resume_usdt_share: number;
+    inventory_max_usdt_share: number;
+    trend_guard_pct: number;
+    trend_pause_minutes: number;
+    spread_min_pct: number;
+    spread_max_pct: number;
+    is_enabled: number;
+    tg_user_id: string | null;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface DevmmState {
+    id: number;
+    exchange: DevmmExchange;
+    status: DevmmStatus;
+    pause_reason: string | null;
+    last_action: string | null;
+    last_action_at: number | null;
+    last_error: string | null;
+    last_error_at: number | null;
+    used_turnover_today_usdt: number;
+    used_turnover_hour_usdt: number;
+    hour_bucket: string | null;
+    day_bucket: string | null;
+    last_bid: number | null;
+    last_ask: number | null;
+    last_mid: number | null;
+    last_ref: number | null;
+    usdt_balance: number | null;
+    pepew_balance: number | null;
+    usdt_share: number | null;
+    open_buy_order_id: string | null;
+    open_sell_order_id: string | null;
+    cooldown_until: number | null;
+    vol24h_usdt: number | null;
+    vol24h_updated_at: number | null;
+    ref_samples: string | null;
+    last_tick_at: number | null;
+    last_decision: string | null;
+    updated_at: number;
+}
+
+export interface DevmmFill {
+    id: number;
+    ts: number;
+    exchange: DevmmExchange;
+    symbol: string;
+    side: "BUY" | "SELL";
+    price: number;
+    qty_pepew: number;
+    quote_usdt: number;
+    fee_usdt: number | null;
+    order_id: string | null;
+    trade_id: string | null;
+    day_bucket: string;
+    week_bucket: string;
+    month_bucket: string;
+}
+
+// Default minNotional by exchange
+export const DEVMM_MIN_NOTIONAL: Record<DevmmExchange, number> = {
+    nonkyc: 1,
+    dextrade: 5,
+    nestex: 1.0,
+};
+
+const DEVMM_DEFAULT_INVENTORY_MIN_SHARE = Number(process.env.DEVMM_INVENTORY_MIN_USDT_SHARE || 0.1);
+const DEVMM_DEFAULT_INVENTORY_MAX_SHARE = Number(process.env.DEVMM_INVENTORY_MAX_USDT_SHARE || 0.9);
+
+// ============= DevMM Config Functions =============
+
+export function getDevmmConfig(exchange: DevmmExchange, symbol = "PEPEW/USDT"): DevmmConfig | null {
+    const row = db.prepare(
+        "SELECT * FROM devmm_config WHERE exchange = ? AND symbol = ?"
+    ).get(exchange, symbol) as DevmmConfig | undefined;
+    return row || null;
+}
+
+export function getDevmmConfigById(id: number): DevmmConfig | null {
+    const row = db.prepare(
+        "SELECT * FROM devmm_config WHERE id = ?"
+    ).get(id) as DevmmConfig | undefined;
+    return row || null;
+}
+
+export function upsertDevmmConfig(params: {
+    exchange: DevmmExchange;
+    symbol?: string;
+    tgUserId?: string;
+    orderQuoteUsdt?: number;
+    buyOffsetPct?: number;
+    sellOffsetPct?: number;
+    refreshSeconds?: number;
+    inventoryMinUsdtShare?: number;
+    inventoryMaxUsdtShare?: number;
+}): DevmmConfig {
+    const now = Date.now();
+    const symbol = params.symbol || "PEPEW/USDT";
+    const minNotional = DEVMM_MIN_NOTIONAL[params.exchange];
+    const defaultOrderQuote = minNotional * 1.05;
+    const orderQuote = params.orderQuoteUsdt ?? defaultOrderQuote;
+    const buyOffset = params.buyOffsetPct ?? 0.02;
+    const sellOffset = params.sellOffsetPct ?? 0.01;
+    const refreshSec = params.refreshSeconds ?? 45;
+    const tgUserId = params.tgUserId ?? null;
+    const invMinRaw = params.inventoryMinUsdtShare ?? DEVMM_DEFAULT_INVENTORY_MIN_SHARE;
+    const invMaxRaw = params.inventoryMaxUsdtShare ?? DEVMM_DEFAULT_INVENTORY_MAX_SHARE;
+    const invMin = Math.min(Math.max(invMinRaw, 0), 0.99);
+    const invMax = Math.min(Math.max(invMaxRaw, invMin + 0.01), 1);
+
+    db.prepare(`
+        INSERT INTO devmm_config
+        (exchange, symbol, tg_user_id, min_notional_usdt, order_quote_usdt, buy_offset_pct, sell_offset_pct, refresh_seconds, inventory_min_usdt_share, inventory_max_usdt_share, is_enabled, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(exchange, symbol) DO UPDATE SET
+            tg_user_id = COALESCE(?, tg_user_id),
+            order_quote_usdt = ?,
+            buy_offset_pct = ?,
+            sell_offset_pct = ?,
+            refresh_seconds = ?,
+            inventory_min_usdt_share = ?,
+            inventory_max_usdt_share = ?,
+            is_enabled = 1,
+            updated_at = ?
+    `).run(
+        params.exchange, symbol, tgUserId, minNotional, orderQuote > 0 ? orderQuote : defaultOrderQuote, buyOffset, sellOffset, refreshSec, invMin, invMax, now, now,
+        tgUserId, orderQuote > 0 ? orderQuote : defaultOrderQuote, buyOffset, sellOffset, refreshSec, invMin, invMax, now
+    );
+
+    return getDevmmConfig(params.exchange, symbol)!;
+}
+
+export function disableDevmmConfig(exchange: DevmmExchange, symbol = "PEPEW/USDT"): boolean {
+    const now = Date.now();
+    const result = db.prepare(
+        "UPDATE devmm_config SET is_enabled = 0, updated_at = ? WHERE exchange = ? AND symbol = ?"
+    ).run(now, exchange, symbol);
+    return result.changes > 0;
+}
+
+export function getEnabledDevmmConfigs(): DevmmConfig[] {
+    return db.prepare(
+        "SELECT * FROM devmm_config WHERE is_enabled = 1"
+    ).all() as DevmmConfig[];
+}
+
+// ============= DevMM State Functions =============
+
+export function getDevmmState(exchange: DevmmExchange, symbol = "PEPEW/USDT"): DevmmState | null {
+    const row = db.prepare(
+        "SELECT * FROM devmm_state WHERE exchange = ? AND symbol = ?"
+    ).get(exchange, symbol) as DevmmState | undefined;
+    return row || null;
+}
+
+
+export function upsertDevmmState(exchange: DevmmExchange, symbol: string, updates: Partial<Omit<DevmmState, "id" | "exchange" | "symbol">>): DevmmState {
+    const now = Date.now();
+    const existing = getDevmmState(exchange, symbol);
+
+    if (!existing) {
+        db.prepare(`
+            INSERT INTO devmm_state (exchange, symbol, status, updated_at)
+            VALUES (?, ?, 'STOPPED', ?)
+        `).run(exchange, symbol, now);
+    }
+
+    const fields: string[] = [];
+    const values: any[] = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+        if (key === "id" || key === "exchange" || key === "symbol") continue;
+        fields.push(`${key} = ?`);
+        values.push(value);
+    }
+
+    if (fields.length > 0) {
+        fields.push("updated_at = ?");
+        values.push(now);
+        values.push(exchange);
+        values.push(symbol);
+        db.prepare(`UPDATE devmm_state SET ${fields.join(", ")} WHERE exchange = ? AND symbol = ?`).run(...values);
+    }
+
+    return getDevmmState(exchange, symbol)!;
+}
+
+export function setDevmmStatus(exchange: DevmmExchange, symbol: string, status: DevmmStatus, pauseReason?: string | null): void {
+    const now = Date.now();
+    db.prepare(`
+        UPDATE devmm_state SET status = ?, pause_reason = ?, updated_at = ?
+        WHERE exchange = ? AND symbol = ?
+    `).run(status, pauseReason ?? null, now, exchange, symbol);
+}
+
+export function updateDevmmAction(exchange: DevmmExchange, symbol: string, action: string): void {
+    const now = Date.now();
+    db.prepare(`
+        UPDATE devmm_state SET last_action = ?, last_action_at = ?, updated_at = ?
+        WHERE exchange = ? AND symbol = ?
+    `).run(action, now, now, exchange, symbol);
+}
+
+export function updateDevmmError(exchange: DevmmExchange, symbol: string, error: string): void {
+    const now = Date.now();
+    db.prepare(`
+        UPDATE devmm_state SET last_error = ?, last_error_at = ?, updated_at = ?
+        WHERE exchange = ? AND symbol = ?
+    `).run(error, now, now, exchange, symbol);
+}
+
+export function resetDevmmTurnover(exchange: DevmmExchange, symbol: string, dayBucket: string, hourBucket: string): void {
+    const now = Date.now();
+    db.prepare(`
+        UPDATE devmm_state SET
+            used_turnover_today_usdt = 0,
+            used_turnover_hour_usdt = 0,
+            day_bucket = ?,
+            hour_bucket = ?,
+            updated_at = ?
+        WHERE exchange = ? AND symbol = ?
+    `).run(dayBucket, hourBucket, now, exchange, symbol);
+}
+
+export function incrementDevmmTurnover(exchange: DevmmExchange, symbol: string, addUsdt: number): void {
+    const now = Date.now();
+    db.prepare(`
+        UPDATE devmm_state SET
+            used_turnover_today_usdt = used_turnover_today_usdt + ?,
+            used_turnover_hour_usdt = used_turnover_hour_usdt + ?,
+            updated_at = ?
+        WHERE exchange = ? AND symbol = ?
+    `).run(addUsdt, addUsdt, now, exchange, symbol);
+}
+
+// ============= DevMM Fills Functions =============
+
+export function insertDevmmFill(params: {
+    exchange: DevmmExchange;
+    symbol: string;
+    side: "BUY" | "SELL";
+    price: number;
+    qtyPepew: number;
+    quoteUsdt: number;
+    feeUsdt?: number | null;
+    orderId?: string | null;
+    tradeId?: string | null;
+}): DevmmFill {
+    const now = Date.now();
+    // Use Asia/Taipei timezone (UTC+8) for day bucketing
+    const d = new Date(now + 8 * 60 * 60 * 1000);
+    const dayBucket = d.toISOString().slice(0, 10);
+    const year = d.getUTCFullYear();
+    const weekNum = getISOWeek(d);
+    const weekBucket = `${year}-W${String(weekNum).padStart(2, "0")}`;
+    const monthBucket = d.toISOString().slice(0, 7);
+
+    const result = db.prepare(`
+        INSERT INTO devmm_fills
+        (ts, exchange, symbol, side, price, qty_pepew, quote_usdt, fee_usdt, order_id, trade_id, day_bucket, week_bucket, month_bucket)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        now,
+        params.exchange,
+        params.symbol,
+        params.side,
+        params.price,
+        params.qtyPepew,
+        params.quoteUsdt,
+        params.feeUsdt ?? null,
+        params.orderId ?? null,
+        params.tradeId ?? null,
+        dayBucket,
+        weekBucket,
+        monthBucket
+    );
+
+    return {
+        id: result.lastInsertRowid as number,
+        ts: now,
+        exchange: params.exchange,
+        symbol: params.symbol,
+        side: params.side,
+        price: params.price,
+        qty_pepew: params.qtyPepew,
+        quote_usdt: params.quoteUsdt,
+        fee_usdt: params.feeUsdt ?? null,
+        order_id: params.orderId ?? null,
+        trade_id: params.tradeId ?? null,
+        day_bucket: dayBucket,
+        week_bucket: weekBucket,
+        month_bucket: monthBucket,
+    };
+}
+
+function getISOWeek(date: Date): number {
+    const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    const dayNum = d.getUTCDay() || 7;
+    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+}
+
+export interface DevmmReport {
+    period: string;
+    exchange: DevmmExchange;
+    buyTurnoverUsdt: number;
+    sellTurnoverUsdt: number;
+    totalTurnoverUsdt: number;
+    buyQtyPepew: number;
+    sellQtyPepew: number;
+    buyVwap: number | null;
+    sellVwap: number | null;
+    overallVwap: number | null;
+    totalFeeUsdt: number | null;
+    netUsdtChange: number;
+    netPepewChange: number;
+    fillCount: number;
+}
+
+export function getDevmmReport(exchange: DevmmExchange, periodType: "daily" | "weekly" | "monthly", bucket?: string): DevmmReport | null {
+    const bucketColumn = periodType === "daily" ? "day_bucket" : periodType === "weekly" ? "week_bucket" : "month_bucket";
+
+    let targetBucket = bucket;
+    if (!targetBucket) {
+        const now = Date.now();
+        const d = new Date(now + 8 * 60 * 60 * 1000);
+        if (periodType === "daily") {
+            targetBucket = d.toISOString().slice(0, 10);
+        } else if (periodType === "weekly") {
+            const weekNum = getISOWeek(d);
+            targetBucket = `${d.getUTCFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+        } else {
+            targetBucket = d.toISOString().slice(0, 7);
+        }
+    }
+
+    const rows = db.prepare(`
+        SELECT side, SUM(quote_usdt) as total_quote, SUM(qty_pepew) as total_qty, SUM(fee_usdt) as total_fee, COUNT(*) as cnt
+        FROM devmm_fills
+        WHERE exchange = ? AND ${bucketColumn} = ? AND COALESCE(trade_id, '') != 'ASSUMED_VISIBILITY_TIMEOUT'
+        GROUP BY side
+    `).all(exchange, targetBucket) as Array<{ side: string; total_quote: number; total_qty: number; total_fee: number | null; cnt: number }>;
+
+    if (rows.length === 0) {
+        return null;
+    }
+
+    let buyTurnover = 0, sellTurnover = 0, buyQty = 0, sellQty = 0, totalFee = 0, fillCount = 0;
+    for (const row of rows) {
+        fillCount += row.cnt;
+        if (row.side === "BUY") {
+            buyTurnover = row.total_quote;
+            buyQty = row.total_qty;
+        } else {
+            sellTurnover = row.total_quote;
+            sellQty = row.total_qty;
+        }
+        if (row.total_fee) totalFee += row.total_fee;
+    }
+
+    return {
+        period: targetBucket,
+        exchange,
+        buyTurnoverUsdt: buyTurnover,
+        sellTurnoverUsdt: sellTurnover,
+        totalTurnoverUsdt: buyTurnover + sellTurnover,
+        buyQtyPepew: buyQty,
+        sellQtyPepew: sellQty,
+        buyVwap: buyQty > 0 ? buyTurnover / buyQty : null,
+        sellVwap: sellQty > 0 ? sellTurnover / sellQty : null,
+        overallVwap: (buyQty + sellQty) > 0 ? (buyTurnover + sellTurnover) / (buyQty + sellQty) : null,
+        totalFeeUsdt: totalFee || null,
+        netUsdtChange: sellTurnover - buyTurnover,
+        netPepewChange: buyQty - sellQty,
+        fillCount,
+    };
+}
+
+export function getDevmmPauseStats(exchange: DevmmExchange, dayBucket: string): Record<string, number> {
+    // This would track pause reasons but for simplicity we'll return empty for now
+    // Could be enhanced to track in a separate table
+    return {};
 }
 
 export default db;

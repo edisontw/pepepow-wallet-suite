@@ -5,6 +5,7 @@ import dcaRoutes from "./routes/dca.js";
 import strategyRoutes from "./routes/strategy.js";
 import keysRoutes from "./routes/keys.js";
 import orderRoutes from "./routes/order.js";
+import devmmRoutes from "./routes/devmm.js";
 import { startScheduler } from "./scheduler.js";
 import { cleanupOldFailures, getDbPath } from "./db.js";
 
@@ -28,12 +29,22 @@ app.get("/healthz", (_req, res) => {
     });
 });
 
+// Readiness check
+app.get("/readyz", (_req, res) => {
+    const dbExists = fs.existsSync(DB_PATH);
+    if (!dbExists) {
+        return res.status(500).json({ ok: false, service: "trade-api", error: "DB not found" });
+    }
+    res.json({ ok: true, service: "trade-api", db: "ready" });
+});
+
 // Mount routes
 app.use(priceRoutes);
 app.use(dcaRoutes);
 app.use(strategyRoutes);
 app.use(keysRoutes);
 app.use(orderRoutes);
+app.use(devmmRoutes);
 
 // Error handler
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

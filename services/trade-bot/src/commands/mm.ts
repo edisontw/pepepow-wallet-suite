@@ -2,6 +2,7 @@ import { Context, InlineKeyboard } from "grammy";
 import { ApiError, enableStrategyConfig, disableStrategyConfig, getStrategyStatus, upsertStrategyConfig, getKeysStatus, checkStrategyFunds, cancelStrategyOrders } from "../api.js";
 import { logTelegramError, safeSend } from "../utils/telegram.js";
 import { ExchangeName, formatPairDisplay, formatPairLabel, getAllowedPairs } from "../lib/markets.js";
+import { getRegistryPromptHelpers } from "../lib/registryPrompt.js";
 
 const MM_STATE_TTL_MS = 15 * 60 * 1000;
 const MM_CALLBACK_MAX_BYTES = 64;
@@ -144,15 +145,20 @@ export async function handleMmStop(ctx: Context): Promise<void> {
         }
 
         if (active.length === 1) {
-            // Cancel open orders on exchange first
-            try {
-                const cancelResult = await cancelStrategyOrders(active[0].id, tgUserId);
-                console.log(`[mm_stop] cancelled orders: ${cancelResult.cancelledCount ?? 0}`);
-            } catch (cancelErr: any) {
-                console.warn(`[mm_stop] cancel orders failed: ${cancelErr?.message}`);
-            }
-            await disableStrategyConfig(active[0].id, tgUserId);
-            await safeSend(ctx, { step: "mm_stop.ok", text: "🛑 MM stopped and open orders cancelled." });
+            await safeSend(ctx, { step: "mm_stop.stopping", text: "🛑 MM stopping... cancelling orders" });
+            void (async () => {
+                try {
+                    await disableStrategyConfig(active[0].id, tgUserId, "STOPPING");
+                } catch (disableErr: any) {
+                    console.warn(`[mm_stop] disable failed: ${disableErr?.message}`);
+                }
+                try {
+                    const cancelResult = await cancelStrategyOrders(active[0].id, tgUserId);
+                    console.log(`[mm_stop] cancelled orders: ${cancelResult.cancelledCount ?? 0}`);
+                } catch (cancelErr: any) {
+                    console.warn(`[mm_stop] cancel orders failed: ${cancelErr?.message}`);
+                }
+            })();
             return;
         }
 
@@ -197,16 +203,21 @@ export async function handleMmCallback(ctx: Context): Promise<boolean> {
 
     if (action === "stop" && value) {
         const configId = Number(value);
-        // Cancel open orders on exchange first
-        try {
-            const cancelResult = await cancelStrategyOrders(configId, tgUserId);
-            console.log(`[mm_stop] cancelled orders: ${cancelResult.cancelledCount ?? 0}`);
-        } catch (cancelErr: any) {
-            console.warn(`[mm_stop] cancel orders failed: ${cancelErr?.message}`);
-        }
-        await disableStrategyConfig(configId, tgUserId);
         await safeAnswerCallbackQuery(ctx, "mm.cb.stop");
-        await safeSend(ctx, { step: "mm.cb.stop_msg", text: "🛑 MM stopped and open orders cancelled." });
+        await safeSend(ctx, { step: "mm.cb.stop_msg", text: "🛑 MM stopping... cancelling orders" });
+        void (async () => {
+            try {
+                await disableStrategyConfig(configId, tgUserId, "STOPPING");
+            } catch (disableErr: any) {
+                console.warn(`[mm_stop] disable failed: ${disableErr?.message}`);
+            }
+            try {
+                const cancelResult = await cancelStrategyOrders(configId, tgUserId);
+                console.log(`[mm_stop] cancelled orders: ${cancelResult.cancelledCount ?? 0}`);
+            } catch (cancelErr: any) {
+                console.warn(`[mm_stop] cancel orders failed: ${cancelErr?.message}`);
+            }
+        })();
         return true;
     }
 
@@ -341,7 +352,7 @@ export async function handleMmCallback(ctx: Context): Promise<boolean> {
                 `Pair: ${pairDisplay}`,
                 "Mode: REAL",
                 `Spread: ${formatQuantity(state.spreadPct * 100)}%`,
-                `Quote/order: ${formatQuantity(state.orderQuote)} USDT`,
+                `Quote/order: ${formatQuantity(state.orderQuote)} ${(await getRegistryPromptHelpers(state.exchange!, state.symbol!)).quoteAsset}`,
                 `Orders/side: ${state.ordersPerSide}`,
                 "Status: ACTIVE",
             ];
@@ -395,14 +406,20 @@ export async function handleMmTextInput(ctx: Context): Promise<boolean> {
         state.step = "order";
         state.updatedAt = Date.now();
         pendingMm.set(tgUserId, state);
-        await safeSend(ctx, { step: "mm.order", text: "Enter quote per order (> 1 USDT, e.g. 1.05):" });
+        const helpers = await getRegistryPromptHelpers(state.exchange!, state.symbol!);
+        await safeSend(ctx, { step: "mm.order", text: `Enter quote per order (> ${helpers.minLabel}, ${helpers.exampleLabel}):` });
         return true;
     }
 
     if (state.step === "order") {
         const orderQuote = Number(text);
-        if (!Number.isFinite(orderQuote) || orderQuote <= 1) {
-            await safeSend(ctx, { step: "mm.order.invalid", text: "❌ NonKYC minimum order is > 1 USDT. Suggest ≥ 1.05." });
+        const helpers = await getRegistryPromptHelpers(state.exchange!, state.symbol!);
+        if (!Number.isFinite(orderQuote) || orderQuote <= helpers.minNotional) {
+            const label = exchangeLabel(state.exchange!);
+            await safeSend(ctx, {
+                step: "mm.order.invalid",
+                text: `❌ ${label} minimum order is > ${helpers.minLabel}. Suggest > ${helpers.exampleLabel}.`
+            });
             return true;
         }
 

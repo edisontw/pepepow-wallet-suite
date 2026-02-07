@@ -1,13 +1,190 @@
+import fetch from "node-fetch";
 import { NormalizedTicker } from "../types.js";
 import { fetchWithTimeout, parseNumber, truncateRaw } from "../utils.js";
 
 const NESTEX_TICKER_URL =
     process.env.NESTEX_TICKER_URL || "https://trade.nestex.one/api/cg/tickers/PEPEW_USDT";
+const NESTEX_ORDERBOOK_URL =
+    process.env.NESTEX_ORDERBOOK_URL || "https://trade.nestex.one/api/cg/orderbook/PEPEW_USDT";
+const NESTEX_DEBUG =
+    process.env.DEBUG_NESTEX === "1" ||
+    process.env.DEBUG_NESTEX === "true" ||
+    process.env.NESTEX_DEBUG === "1" ||
+    process.env.NESTEX_DEBUG === "true";
+let orderbookEndpointDisabled = false;
+let orderbookDisableReason: string | null = null;
+let orderbookDisableLogged = false;
+
+function debugLog(label: string, data: any): void {
+    if (!NESTEX_DEBUG) return;
+    console.log(`[nestex:debug] ${label}:`, typeof data === "object" ? JSON.stringify(data, null, 2) : data);
+}
+
+function extractSymbolFromUrl(url: string): string | null {
+    try {
+        const parsed = new URL(url);
+        const parts = parsed.pathname.split("/").filter(Boolean);
+        const last = parts.length > 0 ? parts[parts.length - 1] : "";
+        return last ? decodeURIComponent(last).toUpperCase() : null;
+    } catch {
+        return null;
+    }
+}
+
+function collectOrderbookPrices(side: any): number[] {
+    if (!side) return [];
+    const prices: number[] = [];
+    if (Array.isArray(side)) {
+        for (const entry of side) {
+            if (Array.isArray(entry)) {
+                const price = parseNumber(entry[0]);
+                if (price !== null && price > 0) prices.push(price);
+            } else if (entry && typeof entry === "object") {
+                const price = parseNumber(entry.price ?? entry.rate ?? entry[0]);
+                if (price !== null && price > 0) prices.push(price);
+            }
+        }
+    } else if (typeof side === "object") {
+        for (const key of Object.keys(side)) {
+            const price = parseNumber(key);
+            if (price !== null && price > 0) prices.push(price);
+        }
+    }
+    return prices;
+}
+
+function samplePrices(values: number[], limit = 5, order: "asc" | "desc" = "asc"): number[] {
+    const copy = values.slice();
+    copy.sort((a, b) => order === "asc" ? a - b : b - a);
+    return copy.slice(0, limit);
+}
+
+export async function fetchNestExOrderbookTop(): Promise<{
+    bestBid: number | null;
+    bestAsk: number | null;
+    status: "OK" | "EMPTY" | "INVALID";
+    raw: string;
+    bookSource: "orderbook" | "ticker_fallback" | "ticker_primary";
+}> {
+    if (!NESTEX_ORDERBOOK_URL) {
+        console.error(`[nestex] book.fail errCode=NO_BOOK url=n/a statusCode=n/a reason=ORDERBOOK_URL_EMPTY`);
+        return { bestBid: null, bestAsk: null, status: "EMPTY", raw: JSON.stringify({ error: "NestEx orderbook not configured" }), bookSource: "orderbook" };
+    }
+
+    const fallbackToTicker = async (
+        reason: string,
+        raw: string,
+        source: "ticker_fallback" | "ticker_primary" = "ticker_fallback"
+    ): Promise<{
+        bestBid: number | null;
+        bestAsk: number | null;
+        status: "OK" | "EMPTY" | "INVALID";
+        raw: string;
+        bookSource: "orderbook" | "ticker_fallback" | "ticker_primary";
+    }> => {
+        const ticker = await fetchNestExTicker();
+        const bestBid = ticker.ticker.bid ?? null;
+        const bestAsk = ticker.ticker.ask ?? null;
+        if (bestBid !== null && bestAsk !== null && bestBid > 0 && bestAsk > 0) {
+            const status = bestAsk <= bestBid ? "INVALID" : "OK";
+            if (source === "ticker_primary") {
+                if (!orderbookDisableLogged || orderbookDisableReason !== reason) {
+                    console.log(`[nestex] book.primary source=ticker bid=${bestBid} ask=${bestAsk} reason=${reason}`);
+                    orderbookDisableLogged = true;
+                }
+            } else {
+                console.log(`[nestex] book.fallback reason=${reason} bestBid=${bestBid} bestAsk=${bestAsk} source=ticker`);
+            }
+            return { bestBid, bestAsk, status, raw, bookSource: source };
+        }
+        console.error(`[nestex] book.fail errCode=NO_BOOK url=${NESTEX_ORDERBOOK_URL} statusCode=n/a reason=${reason}`);
+        return { bestBid: null, bestAsk: null, status: "EMPTY", raw, bookSource: source };
+    };
+
+    if (orderbookEndpointDisabled) {
+        const reason = orderbookDisableReason || "ORDERBOOK_ENDPOINT_DISABLED";
+        return fallbackToTicker(reason, JSON.stringify({ reason }), "ticker_primary");
+    }
+
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        let res: any;
+        try {
+            res = await fetch(NESTEX_ORDERBOOK_URL, { signal: controller.signal });
+        } finally {
+            clearTimeout(timeout);
+        }
+
+        const httpStatus = Number(res?.status ?? 0);
+        let data: any = null;
+        try {
+            data = await res.json();
+        } catch {
+            data = null;
+        }
+
+        if (httpStatus === 404) {
+            orderbookEndpointDisabled = true;
+            orderbookDisableReason = "ORDERBOOK_ENDPOINT_404_DISABLED";
+            orderbookDisableLogged = false;
+            return fallbackToTicker(orderbookDisableReason, truncateRaw(data ?? { status: 404 }), "ticker_primary");
+        }
+
+        if (!res.ok) {
+            const reason = `ORDERBOOK_HTTP_${httpStatus || "ERROR"}`;
+            return fallbackToTicker(reason, truncateRaw(data ?? { status: httpStatus }));
+        }
+
+        const d = unwrapNestExTicker(data);
+        const bidPrices = collectOrderbookPrices(d?.bids ?? d?.bid ?? d?.buy);
+        const askPrices = collectOrderbookPrices(d?.asks ?? d?.ask ?? d?.sell);
+        const bestBid = bidPrices.length > 0 ? Math.max(...bidPrices) : null;
+        const bestAsk = askPrices.length > 0 ? Math.min(...askPrices) : null;
+        const mid = (bestBid !== null && bestAsk !== null) ? (bestBid + bestAsk) / 2 : null;
+        const status = bidPrices.length === 0 || askPrices.length === 0
+            ? "EMPTY"
+            : (bestBid !== null && bestAsk !== null && bestAsk <= bestBid)
+                ? "INVALID"
+                : "OK";
+        debugLog("orderbook.parsed", {
+            bestBid,
+            bestAsk,
+            mid,
+            status,
+            bidCount: bidPrices.length,
+            askCount: askPrices.length,
+        });
+        if (status === "EMPTY") {
+            debugLog("orderbook.empty", {
+                bidSample: samplePrices(bidPrices, 5, "desc"),
+                askSample: samplePrices(askPrices, 5, "asc"),
+            });
+            return fallbackToTicker("EMPTY_BOOK", truncateRaw(data));
+        }
+        if (status === "INVALID") {
+            debugLog("orderbook.invalid", {
+                bestBid,
+                bestAsk,
+                bidSample: samplePrices(bidPrices, 5, "desc"),
+                askSample: samplePrices(askPrices, 5, "asc"),
+            });
+            return fallbackToTicker("INVALID_BOOK", truncateRaw(data));
+        }
+        console.log(`[nestex] book.ok bidsCount=${bidPrices.length} asksCount=${askPrices.length} bestBid=${bestBid} bestAsk=${bestAsk} source=orderbook`);
+        return { bestBid, bestAsk, status, raw: truncateRaw(data), bookSource: "orderbook" };
+    } catch (err: any) {
+        console.error(`[nestex] book.fail errCode=NO_BOOK url=${NESTEX_ORDERBOOK_URL} statusCode=n/a reason=${err.message}`);
+        return fallbackToTicker("ORDERBOOK_FETCH_ERROR", JSON.stringify({ error: err.message }));
+    }
+}
 
 function unwrapNestExTicker(data: any): any {
     if (!data) return data;
+    if (data?.data?.ticker) return data.data.ticker;
     if (data?.data) return data.data;
     if (data?.ticker) return data.ticker;
+    if (data?.result) return data.result;
     return data;
 }
 
@@ -26,19 +203,34 @@ export async function fetchNestExTicker(): Promise<{
     }
 
     try {
+        const requestedPair = "PEPEW/USDT";
+        const exchangeSymbol = extractSymbolFromUrl(NESTEX_TICKER_URL) || "PEPEW_USDT";
+        debugLog("symbol mapping", { requestedPair, exchangeSymbol, url: NESTEX_TICKER_URL });
+
         const data = await fetchWithTimeout(NESTEX_TICKER_URL);
         const d = unwrapNestExTicker(data);
         const volumeField =
             d?.target_volume ?? d?.quote_volume ?? d?.quoteVolume ?? d?.volume ?? d?.vol;
+        const last = parseNumber(d?.last_price ?? d?.last ?? d?.close ?? d?.price);
+        const bid = parseNumber(d?.bid);
+        const ask = parseNumber(d?.ask);
+        const mid = (bid !== null && ask !== null && bid > 0 && ask > 0) ? (bid + ask) / 2 : null;
         const ticker: NormalizedTicker = {
             exchange: "nestex",
             symbol: d?.ticker_id || d?.symbol || "PEPEW_USDT",
-            last: parseNumber(d?.last_price ?? d?.last ?? d?.close ?? d?.price),
-            bid: parseNumber(d?.bid),
-            ask: parseNumber(d?.ask),
+            last,
+            bid,
+            ask,
             volumeQuote: parseNumber(volumeField),
             ts: d?.timestamp || Date.now(),
         };
+        debugLog("ticker.parsed", {
+            symbol: ticker.symbol,
+            bestBid: bid,
+            bestAsk: ask,
+            mid,
+            last,
+        });
         return { ticker, raw: truncateRaw(data), volumeProvided: volumeField !== undefined };
     } catch (err: any) {
         console.error(`[price] NestEx fetch error: ${err.message}`);

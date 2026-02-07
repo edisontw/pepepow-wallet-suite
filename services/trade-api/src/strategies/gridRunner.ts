@@ -17,15 +17,16 @@ import {
     getGridOrderByLevel,
 } from "../db.js";
 import { decryptKeyPair } from "../crypto.js";
-import { createDexTradeOrder } from "../exchanges/dextrade.js";
+import { createDexTradeOrder, cancelDexTradeOrder, listDexTradeOpenOrders } from "../exchanges/dextrade.js";
 import { createNonKycOrder, cancelNonKycOrder, getNonkycMarketRules, getNonKycOrderById, listNonKycOpenOrders } from "../exchanges/nonkyc.js";
-import { placeNestExLimitOrder } from "../exchanges/nestex.js";
+import { placeNestExLimitOrder, cancelNestExOrder } from "../exchanges/nestex.js";
 import { ExchangeName, getBaseAsset, getExchangeSymbol, getQuoteUnit } from "../lib/markets.js";
 import { getMinNotional, getPricePrecision, getQtyPrecision } from "../lib/exchanges.js";
 import { fetchExchangePrice } from "./price.js";
 import { StrategyRunner } from "./types.js";
 import { wrapStrategyTick } from "../lib/runner-wrapper.js";
-import { getNonKycNormalizedBalance } from "../lib/fundsCheck.js";
+import { getExchangeNormalizedBalance } from "../lib/fundsCheck.js";
+import { logStrategyTickContract } from "./logContract.js";
 
 // Per-strategy lock to avoid overlapping ticks
 const runningConfigs = new Set<number>();
@@ -37,6 +38,7 @@ type GridParams = {
     grid_levels?: number;
     grid_step_pct?: number;
     total_quote_budget?: number;
+    quote_per_order?: number;
     per_order_quote?: number;
     refresh_sec?: number;
     allow_sell?: boolean;
@@ -128,7 +130,7 @@ export const gridRunner: StrategyRunner = {
             }
             await wrapStrategyTick(config, async () => {
                 const exchange = config.exchange as ExchangeName;
-                const symbol = getExchangeSymbol(exchange, config.pair) || config.pair;
+                const symbol = getExchangeSymbol(exchange, config.pair);
                 const quoteCcy = getQuoteUnit(exchange, config.pair) || "USDT";
 
 
@@ -144,7 +146,7 @@ export const gridRunner: StrategyRunner = {
                 const refreshSec = params.refresh_sec ?? DEFAULT_REFRESH_SEC;
                 const allowSell = params.allow_sell ?? true;
                 const totalBudget = params.total_quote_budget ?? 0;
-                const perOrderQuote = params.per_order_quote ?? (totalBudget > 0 ? totalBudget / gridLevels : 1);
+                const perOrderQuote = params.quote_per_order || params.per_order_quote || (totalBudget > 0 ? totalBudget / gridLevels : 1);
 
                 if (!Number.isFinite(stepPct) || stepPct <= 0 || !Number.isFinite(perOrderQuote) || perOrderQuote <= 0) {
                     return {
@@ -217,14 +219,18 @@ export const gridRunner: StrategyRunner = {
                 // --- 1. FETCH OPEN ORDERS (LOCAL ONLY) & BALANCES ---
                 // --- 1. FETCH OPEN ORDERS & BALANCES ---
                 let localOpenOrders = getOpenGridOrders(config.id);
-                let freeUSDT = 0;
+                let freeQuote = 0;
                 let freePEPEW = 0;
+                let balanceTs: number | null = null;
+                let balanceStalenessMs: number | null = null;
 
                 if (exchange === "nonkyc") {
-                    const balanceResult = await getNonKycNormalizedBalance(apiKey, apiSecret, false);
+                    const balanceResult = await getExchangeNormalizedBalance("nonkyc", apiKey, apiSecret, quoteCcy as "USDT" | "BNB", true);
                     if (balanceResult) {
-                        freeUSDT = balanceResult.data.freeUSDT;
+                        freeQuote = balanceResult.data.freeQuote;
                         freePEPEW = balanceResult.data.freePEPEW;
+                        balanceTs = balanceResult.metadata.fetchedAt;
+                        balanceStalenessMs = balanceResult.metadata.cacheAgeMs;
                     }
 
                     // SYNC WITH EXCHANGE to fix "phantom orders"
@@ -251,7 +257,59 @@ export const gridRunner: StrategyRunner = {
                     } catch (err) {
                         console.warn(`[gridRunner] config=${config.id} sync failed:`, err);
                     }
+                } else if (exchange === "dextrade") {
+                    const balanceResult = await getExchangeNormalizedBalance("dextrade", apiKey, apiSecret, quoteCcy as "USDT" | "BNB", true);
+                    if (balanceResult) {
+                        freeQuote = balanceResult.data.freeQuote || 0;
+                        freePEPEW = balanceResult.data.freePEPEW || 0;
+                        balanceTs = balanceResult.metadata.fetchedAt;
+                        balanceStalenessMs = balanceResult.metadata.cacheAgeMs;
+                    }
+
+                    // SYNC WITH EXCHANGE to fix "phantom orders"
+                    try {
+                        const exchangeOrders = await listDexTradeOpenOrders(apiKey, apiSecret, symbol);
+                        if (exchangeOrders.ok && exchangeOrders.orders) {
+                            const exchangeIds = exchangeOrders.orders.map(o => String(o.order_id));
+                            let syncCount = 0;
+                            for (const lo of localOpenOrders) {
+                                if (!exchangeIds.includes(String(lo.order_id))) {
+                                    // It's gone from exchange. Only sync if it's not brand new (propagation delay)
+                                    if (now - lo.created_at > 10000) {
+                                        updateGridOrderStatus(lo.order_id, "FILLED");
+                                        updateStrategyOrderStatusRegistry(exchange, lo.order_id, "FILLED");
+                                        syncCount++;
+                                    }
+                                }
+                            }
+                            if (syncCount > 0) {
+                                console.log(`[gridRunner] config=${config.id} synced ${syncCount} phantom orders (dextrade)`);
+                                localOpenOrders = getOpenGridOrders(config.id);
+                            }
+                        }
+                    } catch (err) {
+                        console.warn(`[gridRunner] config=${config.id} sync failed (dextrade):`, err);
+                    }
+                } else if (exchange === "nestex") {
+                    const balanceResult = await getExchangeNormalizedBalance("nestex", apiKey, apiSecret, quoteCcy as "USDT" | "BNB", true);
+                    if (balanceResult) {
+                        freeQuote = balanceResult.data.freeQuote || 0;
+                        freePEPEW = balanceResult.data.freePEPEW || 0;
+                        balanceTs = balanceResult.metadata.fetchedAt;
+                        balanceStalenessMs = balanceResult.metadata.cacheAgeMs;
+                    }
                 }
+
+                logStrategyTickContract({
+                    strategyId: config.id,
+                    strategyType: "GRID",
+                    requestedExchangeId: config.exchange,
+                    canonicalPair: config.pair,
+                    exchangeSymbol: symbol,
+                    balanceTs,
+                    balanceStalenessMs,
+                    guards: skipReasons,
+                });
 
                 // --- 2. RECONCILE (DEDUPLICATE) ---
                 // We use price_key (rounded price string) for unique level tracking
@@ -272,6 +330,20 @@ export const gridRunner: StrategyRunner = {
                             console.log(`[gridRunner] config=${config.id} DEDUPE_CANCEL: ${key} id=${o.order_id}`);
                             if (config.trade_mode === "REAL" && exchange === "nonkyc") {
                                 const cancelResult = await cancelNonKycOrder(apiKey, apiSecret, o.order_id);
+                                if (cancelResult.ok || cancelResult.status === 404) {
+                                    updateGridOrderStatus(o.order_id, "CANCELLED");
+                                    updateStrategyOrderStatusRegistry(exchange, o.order_id, "CANCELLED");
+                                    cancelledDuplicates++;
+                                }
+                            } else if (config.trade_mode === "REAL" && exchange === "dextrade") {
+                                const cancelResult = await cancelDexTradeOrder(apiKey, apiSecret, o.order_id, symbol);
+                                if (cancelResult.ok || cancelResult.status === 404) {
+                                    updateGridOrderStatus(o.order_id, "CANCELLED");
+                                    updateStrategyOrderStatusRegistry(exchange, o.order_id, "CANCELLED");
+                                    cancelledDuplicates++;
+                                }
+                            } else if (config.trade_mode === "REAL" && exchange === "nestex") {
+                                const cancelResult = await cancelNestExOrder(apiKey, apiSecret, o.order_id, `USER:${config.tg_user_id}`);
                                 if (cancelResult.ok || cancelResult.status === 404) {
                                     updateGridOrderStatus(o.order_id, "CANCELLED");
                                     updateStrategyOrderStatusRegistry(exchange, o.order_id, "CANCELLED");
@@ -340,12 +412,12 @@ export const gridRunner: StrategyRunner = {
                 const finalToCreateSell = toCreate.filter(o => o.side === "SELL").slice(0, sellRoom);
                 const finalToCreate = [...finalToCreateBuy, ...finalToCreateSell];
 
-                const totalNeededUSDT = finalToCreateBuy.reduce((sum, o) => sum + (o.qty * o.price), 0) * 1.05;
+                const totalNeededQuote = finalToCreateBuy.reduce((sum, o) => sum + (o.qty * o.price), 0) * 1.05;
                 const totalNeededPEPEW = finalToCreateSell.reduce((sum, o) => sum + o.qty, 0) * 1.05;
 
                 if (exchange === "nonkyc") {
-                    if (finalToCreateBuy.length > 0 && freeUSDT < totalNeededUSDT) {
-                        const msg = `SKIP: Insufficient USDT (have ${freeUSDT.toFixed(2)}, need ${totalNeededUSDT.toFixed(2)})`;
+                    if (finalToCreateBuy.length > 0 && freeQuote < totalNeededQuote) {
+                        const msg = `SKIP: Insufficient ${quoteCcy} (have ${freeQuote.toFixed(quoteCcy === "BNB" ? 4 : 2)}, need ${totalNeededQuote.toFixed(quoteCcy === "BNB" ? 4 : 2)})`;
                         console.warn(`[gridRunner] config=${config.id} ${msg}`);
                         skipReasons.push(msg);
                         finalToCreate.splice(0, finalToCreate.length, ...finalToCreate.filter(o => o.side !== "BUY"));
@@ -366,7 +438,8 @@ export const gridRunner: StrategyRunner = {
                 for (const order of finalToCreate) {
                     const notional = order.qty * order.price;
                     if (rules.minNotional > 0 && notional < rules.minNotional) {
-                        skipReasons.push(`SKIP: Notional too small (${notional.toFixed(4)} < ${rules.minNotional})`);
+                        const suggest = (rules.minNotional * 1.05);
+                        skipReasons.push(`SKIP: MIN_NOTIONAL <${rules.minNotional.toFixed(4)} ${quoteCcy}; suggest >= ${suggest.toFixed(4)} ${quoteCcy}`);
                         continue;
                     }
                     if (rules.minQty > 0 && order.qty < rules.minQty) {
@@ -449,6 +522,129 @@ export const gridRunner: StrategyRunner = {
                             // Log failures only if significant
                             console.warn(`[gridRunner] config=${config.id} ${order.side} failed: ${res.error}`);
                         }
+                    } else if (exchange === "dextrade") {
+                        const clientOrderId = `PPW-GRID-${config.id}-${order.side}-${order.priceKey}`;
+                        const res = await createDexTradeOrder({
+                            loginToken: apiKey,
+                            secret: apiSecret,
+                            pair: symbol,
+                            side: order.side as "BUY" | "SELL",
+                            tradeType: "LIMIT",
+                            volume: order.qty,
+                            rate: order.price,
+                        });
+
+                        if (res.ok) {
+                            const exchangeOrderId = res.data?.data?.order_id ?? res.data?.data?.id ?? res.data?.order_id ?? res.data?.id ?? null;
+                            if (order.side === "BUY") createdBuy++;
+                            else createdSell++;
+
+                            if (exchangeOrderId) {
+                                insertGridOrder({
+                                    configId: config.id,
+                                    exchange: config.exchange,
+                                    pair: config.pair,
+                                    side: order.side,
+                                    priceKey: order.priceKey,
+                                    orderId: String(exchangeOrderId),
+                                    status: "OPEN"
+                                });
+
+                                insertStrategyOrderRegistry({
+                                    strategy_id: String(config.id),
+                                    exchange: config.exchange,
+                                    pair: config.pair,
+                                    order_id: String(exchangeOrderId),
+                                    client_order_id: clientOrderId,
+                                    side: order.side,
+                                    price: String(order.price),
+                                    qty: String(order.qty),
+                                    status: "OPEN",
+                                });
+
+                                insertStrategyOrder({
+                                    configId: config.id,
+                                    tgUserId: config.tg_user_id,
+                                    exchange: config.exchange,
+                                    pair: config.pair,
+                                    strategy: config.strategy,
+                                    tradeMode: config.trade_mode,
+                                    side: order.side,
+                                    price: order.price,
+                                    qty: order.qty,
+                                    quoteQty: notional,
+                                    status: "OPEN",
+                                    exchangeOrderId: String(exchangeOrderId),
+                                    clientOrderId: clientOrderId
+                                });
+
+                                createdIds.push(String(exchangeOrderId));
+                            } else {
+                                console.warn(`[gridRunner] config=${config.id} dextrade order placed but no orderId returned!`);
+                            }
+                        } else if (res.error) {
+                            console.warn(`[gridRunner] config=${config.id} ${order.side} failed (dextrade): ${res.error}`);
+                        }
+                    } else if (exchange === "nestex") {
+                        const clientOrderId = `PPW-GRID-${config.id}-${order.side}-${order.priceKey}`;
+                        const res = await placeNestExLimitOrder({
+                            apiKey,
+                            apiSecret,
+                            cur: symbol,
+                            side: order.side as "BUY" | "SELL",
+                            qty: order.qty,
+                            price: order.price,
+                            rateLimitKey: `USER:${config.tg_user_id}`,
+                        });
+
+                        if (res.ok && res.orderId) {
+                            if (order.side === "BUY") createdBuy++;
+                            else createdSell++;
+
+                            insertGridOrder({
+                                configId: config.id,
+                                exchange: config.exchange,
+                                pair: config.pair,
+                                side: order.side,
+                                priceKey: order.priceKey,
+                                orderId: String(res.orderId),
+                                status: "OPEN"
+                            });
+
+                            insertStrategyOrderRegistry({
+                                strategy_id: String(config.id),
+                                exchange: config.exchange,
+                                pair: config.pair,
+                                order_id: String(res.orderId),
+                                client_order_id: clientOrderId,
+                                side: order.side,
+                                price: String(order.price),
+                                qty: String(order.qty),
+                                status: "OPEN",
+                            });
+
+                            insertStrategyOrder({
+                                configId: config.id,
+                                tgUserId: config.tg_user_id,
+                                exchange: config.exchange,
+                                pair: config.pair,
+                                strategy: config.strategy,
+                                tradeMode: config.trade_mode,
+                                side: order.side,
+                                price: order.price,
+                                qty: order.qty,
+                                quoteQty: notional,
+                                status: "OPEN",
+                                exchangeOrderId: String(res.orderId),
+                                clientOrderId: clientOrderId
+                            });
+
+                            createdIds.push(String(res.orderId));
+                        } else if (res.ok) {
+                            console.warn(`[gridRunner] config=${config.id} nestex order placed but no orderId returned!`);
+                        } else if (res.error) {
+                            console.warn(`[gridRunner] config=${config.id} ${order.side} failed (nestex): ${res.error}`);
+                        }
                     }
                 }
 
@@ -478,10 +674,14 @@ export const gridRunner: StrategyRunner = {
                 params.total_cancelled = (params.total_cancelled || 0) + cancelledDuplicates;
 
                 const actionSummary = `GRID: tracked=${finalOpenCount} (buy=${finalBuyCount} sell=${finalSellCount}) placed=${createdIds.length} cancelled=${cancelledDuplicates} (totalPlaced=${params.total_placed})`;
+                const primarySkip = skipReasons[0];
+                const lastAction = (createdIds.length === 0 && primarySkip)
+                    ? (primarySkip.startsWith("SKIP:") ? primarySkip : `GRID SKIP: ${primarySkip}`)
+                    : actionSummary;
 
                 updateStrategyParams(config.id, JSON.stringify({
                     ...params,
-                    last_action: actionSummary,
+                    last_action: lastAction,
                     last_action_at: now,
                     open_orders_count: finalOpenCount,
                     placed_buy: finalBuyCount,
@@ -497,6 +697,13 @@ export const gridRunner: StrategyRunner = {
                         configId: config.id,
                         level: "INFO",
                         message: actionSummary,
+                    });
+                } else if (skipReasons.length > 0) {
+                    console.warn(`[gridRunner] SKIP config=${config.id} exchange=${exchange} reason=${lastAction}`);
+                    insertStrategyEvent({
+                        configId: config.id,
+                        level: "WARN",
+                        message: lastAction,
                     });
                 }
                 return { success: true };

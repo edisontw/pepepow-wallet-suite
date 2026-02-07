@@ -1,9 +1,7 @@
-/**
- * Unified Exchange Capabilities
- * Single source of truth for all exchange-related configuration
- */
+import { getExchangeSpec, normalizeExchangeId, getPairLimits } from "../registry/exchanges.js";
+import { ExchangeId } from "../registry/types.js";
 
-export type ExchangeId = "nonkyc" | "dextrade" | "nestex";
+export type { ExchangeId };
 export type QuoteAsset = "BNB" | "USDT";
 
 export interface ExchangeCapability {
@@ -14,97 +12,91 @@ export interface ExchangeCapability {
     pricePrecision: number;
 }
 
+function tickToPrecision(tick: number): number {
+    if (!Number.isFinite(tick) || tick <= 0) return 8;
+    const asText = tick.toString();
+    if (asText.includes("e-")) {
+        return Number(asText.split("e-")[1]);
+    }
+    const idx = asText.indexOf(".");
+    return idx >= 0 ? asText.length - idx - 1 : 0;
+}
+
 export const EXCHANGE_CAPS: Record<ExchangeId, ExchangeCapability> = {
     nonkyc: {
         supportsReal: true,
-        displayName: "NonKYC",
-        minNotional: { BNB: 0.001, USDT: 0.5 },
-        qtyPrecision: 0,  // No decimals for PEPEW qty
-        pricePrecision: 12,
+        displayName: getExchangeSpec("nonkyc").displayName,
+        minNotional: {
+            BNB: getPairLimits("nonkyc", "PEPEW/BNB").minNotional,
+            USDT: getPairLimits("nonkyc", "PEPEW/USDT").minNotional,
+        },
+        qtyPrecision: tickToPrecision(getExchangeSpec("nonkyc").precision.qtyStep),
+        pricePrecision: tickToPrecision(getExchangeSpec("nonkyc").precision.priceTick),
     },
     dextrade: {
         supportsReal: true,
-        displayName: "Dex-Trade",
-        minNotional: { USDT: 1 },
-        qtyPrecision: 0,
-        pricePrecision: 12,
+        displayName: getExchangeSpec("dextrade").displayName,
+        minNotional: {
+            USDT: getPairLimits("dextrade", "PEPEW/USDT").minNotional,
+        },
+        qtyPrecision: tickToPrecision(getExchangeSpec("dextrade").precision.qtyStep),
+        pricePrecision: tickToPrecision(getExchangeSpec("dextrade").precision.priceTick),
     },
     nestex: {
         supportsReal: true,
-        displayName: "NestEX",
-        minNotional: { USDT: 1 },
-        qtyPrecision: 0,
-        pricePrecision: 8,
+        displayName: getExchangeSpec("nestex").displayName,
+        minNotional: {
+            USDT: getPairLimits("nestex", "PEPEW/USDT").minNotional,
+        },
+        qtyPrecision: tickToPrecision(getExchangeSpec("nestex").precision.qtyStep),
+        pricePrecision: tickToPrecision(getExchangeSpec("nestex").precision.priceTick),
     },
 };
 
-/**
- * Check if an exchange supports REAL trading mode
- */
 export function supportsReal(exchange: string): boolean {
-    const caps = EXCHANGE_CAPS[exchange as ExchangeId];
-    return caps?.supportsReal ?? false;
+    const id = normalizeExchangeId(exchange);
+    return EXCHANGE_CAPS[id].supportsReal;
 }
 
-/**
- * Check if an exchange supports PAPER trading mode
- */
-export function supportsPaper(exchange: string): boolean {
+export function supportsPaper(_exchange: string): boolean {
     return false;
 }
 
-/**
- * Get the minimum notional (quote amount) for an exchange/quote pair
- */
 export function getMinNotional(exchange: string, quote: string): number {
-    const caps = EXCHANGE_CAPS[exchange as ExchangeId];
-    if (!caps) return 0;
-    return caps.minNotional[quote as QuoteAsset] ?? 0;
+    const id = normalizeExchangeId(exchange);
+    if (quote === "BNB") {
+        return EXCHANGE_CAPS[id].minNotional.BNB ?? 0;
+    }
+    return EXCHANGE_CAPS[id].minNotional.USDT ?? 0;
 }
 
-/**
- * Get display name for an exchange
- */
 export function getExchangeDisplayName(exchange: string): string {
-    const caps = EXCHANGE_CAPS[exchange as ExchangeId];
-    return caps?.displayName ?? exchange;
+    return getExchangeSpec(exchange).displayName;
 }
 
-/**
- * Validate if exchange ID is canonical
- */
 export function isValidExchange(exchange: string): exchange is ExchangeId {
-    return exchange in EXCHANGE_CAPS;
+    try {
+        normalizeExchangeId(exchange);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
-/**
- * Get quantity precision for an exchange
- */
 export function getQtyPrecision(exchange: string): number {
-    const caps = EXCHANGE_CAPS[exchange as ExchangeId];
-    return caps?.qtyPrecision ?? 0;
+    return EXCHANGE_CAPS[normalizeExchangeId(exchange)].qtyPrecision;
 }
 
-/**
- * Get price precision for an exchange
- */
 export function getPricePrecision(exchange: string): number {
-    const caps = EXCHANGE_CAPS[exchange as ExchangeId];
-    return caps?.pricePrecision ?? 8;
+    return EXCHANGE_CAPS[normalizeExchangeId(exchange)].pricePrecision;
 }
 
-/**
- * Round quantity to exchange precision
- */
 export function roundQty(exchange: string, qty: number): number {
     const precision = getQtyPrecision(exchange);
     const factor = Math.pow(10, precision);
     return Math.floor(qty * factor) / factor;
 }
 
-/**
- * Round price to exchange precision
- */
 export function roundPrice(exchange: string, price: number): number {
     const precision = getPricePrecision(exchange);
     const factor = Math.pow(10, precision);

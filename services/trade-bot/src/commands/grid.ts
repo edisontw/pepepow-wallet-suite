@@ -1,7 +1,8 @@
 import { Context, InlineKeyboard } from "grammy";
-import { ApiError, enableStrategyConfig, disableStrategyConfig, getStrategyStatus, upsertStrategyConfig, getKeysStatus, cancelStrategyOrders } from "../api.js";
+import { ApiError, enableStrategyConfig, disableStrategyConfig, getStrategyStatus, upsertStrategyConfig, getKeysStatus, checkStrategyFunds, cancelStrategyOrders } from "../api.js";
 import { logTelegramError, safeSend } from "../utils/telegram.js";
 import { ExchangeName, formatPairDisplay, formatPairLabel, getAllowedPairs } from "../lib/markets.js";
+import { getRegistryPromptHelpers } from "../lib/registryPrompt.js";
 
 const GRID_STATE_TTL_MS = 15 * 60 * 1000;
 const GRID_CALLBACK_MAX_BYTES = 64;
@@ -12,7 +13,7 @@ type GridWizardState = {
     symbol?: string;
     levels?: number;
     stepPct?: number;
-    budget?: number;
+    quotePerOrder?: number;
     updatedAt: number;
 };
 
@@ -301,37 +302,34 @@ export async function handleGridTextInput(ctx: Context): Promise<boolean> {
         // User input is percentage (e.g., 1 means 1%), store as ratio (0.01)
         const stepPct = value / 100;
         state.stepPct = stepPct;
-        state.step = "budget";
+        state.step = "budget"; // Fix: missing step advance
         state.updatedAt = Date.now();
         pendingGrid.set(tgUserId, state);
-        await safeSend(ctx, { step: "grid.budget", text: "Enter total quote budget (> 1 USDT, e.g. 20):" });
+        const helpers = await getRegistryPromptHelpers(state.exchange!, state.symbol!);
+        await safeSend(ctx, { step: "grid.budget", text: `Enter quote per order (> ${helpers.minLabel}, ${helpers.exampleLabel}):` });
         return true;
     }
 
     if (state.step === "budget") {
-        const budget = Number(text);
-        if (!Number.isFinite(budget) || budget <= 0) {
-            await safeSend(ctx, { step: "grid.budget.invalid", text: "❌ Budget must be a positive number." });
+        const quotePerOrder = Number(text);
+        const helpers = await getRegistryPromptHelpers(state.exchange!, state.symbol!);
+        if (!Number.isFinite(quotePerOrder) || quotePerOrder <= helpers.minNotional) {
+            const label = exchangeLabel(state.exchange!);
+            await safeSend(ctx, { step: "grid.budget.invalid", text: `❌ ${label} minimum order is > ${helpers.minLabel}. Suggest > ${helpers.exampleLabel}.` });
             return true;
         }
 
         const levels = state.levels || 1;
-        if (budget < levels * 1.05) {
-            const minLabel = `${(levels * 1.05).toFixed(2)} USDT`;
-            await safeSend(ctx, {
-                step: "grid.budget.too_low",
-                text: `❌ Budget too low for ${levels} levels. Minimum per level is > 1 USDT. Suggest >= ${minLabel}.`
-            });
-            return true;
-        }
+        state.quotePerOrder = quotePerOrder;
+        state.updatedAt = Date.now();
+        pendingGrid.set(tgUserId, state);
 
-        const perOrderQuote = budget / levels;
         const params = {
             base_price: 0,
             grid_levels: levels,
             grid_step_pct: state.stepPct,
-            total_quote_budget: budget,
-            per_order_quote: perOrderQuote,
+            quote_per_order: quotePerOrder,
+            per_order_quote: quotePerOrder, // compatibility
             refresh_sec: 30,
             allow_sell: true,
             inventory_base: 0,
@@ -351,6 +349,21 @@ export async function handleGridTextInput(ctx: Context): Promise<boolean> {
             }
         } catch (err: any) {
             console.error(`[grid_wizard] keys check error: ${err?.message || err}`);
+        }
+
+        // Perform funds check before creating
+        if (state.exchange === "nonkyc") {
+            try {
+                const fundsResult = await checkStrategyFunds(tgUserId, state.exchange, state.symbol!, "GRID", params);
+                if (fundsResult.ok && fundsResult.status === "FAIL") {
+                    pendingGrid.delete(tgUserId);
+                    const lines = ["❌ Insufficient funds for GRID REAL mode:", "", ...(fundsResult.messages || []), "", "Please deposit more funds and try again."];
+                    await safeSend(ctx, { step: "grid.real.insufficient_funds", text: lines.join("\n") });
+                    return true;
+                }
+            } catch (err: any) {
+                console.warn(`[grid_wizard] funds check failed: ${err?.message || err}`);
+            }
         }
 
         try {
@@ -379,7 +392,7 @@ export async function handleGridTextInput(ctx: Context): Promise<boolean> {
                 "Mode: REAL",
                 `Levels: ${levels}`,
                 `Step: ${formatQuantity(state.stepPct! * 100)}%`,
-                `Total Budget: ${formatQuantity(budget)} USDT`,
+                `Quote/order: ${formatQuantity(quotePerOrder)} ${(await getRegistryPromptHelpers(state.exchange!, state.symbol!)).quoteAsset}`,
                 "Status: ACTIVE",
             ];
             await safeSend(ctx, { step: "grid.create.ok", text: lines.join("\n") });

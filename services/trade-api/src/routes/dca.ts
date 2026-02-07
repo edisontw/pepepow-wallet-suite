@@ -434,7 +434,7 @@ router.get("/v1/dca/status", (req, res) => {
                 id: o.id,
                 exchange: o.exchange,
                 pair: o.pair,
-                symbol: normalizePairSymbol(o.exchange as ExchangeName, o.pair) || o.pair,
+                symbol: normalizePairSymbol(o.exchange as ExchangeName, o.pair) || "UNSUPPORTED_PAIR",
                 side: o.side,
                 quoteAmount: o.quote_qty ?? 0,
                 price: o.price,

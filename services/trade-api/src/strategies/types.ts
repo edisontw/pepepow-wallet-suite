@@ -1,4 +1,4 @@
-export type StrategyType = "DCA" | "GRID" | "MM";
+export type StrategyType = "DCA" | "GRID" | "MM" | "DEVMM";
 
 export interface StrategyRunner {
     type: StrategyType;

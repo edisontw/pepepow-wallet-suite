@@ -19,14 +19,15 @@ import {
 } from "../db.js";
 import { decryptKeyPair } from "../crypto.js";
 import { createDexTradeOrder, listDexTradeOpenOrders, cancelDexTradeOrder } from "../exchanges/dextrade.js";
-import { placeNestExLimitOrder } from "../exchanges/nestex.js";
+import { placeNestExLimitOrder, cancelNestExOrder } from "../exchanges/nestex.js";
 import { createNonKycOrder, getNonkycMarketRules, listNonKycOpenOrders, normalizeNonKycSymbol, cancelNonKycOrder } from "../exchanges/nonkyc.js";
-import { ExchangeName, getBaseAsset, getQuoteUnit, normalizePairSymbol } from "../lib/markets.js";
+import { ExchangeName, getExchangeSymbol, getQuoteUnit, normalizePairSymbol } from "../lib/markets.js";
 import { getMinNotional, roundQty } from "../lib/exchanges.js";
 import { fetchExchangePrice } from "./price.js";
 import { StrategyRunner } from "./types.js";
 import { cancelOutstandingOrders } from "./strategyHelper.js";
 import { wrapStrategyTick } from "../lib/runner-wrapper.js";
+import { logStrategyTickContract } from "./logContract.js";
 
 // Per-strategy mutex to prevent concurrent ticks
 const tickLocks = new Map<number, boolean>();
@@ -237,14 +238,32 @@ export const dcaRunner: StrategyRunner = {
                         if (config.exchange === "nonkyc") {
                             await cancelNonKycOrder(apiKey, apiSecret, orderId).catch(() => { });
                         } else if (config.exchange === "dextrade") {
-                            await cancelDexTradeOrder(apiKey, apiSecret, orderId).catch(() => { });
+                            // Use normalized symbol if available
+                            const dcaSymbol = params.symbol || getExchangeSymbol("dextrade", config.pair);
+                            await cancelDexTradeOrder(apiKey, apiSecret, orderId, dcaSymbol).catch(() => { });
+                        } else if (config.exchange === "nestex") {
+                            await cancelNestExOrder(apiKey, apiSecret, orderId, `USER:${config.tg_user_id}`).catch(() => { });
                         }
                     }
                     // Briefly wait after cancellation to let exchange state settle
                     await new Promise(resolve => setTimeout(resolve, 1000));
                 }
 
-                const symbol = params.symbol || normalizePairSymbol(config.exchange as ExchangeName, config.pair) || config.pair;
+                const symbol = params.symbol || normalizePairSymbol(config.exchange as ExchangeName, config.pair);
+                if (!symbol) {
+                    return {
+                        success: false,
+                        error: { message: `UNSUPPORTED_PAIR: exchangeId=${config.exchange} canonicalPair=${config.pair}`, code: "UNSUPPORTED_PAIR" }
+                    };
+                }
+                logStrategyTickContract({
+                    strategyId: config.id,
+                    strategyType: "DCA",
+                    requestedExchangeId: config.exchange,
+                    canonicalPair: config.pair,
+                    exchangeSymbol: symbol,
+                    guards: [],
+                });
 
                 // REAL mode safety: rate limiting check
                 const maxDaily = quoteCcy === "BNB" ? DEFAULT_MAX_QUOTE_PER_DAY_BNB : DEFAULT_MAX_QUOTE_PER_DAY_USDT;
@@ -310,12 +329,35 @@ async function executeDcaBuyAllIn(opts: {
     }
 
     const currentPrice = priceResult.price;
+    const minNotional = getMinNotional(config.exchange as ExchangeName, quoteCcy);
+
     let totalFilledQuote = 0;
     let totalFilledQty = 0;
     let attemptsUsed = 0;
     let lastError: string | null = null;
 
-    console.log(`[dca] executeAllIn config=${config.id} exchange=${config.exchange} budget=${budget} price=${currentPrice}`);
+    console.log(`[dca] executeAllIn config=${config.id} exchange=${config.exchange} budget=${budget} price=${currentPrice} minNotional=${minNotional}`);
+
+    // Pre-flight check: budget must be >= minNotional
+    if (budget < minNotional) {
+        const minLabel = `${minNotional.toFixed(4)} ${quoteCcy}`;
+        const suggest = (minNotional * 1.05);
+        const suggestLabel = `${suggest.toFixed(4)} ${quoteCcy}`;
+        const msg = `SKIP: MIN_NOTIONAL <${minLabel}; suggest >= ${suggestLabel}`;
+        console.warn(`[dca] ${msg} config=${config.id} exchange=${config.exchange}`);
+        insertStrategyEvent({
+            configId: config.id,
+            level: "WARN",
+            message: msg,
+        });
+        return {
+            success: false,
+            error: {
+                message: msg,
+                code: "MIN_NOTIONAL"
+            }
+        };
+    }
 
     // Option A: Market Order (DexTrade)
     if (config.exchange === "dextrade") {
@@ -342,13 +384,78 @@ async function executeDcaBuyAllIn(opts: {
         }
     }
 
+    // Option B: NestEx aggressive limit (market-like)
+    if (config.exchange === "nestex") {
+        attemptsUsed = 1;
+        const sweepPrice = currentPrice * 1.5;
+        const rawQty = budget / sweepPrice;
+        const qty = roundQty(config.exchange as ExchangeName, rawQty);
+        if (!Number.isFinite(qty) || qty <= 0) {
+            return { success: false, error: { message: "Calculated qty is too small", code: "MIN_QTY" } };
+        }
+
+        const orderSymbol = getExchangeSymbol(config.exchange as ExchangeName, config.pair);
+        const clientOrderId = `PPW-DCA-${config.id}-${Date.now()}-${attemptsUsed}`;
+        const orderResult = await placeNestExLimitOrder({
+            apiKey,
+            apiSecret,
+            cur: orderSymbol,
+            side: "BUY",
+            qty,
+            price: sweepPrice,
+            rateLimitKey: `USER:${config.tg_user_id}`,
+        });
+
+        if (!orderResult.ok) {
+            return { success: false, error: { message: orderResult.error || "NestEx order failed", code: String(orderResult.status || "ORDER_FAILED") } };
+        }
+
+        const exchangeOrderId = String(orderResult.orderId || "");
+        if (exchangeOrderId) {
+            insertStrategyOrderRegistry({
+                strategy_id: String(config.id),
+                exchange: config.exchange,
+                pair: config.pair,
+                order_id: exchangeOrderId,
+                client_order_id: clientOrderId,
+                side: "BUY",
+                price: String(sweepPrice),
+                qty: String(qty),
+                status: "OPEN",
+            });
+        } else {
+            console.warn(`[dca] nestex order placed but no orderId returned: config=${config.id}`);
+        }
+
+        // Brief wait then cancel to avoid lingering open orders
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        if (exchangeOrderId) {
+            const cancelRes = await cancelNestExOrder(apiKey, apiSecret, exchangeOrderId, `USER:${config.tg_user_id}`).catch(() => ({ ok: false }));
+            if (cancelRes && (cancelRes as any).ok) {
+                updateStrategyOrderStatusRegistry(config.exchange, exchangeOrderId, "CANCELLED");
+            } else if (
+                cancelRes &&
+                (((cancelRes as any).status === 404) ||
+                    (((cancelRes as any).error && /not found|already.*closed|cancelled|canceled/i.test((cancelRes as any).error))))
+            ) {
+                updateStrategyOrderStatusRegistry(config.exchange, exchangeOrderId, "CLOSED");
+            }
+        }
+
+        totalFilledQuote = budget;
+        totalFilledQty = budget / currentPrice;
+        recordDcaExecution(config, budget, currentPrice, totalFilledQty, totalFilledQuote, "FILLED", orderResult.data, now);
+        updateDcaStatusParams(config, params, totalFilledQuote, 0, attemptsUsed, "NESTEX_SWEEP", now);
+        return { success: true };
+    }
+
     // Option B: Sweep Loop (NonKYC / Fallback)
     const MAX_SWEEP_ATTEMPTS = 3;
     let remainingBudget = budget;
 
     for (let i = 0; i < MAX_SWEEP_ATTEMPTS; i++) {
         attemptsUsed++;
-        if (remainingBudget < 0.01) break; // Small residual skip
+        if (remainingBudget < minNotional) break; // Use exchange minNotional instead of 0.01
 
         // Get fresh best price if possible, or use currentPrice
         const sweepPrice = currentPrice * 1.5; // Very aggressive sweep price
@@ -412,7 +519,7 @@ async function executeDcaBuyAllIn(opts: {
 
         console.log(`[dca] sweep attempt ${attemptsUsed} results: filledQty=${attemptFilledQty} filledQuote=${attemptFilledQuote.toFixed(4)}`);
 
-        if (remainingBudget < 0.01) break;
+        if (remainingBudget < minNotional) break;
     }
 
     if (totalFilledQuote > 0) {
@@ -423,7 +530,11 @@ async function executeDcaBuyAllIn(opts: {
 
     return {
         success: false,
-        error: { message: lastError || "Sweep failed to fill any amount", attempts: attemptsUsed }
+        error: {
+            message: lastError || "Sweep failed to fill any amount (liquidity / time out)",
+            attempts: attemptsUsed,
+            code: "TEMPORARY" // Mark 0 fill as temporary/retryable, not permanent stop
+        }
     };
 }
 

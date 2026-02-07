@@ -11,9 +11,9 @@ export async function fetchDexTradeTicker(): Promise<{ ticker: NormalizedTicker;
         const ticker: NormalizedTicker = {
             exchange: "dextrade",
             symbol: "PEPEWUSDT",
-            last: parseNumber(d?.last),
-            bid: parseNumber(d?.buy),
-            ask: parseNumber(d?.sell),
+            last: parseNumber(d?.last ?? d?.last_price ?? d?.price),
+            bid: parseNumber(d?.buy ?? d?.bid ?? d?.bid_price ?? d?.bidPrice),
+            ask: parseNumber(d?.sell ?? d?.ask ?? d?.ask_price ?? d?.askPrice),
             volumeQuote: parseNumber(d?.vol ?? d?.volume ?? d?.quoteVolume ?? d?.quote_volume),
             volumeBase: parseNumber(d?.volume_24H ?? d?.volume_24h ?? d?.volume24H),
             ts: d?.updated || Date.now(),

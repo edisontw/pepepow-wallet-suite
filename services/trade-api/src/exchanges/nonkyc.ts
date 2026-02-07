@@ -37,7 +37,7 @@ const NONKYC_RULES_FALLBACK: Record<string, NonKycMarketRules> = {
     },
     PEPEW_BNB: {
         symbol: "PEPEW_BNB",
-        minNotional: 0.001,
+        minNotional: 0.0016,
         minQty: 1,
         qtyStep: 1,
         priceTick: 1e-12,

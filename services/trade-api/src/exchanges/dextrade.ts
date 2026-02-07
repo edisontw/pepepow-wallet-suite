@@ -32,6 +32,7 @@ export interface DexTradeOrderResult {
     data?: any;
     error?: string;
     code?: string | number;
+    orders?: any[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,15 +153,18 @@ export async function createDexTradeOrder(req: DexTradeOrderRequest): Promise<De
 
         const status = res.status;
         let data: any = null;
+        let responseText = "";
         try {
-            data = await res.json();
+            responseText = await res.text();
+            data = JSON.parse(responseText);
         } catch (_) {
             data = null;
         }
 
-        if (!res.ok) {
+        if (!res.ok || data?.status === false) {
             const errMsg = data?.error || data?.message || res.statusText || "Request failed";
-            console.warn(`[dextrade] order failed: status=${status} error=${errMsg}`);
+            const responseSnippet = responseText ? responseText.slice(0, 300) : "No body";
+            console.warn(`[dextrade] order failed: status=${status} error=${errMsg} body=${responseSnippet}`);
 
             if (status === 401 || status === 403) {
                 console.warn(`[dextrade] AUTH FAILURE - Check: 1) login-token valid, 2) secret correct, 3) request_id incrementing`);
@@ -170,13 +174,14 @@ export async function createDexTradeOrder(req: DexTradeOrderRequest): Promise<De
                 ok: false,
                 status,
                 error: errMsg,
-                code: data?.code,
-                data,
+                code: data?.code || "ORDER_FAILED",
+                data: responseText,
             };
         }
 
         debugLog("response", { status, data });
-        console.log(`[dextrade] order success: pair=${req.pair} side=${req.side} volume=${req.volume}`);
+        const orderId = data?.data?.order_id ?? data?.data?.id ?? data?.order_id ?? data?.id;
+        console.log(`[dextrade] order success: pair=${req.pair} side=${req.side} volume=${req.volume} orderId=${orderId} key_fingerprint=${maskSecret(req.loginToken)}`);
 
         return { ok: true, status, data };
 
@@ -191,13 +196,13 @@ export async function createDexTradeOrder(req: DexTradeOrderRequest): Promise<De
 }
 
 /**
- * Fetch account balances (for selftest verification)
+ * Fetch account balances and normalize them for funds check
  */
 export async function getDexTradeBalances(
     loginToken: string,
     secret: string
 ): Promise<DexTradeOrderResult> {
-    const endpoint = "/private/balance";
+    const endpoint = "/private/balances";
     const url = `${DEXTRADE_API_BASE}${endpoint}`;
 
     const params: Record<string, any> = {
@@ -230,29 +235,44 @@ export async function getDexTradeBalances(
 
         const status = res.status;
         let data: any = null;
+        let responseText = "";
         try {
-            data = await res.json();
+            responseText = await res.text();
+            data = JSON.parse(responseText);
         } catch (_) {
             data = null;
         }
 
-        if (!res.ok) {
+        if (!res.ok || data?.status === false) {
+            const errorMsg = data?.error || data?.message || res.statusText || "Request failed";
+            const responseSnippet = responseText ? responseText.slice(0, 500) : "No body";
+            console.warn(`[dextrade] balance failed: status=${status} error=${errorMsg} body=${responseSnippet}`);
+
+            let reason = "FETCH_FAILED";
+            if (status === 401 || status === 403) reason = "AUTH_FAILED";
+            else if (status === 429) reason = "RATE_LIMITED";
+            else if (status >= 500) reason = "EXCHANGE_DOWN";
+
             return {
                 ok: false,
                 status,
-                error: data?.error || data?.message || res.statusText || "Request failed",
-                code: data?.code,
-                data,
+                error: errorMsg,
+                code: data?.code || reason,
+                data: responseSnippet,
             };
         }
 
-        return { ok: true, status, data };
+        // Return raw payload; normalization is handled centrally by balance normalizer.
+        debugLog("balance raw", data);
+        return { ok: true, status, data: data?.data ?? data };
 
     } catch (err: any) {
+        console.error(`[dextrade] balance error: ${err?.message || err}`);
         return {
             ok: false,
             status: 0,
             error: err?.message || "Network error",
+            code: "NETWORK_ERROR"
         };
     }
 }
@@ -263,15 +283,20 @@ export async function getDexTradeBalances(
 export async function cancelDexTradeOrder(
     loginToken: string,
     secret: string,
-    orderId: string | number
+    orderId: string | number,
+    pair?: string
 ): Promise<DexTradeOrderResult> {
     const endpoint = "/private/delete-order";
     const url = `${DEXTRADE_API_BASE}${endpoint}`;
 
     const params: Record<string, any> = {
         request_id: String(Date.now() * 1000 + Math.floor(Math.random() * 1000)),
-        order_id: Number(orderId),
+        order_id: String(orderId),
     };
+
+    if (pair) {
+        params.pair = pair;
+    }
 
     const signature = buildSignature(params, secret);
 
@@ -290,19 +315,24 @@ export async function cancelDexTradeOrder(
 
         const status = res.status;
         let data: any = null;
+        let responseText = "";
         try {
-            data = await res.json();
+            responseText = await res.text();
+            data = JSON.parse(responseText);
         } catch (_) {
             data = null;
         }
 
-        if (!res.ok) {
+        if (!res.ok || data?.status === false) {
+            const errMsg = data?.error || data?.message || res.statusText || "Request failed";
+            const responseSnippet = responseText ? responseText.slice(0, 300) : "No body";
+            console.warn(`[dextrade] cancel failed: status=${status} error=${errMsg} body=${responseSnippet}`);
             return {
                 ok: false,
                 status,
-                error: data?.error || data?.message || res.statusText || "Request failed",
-                code: data?.code,
-                data,
+                error: errMsg,
+                code: data?.code || "CANCEL_FAILED",
+                data: responseText,
             };
         }
 
@@ -350,23 +380,41 @@ export async function listDexTradeOpenOrders(
 
         const status = res.status;
         let data: any = null;
+        let responseText = "";
         try {
-            data = await res.json();
+            responseText = await res.text();
+            data = JSON.parse(responseText);
         } catch (_) {
             data = null;
         }
 
-        if (!res.ok) {
+        if (!res.ok || data?.status === false) {
+            const errMsg = data?.error || data?.message || res.statusText || "Request failed";
+            const responseSnippet = responseText ? responseText.slice(0, 300) : "No body";
+            console.warn(`[dextrade] list orders failed: status=${status} error=${errMsg} body=${responseSnippet}`);
             return {
                 ok: false,
                 status,
-                error: data?.error || data?.message || res.statusText || "Request failed",
-                code: data?.code,
-                data,
+                error: errMsg,
+                code: data?.code || "FETCH_FAILED",
+                data: responseText,
             };
         }
 
-        return { ok: true, status, data };
+        // Dex-Trade response is { status: true, data: { list: [ ... ] } }
+        const rawOrders = data?.data?.list || [];
+        const orders = rawOrders.map((o: any) => ({
+            order_id: String(o.id || o.order_id),
+            symbol: o.pair,
+            side: Number(o.type) === 0 ? "buy" : "sell", // 0=buy, 1=sell
+            price: Number(o.rate),
+            quantity: Number(o.volume),
+            filled_quantity: Number(o.volume_done),
+            status: "OPEN",
+            created_at: (o.time_create || o.time || 0) * 1000,
+        }));
+
+        return { ok: true, status, data, orders };
 
     } catch (err: any) {
         return {

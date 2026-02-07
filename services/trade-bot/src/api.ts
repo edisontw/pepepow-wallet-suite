@@ -150,20 +150,74 @@ export interface StrategyFill {
     ts: number;
 }
 
+export interface NormalizedBalance {
+    ok: boolean;
+    exchange: string;
+    assets: {
+        USDT: number;
+        BNB: number;
+        PEPEW: number;
+    };
+    error?: string;
+    reason?: string;
+    errCode?: string;
+    lastOkTs?: number;
+    snapshot?: {
+        ts: number;
+        stalenessMs: number;
+        source: "live" | "cached";
+        rawHash: string;
+        assets: Record<string, { free: number; locked: number; total: number }>;
+    };
+}
+
 interface StrategyStatusResponse {
     ok: boolean;
     configs: StrategyConfig[];
     recentOrders: StrategyOrder[];
     recentFills: StrategyFill[];
+    balances?: NormalizedBalance[];
     debug?: {
         balance_source: string;
         fetchedAt: number;
         cacheAgeMs: number;
         isCached: boolean;
         symbolsFound: string[];
-        freeUSDT: number;
+        freeQuote: number;
         freePEPEW: number;
     } | null;
+}
+
+export interface BalanceSummaryResponse {
+    ok: boolean;
+    exchanges: Array<{
+        exchangeId: "nonkyc" | "dextrade" | "nestex";
+        ok: boolean;
+        errCode: string | null;
+        errMsgShort: string | null;
+        lastOkTs: number | null;
+        snapshot: {
+            ts: number;
+            stalenessMs: number;
+            source: "live" | "cached";
+            rawHash: string;
+            assets: Record<string, { free: number; locked: number; total: number }>;
+        } | null;
+        assets: { USDT: number; BNB: number; PEPEW: number };
+    }>;
+}
+
+export interface ExchangeRegistryResponse {
+    ok: boolean;
+    exchanges: Array<{
+        exchangeId: "nonkyc" | "dextrade" | "nestex";
+        displayName: string;
+        adapterKey: "nonkyc" | "dextrade" | "nestex";
+        pairs: string[];
+        symbolMapping: Record<string, string>;
+        limits: { byPair: Record<string, { minNotional: number; minQuotePerOrder: number }> };
+        precision: { priceTick: number; qtyStep: number; priceRounding: string; qtyRounding: string };
+    }>;
 }
 
 async function fetchApi<T>(path: string, options?: { method?: string; body?: any }): Promise<T> {
@@ -284,15 +338,27 @@ export async function enableStrategyConfig(configId: number, tgUserId: string): 
     });
 }
 
-export async function disableStrategyConfig(configId: number, tgUserId: string): Promise<SimpleResponse & { config?: StrategyConfig }> {
+export async function disableStrategyConfig(
+    configId: number,
+    tgUserId: string,
+    reason?: string
+): Promise<SimpleResponse & { config?: StrategyConfig }> {
     return fetchApi<SimpleResponse & { config?: StrategyConfig }>(`/v1/strategy/config/${configId}/disable`, {
         method: "POST",
-        body: { tgUserId },
+        body: reason ? { tgUserId, reason } : { tgUserId },
     });
 }
 
 export async function getStrategyStatus(tgUserId: string): Promise<StrategyStatusResponse> {
     return fetchApi<StrategyStatusResponse>(`/v1/strategy/status?tg_user_id=${encodeURIComponent(tgUserId)}`);
+}
+
+export async function getBalancesSummary(tgUserId: string): Promise<BalanceSummaryResponse> {
+    return fetchApi<BalanceSummaryResponse>(`/v1/balances/summary?tg_user_id=${encodeURIComponent(tgUserId)}`);
+}
+
+export async function getExchangeRegistry(): Promise<ExchangeRegistryResponse> {
+    return fetchApi<ExchangeRegistryResponse>("/v1/registry/exchanges");
 }
 
 export async function getHealth(): Promise<SimpleResponse> {
@@ -303,6 +369,11 @@ interface KeysStatusEntry {
     exchange: string;
     updatedAt: number | null;
     createdAt: number | null;
+    validation?: {
+        ok: boolean;
+        reason?: string;
+        message?: string;
+    };
 }
 
 interface KeysStatusResponse {
@@ -317,8 +388,8 @@ export async function setExchangeKeys(
     apiKey: string,
     apiSecret: string,
     validate?: boolean
-): Promise<SimpleResponse & { validation?: { ok: boolean; error?: string } }> {
-    return fetchApi<SimpleResponse & { validation?: { ok: boolean; error?: string } }>("/v1/keys/set", {
+): Promise<SimpleResponse & { validation?: { ok: boolean; error?: string; details?: any } }> {
+    return fetchApi<SimpleResponse & { validation?: { ok: boolean; error?: string; details?: any } }>("/v1/keys/set", {
         method: "POST",
         body: { tgUserId, exchange, apiKey, apiSecret, validate },
     });
@@ -336,10 +407,24 @@ export async function clearExchangeKeys(
 
 export async function getKeysStatus(
     tgUserId: string,
-    exchange?: "nonkyc" | "dextrade" | "nestex"
+    exchange?: "nonkyc" | "dextrade" | "nestex",
+    validate?: boolean
 ): Promise<KeysStatusResponse> {
     const qs = exchange ? `&exchange=${encodeURIComponent(exchange)}` : "";
-    return fetchApi<KeysStatusResponse>(`/v1/keys/status?tgUserId=${encodeURIComponent(tgUserId)}${qs}`);
+    const validateQs = validate ? "&validate=1" : "";
+    return fetchApi<KeysStatusResponse>(`/v1/keys/status?tgUserId=${encodeURIComponent(tgUserId)}${qs}${validateQs}`);
+}
+
+export async function validateExchangeKeys(
+    tgUserId: string,
+    exchange: "nonkyc" | "dextrade" | "nestex",
+    apiKey: string,
+    apiSecret: string
+): Promise<SimpleResponse & { validation?: { ok: boolean; error?: string; details?: any } }> {
+    return fetchApi<SimpleResponse & { validation?: { ok: boolean; error?: string; details?: any } }>("/v1/keys/validate", {
+        method: "POST",
+        body: { tgUserId, exchange, apiKey, apiSecret },
+    });
 }
 
 // Funds check types
@@ -363,11 +448,17 @@ export interface FundsCheckResponse {
 export interface BalanceResponse {
     ok: boolean;
     exchange?: string;
-    freeUSDT?: number;
-    freePEPEW?: number;
+    assets?: {
+        USDT: number;
+        BNB: number;
+        PEPEW: number;
+    };
+    freeQuote?: number; // Legacy support
+    freePEPEW?: number; // Legacy support
     fetchedAt?: number;
     error?: string;
     message?: string;
+    reason?: string;
 }
 
 export async function checkStrategyFunds(
@@ -387,6 +478,10 @@ export async function getNonKycBalance(tgUserId: string): Promise<BalanceRespons
     return fetchApi<BalanceResponse>(`/v1/balance/nonkyc?tgUserId=${encodeURIComponent(tgUserId)}`);
 }
 
+export async function getBalance(tgUserId: string, exchange: string): Promise<BalanceResponse> {
+    return fetchApi<BalanceResponse>(`/v1/balance?tgUserId=${encodeURIComponent(tgUserId)}&exchange=${encodeURIComponent(exchange)}`);
+}
+
 export interface CancelOrdersResponse {
     ok: boolean;
     message?: string;
@@ -400,4 +495,132 @@ export async function cancelStrategyOrders(configId: number, tgUserId: string): 
         method: "POST",
         body: { tgUserId },
     });
+}
+
+// DevMM API Types and Functions
+
+export interface DevmmStatusEntry {
+    exchange: string;
+    requestedExchange?: string;
+    normalizedExchange?: string;
+    resolvedExchange?: string;
+    adapterKey?: string;
+    status: "ACTIVE" | "DEGRADED" | "PAUSED" | "STOPPED" | "NOT_CONFIGURED";
+    pauseReason?: string | null;
+    isEnabled?: boolean;
+    config?: {
+        symbol: string;
+        orderQuoteUsdt: number;
+        minNotionalUsdt: number;
+        buyOffsetPct: number;
+        sellOffsetPct: number;
+        refreshSeconds: number;
+        capRatio: number;
+    } | null;
+    turnover?: {
+        todayUsdt: number;
+        capDayUsdt: number;
+        hourUsdt: number;
+        capHourUsdt: number;
+        vol24hUsdt: number;
+        vol24hEstimate?: boolean;
+    } | null;
+    inventory?: ({
+        status: "unavailable";
+        reason?: string | null;
+    } | {
+        usdtBalance: number | null;
+        pepewBalance: number | null;
+        usdtShare: number | null;
+    }) | null;
+    market?: {
+        bid: number | null;
+        ask: number | null;
+        mid: number | null;
+        ref: number | null;
+        spread: number | null;
+    } | null;
+    orders?: {
+        buyOrderId: string | null;
+        sellOrderId: string | null;
+    } | null;
+    lastAction?: string | null;
+    lastActionAt?: number | null;
+    lastError?: string | null;
+    lastErrorCode?: string | null;
+    lastErrorMessage?: string | null;
+    lastErrorAt?: number | null;
+    balanceLastOkTs?: number | null;
+    balanceLastOkAgeSec?: number | null;
+    balanceLastErrCode?: string | null;
+    cooldownUntil?: number | null;
+    updatedAt?: number | null;
+}
+
+export interface DevmmReportEntry {
+    exchange: string;
+    period: string;
+    bucket: string | null;
+    buyTurnoverUsdt?: number;
+    sellTurnoverUsdt?: number;
+    totalTurnoverUsdt?: number;
+    buyQtyPepew?: number;
+    sellQtyPepew?: number;
+    buyVwap?: number | null;
+    sellVwap?: number | null;
+    overallVwap?: number | null;
+    totalFeeUsdt?: number | null;
+    netUsdtChange?: number;
+    netPepewChange?: number;
+    fillCount?: number;
+    message?: string;
+}
+
+export async function devmmStart(params: {
+    exchange: "nonkyc" | "dextrade" | "nestex";
+    tgUserId: string;
+    orderQuoteUsdt?: number;
+    refreshSeconds?: number;
+}): Promise<{ ok: boolean; message?: string; config?: any; error?: string }> {
+    return fetchApi<{ ok: boolean; message?: string; config?: any; error?: string }>("/v1/devmm/start", {
+        method: "POST",
+        body: params,
+    });
+}
+
+export async function devmmStop(exchange: "nonkyc" | "dextrade" | "nestex"): Promise<{
+    ok: boolean;
+    message?: string;
+    ordersCancelled?: number;
+    ordersFailed?: number;
+    error?: string;
+}> {
+    return fetchApi<{ ok: boolean; message?: string; ordersCancelled?: number; ordersFailed?: number; error?: string }>("/v1/devmm/stop", {
+        method: "POST",
+        body: { exchange },
+    });
+}
+
+export async function devmmStatus(exchange?: "nonkyc" | "dextrade" | "nestex"): Promise<{
+    ok: boolean;
+    exchanges?: DevmmStatusEntry[];
+    error?: string;
+}> {
+    const qs = exchange ? `?exchange=${encodeURIComponent(exchange)}` : "";
+    return fetchApi<{ ok: boolean; exchanges?: DevmmStatusEntry[]; error?: string }>(`/v1/devmm/status${qs}`);
+}
+
+export async function devmmReport(params?: {
+    exchange?: "nonkyc" | "dextrade" | "nestex";
+    period?: "daily" | "weekly" | "monthly";
+}): Promise<{
+    ok: boolean;
+    reports?: DevmmReportEntry[];
+    error?: string;
+}> {
+    const qsParts: string[] = [];
+    if (params?.exchange) qsParts.push(`exchange=${encodeURIComponent(params.exchange)}`);
+    if (params?.period) qsParts.push(`period=${encodeURIComponent(params.period)}`);
+    const qs = qsParts.length > 0 ? `?${qsParts.join("&")}` : "";
+    return fetchApi<{ ok: boolean; reports?: DevmmReportEntry[]; error?: string }>(`/v1/devmm/report${qs}`);
 }

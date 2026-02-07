@@ -1,6 +1,7 @@
 import { Context, InlineKeyboard } from "grammy";
 import { ApiError, setExchangeKeys, clearExchangeKeys, getKeysStatus } from "../api.js";
 import { safeSend } from "../utils/telegram.js";
+import { safeText, truncateText } from "../utils/strings.js";
 import { ExchangeName } from "../lib/markets.js";
 
 const KEY_STATE_TTL_MS = 15 * 60 * 1000;
@@ -57,16 +58,16 @@ export async function handleKeysStatus(ctx: Context): Promise<void> {
     }
 
     try {
-        const data = await getKeysStatus(tgUserId);
+        const data = await getKeysStatus(tgUserId, undefined, true);
         if (!data.ok) {
             await safeSend(ctx, { step: "keys_status.api_error", text: "❌ Failed to fetch keys status." });
             return;
         }
 
         const knownExchanges: ExchangeName[] = ["nonkyc", "dextrade", "nestex"];
-        const keyMap = new Map<string, { updatedAt: number | null }>();
+        const keyMap = new Map<string, { updatedAt: number | null; validation?: { ok: boolean; reason?: string; message?: string } }>();
         for (const entry of data.keys || []) {
-            keyMap.set(entry.exchange, { updatedAt: entry.updatedAt || null });
+            keyMap.set(entry.exchange, { updatedAt: entry.updatedAt || null, validation: entry.validation });
         }
 
         let message = "🔐 API Keys Status\n\n";
@@ -74,7 +75,17 @@ export async function handleKeysStatus(ctx: Context): Promise<void> {
             const entry = keyMap.get(exchange);
             const updated = entry?.updatedAt ? new Date(entry.updatedAt).toISOString() : "Not set";
             message += `• ${exchangeLabel(exchange)}: ${entry?.updatedAt ? "✅ Set" : "❌ Not set"}`;
-            message += `\n  Updated: ${updated}\n`;
+            message += `\n  Updated: ${updated}`;
+            if (entry?.validation) {
+                if (entry.validation.ok) {
+                    message += `\n  Status: OK`;
+                } else {
+                    const reason = entry.validation.reason || "ERROR";
+                    const detail = entry.validation.message ? truncateText(safeText(entry.validation.message), 120) : "";
+                    message += `\n  Status: ${reason}${detail ? ` - ${detail}` : ""}`;
+                }
+            }
+            message += "\n";
         }
 
         await safeSend(ctx, { step: "keys_status.success", text: message });
@@ -215,7 +226,8 @@ export async function handleKeysTextInput(ctx: Context): Promise<boolean> {
         }
 
         try {
-            const result = await setExchangeKeys(tgUserId, exchange, apiKey, apiSecret, exchange === "nestex");
+            const validate = exchange === "dextrade" || exchange === "nestex";
+            const result = await setExchangeKeys(tgUserId, exchange, apiKey, apiSecret, validate);
             pendingKeys.delete(tgUserId);
 
             if (!result.ok) {
@@ -224,13 +236,18 @@ export async function handleKeysTextInput(ctx: Context): Promise<boolean> {
             }
 
             let message = `✅ ${exchangeLabel(exchange)} keys set/updated.`;
-            if (exchange === "nestex") {
+            if (validate) {
                 if (result.validation?.ok === false) {
-                    message += `\n⚠️ NestEx checktoken failed: ${result.validation.error || "unknown error"}`;
+                    message += `\n❌ Validation failed: ${result.validation.error || "unknown error"}`;
                 } else if (result.validation?.ok) {
-                    message += "\n✅ NestEx checktoken OK.";
+                    message += `\n✅ Validation success.`;
+                    if (result.validation.details?.assets) {
+                        message += `\nDetected assets: ${result.validation.details.assets.join(", ")}`;
+                    }
                 }
-                message += "\nNote: NestEx Private API is Experimental. Use small amounts.";
+                if (exchange === "nestex") {
+                    message += "\nNote: NestEx Private API is Experimental. Use small amounts.";
+                }
             }
             await safeSend(ctx, { step: "keys_text.success", text: message });
             return true;

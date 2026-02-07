@@ -9,6 +9,7 @@ import {
     getAllowedPairs,
     isExperimental,
 } from "../lib/markets.js";
+import { getRegistryPromptHelpers } from "../lib/registryPrompt.js";
 
 const DCA_STATE_TTL_MS = 15 * 60 * 1000;
 const DCA_CALLBACK_MAX_BYTES = 64;
@@ -227,10 +228,13 @@ export async function handleDcaSet(ctx: Context): Promise<void> {
     const intervalMin = parseInt(parts[2], 10);
     const tradeMode = "REAL"; // Fixed to REAL
 
-    if (isNaN(budget) || budget <= (mode === "BNB" ? 0.001 : 1)) {
-        const minVal = mode === "BNB" ? "0.001 BNB" : "1 USDT";
-        const suggest = mode === "BNB" ? "0.0011 BNB" : "1.05 USDT";
-        await safeSend(ctx, { step: "dca_set.invalid_amount", text: `❌ NonKYC minimum order is > ${minVal}. Suggest ≥ ${suggest}.` });
+    const helpers = await getRegistryPromptHelpers("nonkyc", parts[1]); // Quote CCY is actually the second part when normalized
+    const minVal = helpers.minNotional;
+    const minLabel = helpers.minLabel;
+    const suggest = helpers.exampleLabel;
+
+    if (isNaN(budget) || budget <= minVal) {
+        await safeSend(ctx, { step: "dca_set.invalid_amount", text: `❌ NonKYC minimum order is > ${minLabel}. Suggest > ${suggest}.` });
         return;
     }
 
@@ -713,12 +717,11 @@ export async function handleDcaCallback(ctx: Context): Promise<boolean> {
             updatedAt: Date.now(),
         });
 
-        const minVal = pair.quoteAsset === "BNB" ? "0.001 BNB" : "1 USDT";
-        const example = pair.quoteAsset === "BNB" ? "e.g. 0.0011 BNB" : "e.g. 1.05 USDT";
+        const helpers = await getRegistryPromptHelpers(state.exchange, pair.symbol);
 
         await safeSend(ctx, {
             step: "dca_wizard.budget",
-            text: `Enter quote amount (> ${minVal}, ${example}):`,
+            text: `Enter quote per order (> ${helpers.minLabel}, ${helpers.exampleLabel}):`,
         });
         await ctx.answerCallbackQuery();
         return true;
@@ -748,13 +751,13 @@ export async function handleDcaTextInput(ctx: Context): Promise<boolean> {
 
     if (state.step === "budget") {
         const budget = parseFloat(text.trim());
-        const minVal = state.quoteAsset === "BNB" ? 0.001 : 1;
-        if (isNaN(budget) || budget <= minVal) {
-            const minLabel = state.quoteAsset === "BNB" ? "0.001 BNB" : "1 USDT";
-            const suggest = state.quoteAsset === "BNB" ? "0.0011 BNB" : "1.05 USDT";
+        const helpers = await getRegistryPromptHelpers(state.exchange!, state.symbol!);
+
+        if (isNaN(budget) || budget <= helpers.minNotional) {
+            const label = exchangeLabel(state.exchange!);
             await safeSend(ctx, {
                 step: "dca_text.invalid_budget",
-                text: `❌ NonKYC minimum order is > ${minLabel}. Suggest ≥ ${suggest}.`,
+                text: `❌ ${label} minimum order is > ${helpers.minLabel}. Suggest > ${helpers.exampleLabel}.`,
             });
             return true;
         }
