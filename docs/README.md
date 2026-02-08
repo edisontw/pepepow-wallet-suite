@@ -11,9 +11,9 @@ Use this page to find the right document based on your role.
 - `docs/telegram-architecture.md` - Telegram Bot/Mini App/Web Wallet flows and DB rules.
 - `docs/wallet-api.md` - wallet-api purpose, endpoints, and security model.
 - `docs/pepew-api.md` - pepew-api integration overview.
-- `services/trade-bot/docs/devmm.md` - DevMM bot commands, guards, and operator-facing usage.
-- `services/trade-api/docs/DEVMM_BUG_FRAMEWORK.md` - DevMM failure taxonomy, guardrails, and regression framework.
-- `services/trade-api/docs/DEVMM_INCIDENT_TEMPLATE.md` - Incident record template for repeated DevMM bugs.
+- `docs/devmm.md` - DevMM bot commands, guards, and operator-facing usage.
+- `docs/DEVMM_BUG_FRAMEWORK.md` - DevMM failure taxonomy, guardrails, and regression framework.
+- `docs/DEVMM_INCIDENT_TEMPLATE.md` - Incident record template for repeated DevMM bugs.
 
 ## For Operators / DevOps
 - `docs/runtime.md` - Runbook, health checks, and common failures.
