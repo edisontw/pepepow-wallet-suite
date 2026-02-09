@@ -1055,6 +1055,37 @@ export function getOpenStrategyOrdersRegistry(strategyId: string): StrategyOrder
     ).all(strategyId) as StrategyOrderRegistry[];
 }
 
+export function closeMissingStrategyOrdersRegistry(
+    strategyId: string,
+    exchange: string,
+    pair: string,
+    liveOrderIds: string[],
+    status: string = "CLOSED"
+): number {
+    const now = Date.now();
+    const ids = Array.from(new Set((liveOrderIds || []).map((v) => String(v || "").trim()).filter(Boolean)));
+
+    if (ids.length === 0) {
+        const result = db.prepare(
+            "UPDATE strategy_order SET status = ?, updated_at = ? WHERE strategy_id = ? AND exchange = ? AND pair = ? AND status = 'OPEN'"
+        ).run(status, now, strategyId, exchange, pair);
+        return result.changes;
+    }
+
+    const placeholders = ids.map(() => "?").join(", ");
+    const sql = `
+        UPDATE strategy_order
+        SET status = ?, updated_at = ?
+        WHERE strategy_id = ?
+          AND exchange = ?
+          AND pair = ?
+          AND status = 'OPEN'
+          AND order_id NOT IN (${placeholders})
+    `;
+    const result = db.prepare(sql).run(status, now, strategyId, exchange, pair, ...ids);
+    return result.changes;
+}
+
 export function cancelLocalStrategyOrdersRegistry(strategyId: string): number {
     const now = Date.now();
     const result = db.prepare(
@@ -1651,7 +1682,7 @@ export interface DevmmFill {
 export const DEVMM_MIN_NOTIONAL: Record<DevmmExchange, number> = {
     nonkyc: 1,
     dextrade: 5,
-    nestex: 1.0,
+    nestex: 0.0015,
 };
 
 const DEVMM_DEFAULT_INVENTORY_MIN_SHARE = Number(process.env.DEVMM_INVENTORY_MIN_USDT_SHARE || 0.1);
@@ -1825,6 +1856,18 @@ export function incrementDevmmTurnover(exchange: DevmmExchange, symbol: string, 
 
 // ============= DevMM Fills Functions =============
 
+function normalizeDevmmExchangeKey(exchange: string): DevmmExchange {
+    const normalized = String(exchange || "").trim().toLowerCase();
+    if (normalized === "nonkyc") return "nonkyc";
+    if (normalized === "dextrade" || normalized === "dex-trade") return "dextrade";
+    if (normalized === "nestex") return "nestex";
+    return normalized as DevmmExchange;
+}
+
+function normalizeDevmmSymbolKey(symbol: string): string {
+    return String(symbol || "").trim().toUpperCase().replace(/_/g, "/");
+}
+
 export function insertDevmmFill(params: {
     exchange: DevmmExchange;
     symbol: string;
@@ -1837,6 +1880,8 @@ export function insertDevmmFill(params: {
     tradeId?: string | null;
 }): DevmmFill {
     const now = Date.now();
+    const exchangeKey = normalizeDevmmExchangeKey(params.exchange);
+    const symbolKey = normalizeDevmmSymbolKey(params.symbol);
     // Use Asia/Taipei timezone (UTC+8) for day bucketing
     const d = new Date(now + 8 * 60 * 60 * 1000);
     const dayBucket = d.toISOString().slice(0, 10);
@@ -1851,8 +1896,8 @@ export function insertDevmmFill(params: {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
         now,
-        params.exchange,
-        params.symbol,
+        exchangeKey,
+        symbolKey,
         params.side,
         params.price,
         params.qtyPepew,
@@ -1868,8 +1913,8 @@ export function insertDevmmFill(params: {
     return {
         id: result.lastInsertRowid as number,
         ts: now,
-        exchange: params.exchange,
-        symbol: params.symbol,
+        exchange: exchangeKey,
+        symbol: symbolKey,
         side: params.side,
         price: params.price,
         qty_pepew: params.qtyPepew,
@@ -1924,13 +1969,14 @@ export function getDevmmReport(exchange: DevmmExchange, periodType: "daily" | "w
             targetBucket = d.toISOString().slice(0, 7);
         }
     }
+    const exchangeKey = normalizeDevmmExchangeKey(exchange);
 
     const rows = db.prepare(`
-        SELECT side, SUM(quote_usdt) as total_quote, SUM(qty_pepew) as total_qty, SUM(fee_usdt) as total_fee, COUNT(*) as cnt
+        SELECT UPPER(TRIM(side)) as side, SUM(quote_usdt) as total_quote, SUM(qty_pepew) as total_qty, SUM(fee_usdt) as total_fee, COUNT(*) as cnt
         FROM devmm_fills
-        WHERE exchange = ? AND ${bucketColumn} = ? AND COALESCE(trade_id, '') != 'ASSUMED_VISIBILITY_TIMEOUT'
-        GROUP BY side
-    `).all(exchange, targetBucket) as Array<{ side: string; total_quote: number; total_qty: number; total_fee: number | null; cnt: number }>;
+        WHERE LOWER(TRIM(exchange)) = ? AND ${bucketColumn} = ? AND COALESCE(trade_id, '') != 'ASSUMED_VISIBILITY_TIMEOUT'
+        GROUP BY UPPER(TRIM(side))
+    `).all(exchangeKey, targetBucket) as Array<{ side: string; total_quote: number; total_qty: number; total_fee: number | null; cnt: number }>;
 
     if (rows.length === 0) {
         return null;
@@ -1951,7 +1997,7 @@ export function getDevmmReport(exchange: DevmmExchange, periodType: "daily" | "w
 
     return {
         period: targetBucket,
-        exchange,
+        exchange: exchangeKey,
         buyTurnoverUsdt: buyTurnover,
         sellTurnoverUsdt: sellTurnover,
         totalTurnoverUsdt: buyTurnover + sellTurnover,

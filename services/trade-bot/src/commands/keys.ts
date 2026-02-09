@@ -3,6 +3,7 @@ import { ApiError, setExchangeKeys, clearExchangeKeys, getKeysStatus } from "../
 import { safeSend } from "../utils/telegram.js";
 import { safeText, truncateText } from "../utils/strings.js";
 import { ExchangeName } from "../lib/markets.js";
+import { sendMainMenu } from "./mainMenu.js";
 
 const KEY_STATE_TTL_MS = 15 * 60 * 1000;
 
@@ -33,6 +34,7 @@ export async function handleKeys(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, { step: "keys.no_user", text: "❌ Could not identify user." });
+        await sendMainMenu(ctx);
         return;
     }
 
@@ -54,6 +56,7 @@ export async function handleKeysStatus(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, { step: "keys_status.no_user", text: "❌ Could not identify user." });
+        await sendMainMenu(ctx);
         return;
     }
 
@@ -61,6 +64,7 @@ export async function handleKeysStatus(ctx: Context): Promise<void> {
         const data = await getKeysStatus(tgUserId, undefined, true);
         if (!data.ok) {
             await safeSend(ctx, { step: "keys_status.api_error", text: "❌ Failed to fetch keys status." });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -89,6 +93,7 @@ export async function handleKeysStatus(ctx: Context): Promise<void> {
         }
 
         await safeSend(ctx, { step: "keys_status.success", text: message });
+        await sendMainMenu(ctx);
     } catch (err: any) {
         if (err instanceof ApiError) {
             console.error(`[keys_status] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
@@ -96,6 +101,7 @@ export async function handleKeysStatus(ctx: Context): Promise<void> {
             console.error(`[keys_status] Error: ${err?.message || err}`);
         }
         await safeSend(ctx, { step: "keys_status.error", text: "❌ Failed to fetch keys status." });
+        await sendMainMenu(ctx);
     }
 }
 
@@ -103,6 +109,7 @@ export async function handleKeysClear(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, { step: "keys_clear.no_user", text: "❌ Could not identify user." });
+        await sendMainMenu(ctx);
         return;
     }
 
@@ -132,10 +139,12 @@ async function clearKeysForExchange(ctx: Context, tgUserId: string, exchange: Ex
         const result = await clearExchangeKeys(tgUserId, exchange);
         if (!result.ok) {
             await safeSend(ctx, { step: "keys_clear.api_error", text: "❌ Failed to clear keys." });
+            await sendMainMenu(ctx);
             return;
         }
 
         await safeSend(ctx, { step: "keys_clear.success", text: `✅ ${exchangeLabel(exchange)} keys cleared.` });
+        await sendMainMenu(ctx);
     } catch (err: any) {
         if (err instanceof ApiError) {
             console.error(`[keys_clear] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
@@ -143,6 +152,7 @@ async function clearKeysForExchange(ctx: Context, tgUserId: string, exchange: Ex
             console.error(`[keys_clear] Error: ${err?.message || err}`);
         }
         await safeSend(ctx, { step: "keys_clear.error", text: "❌ Failed to clear keys." });
+        await sendMainMenu(ctx);
     }
 }
 
@@ -200,6 +210,7 @@ export async function handleKeysTextInput(ctx: Context): Promise<boolean> {
     if (isExpired(state)) {
         pendingKeys.delete(tgUserId);
         await safeSend(ctx, { step: "keys_text.expired", text: "⌛ Key setup expired. Please run /keys again." });
+        await sendMainMenu(ctx);
         return true;
     }
 
@@ -232,6 +243,7 @@ export async function handleKeysTextInput(ctx: Context): Promise<boolean> {
 
             if (!result.ok) {
                 await safeSend(ctx, { step: "keys_text.api_error", text: "❌ Failed to save keys. Please try again." });
+                await sendMainMenu(ctx);
                 return true;
             }
 
@@ -250,6 +262,7 @@ export async function handleKeysTextInput(ctx: Context): Promise<boolean> {
                 }
             }
             await safeSend(ctx, { step: "keys_text.success", text: message });
+            await sendMainMenu(ctx);
             return true;
         } catch (err: any) {
             pendingKeys.delete(tgUserId);
@@ -269,11 +282,13 @@ export async function handleKeysTextInput(ctx: Context): Promise<boolean> {
                 }
 
                 await safeSend(ctx, { step: "keys_text.error", text: userMessage });
+                await sendMainMenu(ctx);
                 return true;
             } else {
                 console.error(`[keys_set] Error: ${err?.message || err}`);
             }
             await safeSend(ctx, { step: "keys_text.error", text: "❌ Failed to save keys. Please try again." });
+            await sendMainMenu(ctx);
             return true;
         }
     }

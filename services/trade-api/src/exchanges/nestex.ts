@@ -44,6 +44,7 @@ export interface NestExResult {
     data?: any;
     error?: string;
     orderId?: string | null;
+    alreadyClosed?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,7 +198,7 @@ async function postNestEx(
     payload: Record<string, any>,
     rateLimitKey: string,
     opts?: {
-        validator?: (data: any) => { ok: boolean; error?: string; orderId?: string | null };
+        validator?: (data: any) => { ok: boolean; error?: string; orderId?: string | null; alreadyClosed?: boolean };
     }
 ): Promise<NestExResult> {
     await enforceRateLimit(rateLimitKey);
@@ -265,7 +266,13 @@ async function postNestEx(
             }
             return { ok: false, status, error: errMsg, data };
         }
-        return { ok: true, status, data, orderId: verdict.orderId ?? null };
+        return {
+            ok: true,
+            status,
+            data,
+            orderId: verdict.orderId ?? null,
+            alreadyClosed: verdict.alreadyClosed === true,
+        };
     }
 
     const orderId =
@@ -565,7 +572,7 @@ export async function cancelNestExOrder(
                     const errStr = String(error).toLowerCase();
                     if (errStr.includes("not found") || errStr.includes("not exist") || errStr.includes("check the order_id")) {
                         // This is "success" in the sense that the order is no longer open
-                        return { ok: true, orderId: normalizedOrderId };
+                        return { ok: true, orderId: normalizedOrderId, alreadyClosed: true };
                     }
                     return { ok: false, error };
                 }

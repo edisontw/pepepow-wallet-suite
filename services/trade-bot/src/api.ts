@@ -245,7 +245,12 @@ async function fetchApi<T>(path: string, options?: { method?: string; body?: any
     }
 
     if (!res.ok) {
-        const message = data?.error || data?.message || res.statusText || "Request failed";
+        const errorCode = typeof data?.error === "string" ? data.error.trim() : "";
+        const errorMessage = typeof data?.message === "string" ? data.message.trim() : "";
+        let message = errorMessage || errorCode || res.statusText || "Request failed";
+        if (errorCode && errorMessage && !errorMessage.includes(errorCode)) {
+            message = `${errorCode}: ${errorMessage}`;
+        }
         throw new ApiError(path, res.status || null, message);
     }
 
@@ -363,6 +368,43 @@ export async function getExchangeRegistry(): Promise<ExchangeRegistryResponse> {
 
 export async function getHealth(): Promise<SimpleResponse> {
     return fetchApi<SimpleResponse>("/healthz");
+}
+
+export type ReportPeriod = "daily" | "weekly" | "monthly";
+export type ReportExchange = "nonkyc" | "dextrade" | "nestex";
+
+export interface StrategyReportMetrics {
+    strategy: "dca" | "grid" | "mm" | "devmm" | "total";
+    fillCount: number;
+    orderCount: number;
+    quoteVolume: number;
+    baseVolume: number;
+    fee: number;
+    netQuote: number;
+}
+
+export interface StrategyReportResponse {
+    ok: boolean;
+    period: ReportPeriod;
+    exchange: ReportExchange;
+    bucket: string;
+    report: {
+        dca: StrategyReportMetrics;
+        grid: StrategyReportMetrics;
+        mm: StrategyReportMetrics;
+        devmm: StrategyReportMetrics;
+        total: StrategyReportMetrics;
+    };
+    error?: string;
+}
+
+export async function getStrategyReport(
+    tgUserId: string,
+    period: ReportPeriod,
+    exchange: ReportExchange
+): Promise<StrategyReportResponse> {
+    const qs = `?tg_user_id=${encodeURIComponent(tgUserId)}&period=${encodeURIComponent(period)}&exchange=${encodeURIComponent(exchange)}`;
+    return fetchApi<StrategyReportResponse>(`/v1/strategy/report${qs}`);
 }
 
 interface KeysStatusEntry {
@@ -484,6 +526,7 @@ export async function getBalance(tgUserId: string, exchange: string): Promise<Ba
 
 export interface CancelOrdersResponse {
     ok: boolean;
+    queued?: boolean;
     message?: string;
     cancelledCount?: number;
     failedCount?: number;
@@ -508,6 +551,11 @@ export interface DevmmStatusEntry {
     status: "ACTIVE" | "DEGRADED" | "PAUSED" | "STOPPED" | "NOT_CONFIGURED";
     pauseReason?: string | null;
     isEnabled?: boolean;
+    openOrdersBySide?: {
+        buy: number;
+        sell: number;
+    };
+    openOrdersSource?: string;
     config?: {
         symbol: string;
         orderQuoteUsdt: number;
@@ -546,6 +594,7 @@ export interface DevmmStatusEntry {
     } | null;
     lastAction?: string | null;
     lastActionAt?: number | null;
+    lastDecision?: string | null;
     lastError?: string | null;
     lastErrorCode?: string | null;
     lastErrorMessage?: string | null;
@@ -591,11 +640,23 @@ export async function devmmStart(params: {
 export async function devmmStop(exchange: "nonkyc" | "dextrade" | "nestex"): Promise<{
     ok: boolean;
     message?: string;
+    ordersAttempted?: number;
+    ordersVisibleBefore?: number;
     ordersCancelled?: number;
+    ordersAlreadyClosed?: number;
     ordersFailed?: number;
     error?: string;
 }> {
-    return fetchApi<{ ok: boolean; message?: string; ordersCancelled?: number; ordersFailed?: number; error?: string }>("/v1/devmm/stop", {
+    return fetchApi<{
+        ok: boolean;
+        message?: string;
+        ordersAttempted?: number;
+        ordersVisibleBefore?: number;
+        ordersCancelled?: number;
+        ordersAlreadyClosed?: number;
+        ordersFailed?: number;
+        error?: string;
+    }>("/v1/devmm/stop", {
         method: "POST",
         body: { exchange },
     });

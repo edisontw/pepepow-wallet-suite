@@ -42,7 +42,7 @@ import {
     resolveNestExSymbol,
 } from "../exchanges/nestex.js";
 import { getLastBalanceMeta, getNormalizedBalances } from "../lib/balanceHelper.js";
-import { fetchExchangePrice, fetchExchangeTopOfBook } from "./price.js";
+import { fetchAggregatedPrice, fetchExchangePrice, fetchExchangeTopOfBook } from "./price.js";
 import { fetchNestExOrderbookTop } from "../lib/price/sources/nestex.js";
 import { logStrategyTickContract } from "./logContract.js";
 import { getExchangeSpec, getPairLimits } from "../registry/exchanges.js";
@@ -110,6 +110,16 @@ function roundToTick(value: number, tick: number): number {
     return Math.round(value / tick) * tick;
 }
 
+function floorToTick(value: number, tick: number): number {
+    if (tick <= 0 || !Number.isFinite(tick)) return value;
+    return Math.floor(value / tick) * tick;
+}
+
+function ceilToTick(value: number, tick: number): number {
+    if (tick <= 0 || !Number.isFinite(tick)) return value;
+    return Math.ceil(value / tick) * tick;
+}
+
 function roundToStep(value: number, step: number): number {
     if (step <= 0 || !Number.isFinite(step)) return value;
     return Math.floor(value / step) * step;
@@ -135,6 +145,12 @@ function resolvePriceTick(baseTick: number, candidates: Array<number | null | un
         }
     }
     return 1e-8;
+}
+
+function normalizePercentRatio(value: number, fallback: number): number {
+    if (!Number.isFinite(value) || value <= 0) return fallback;
+    if (value >= 1) return value / 100;
+    return value;
 }
 
 type PendingOrderSide = "BUY" | "SELL";
@@ -269,7 +285,13 @@ function addPendingOrder(exchange: DevmmExchange, order: { orderId: string; clie
         expiresAt: now + visibilityGraceMs,
     };
     if (existingIndex >= 0) {
-        active[existingIndex] = entry;
+        // Do not extend visibility TTL on repeated re-adds; otherwise pending can become permanent.
+        const existing = active[existingIndex];
+        active[existingIndex] = {
+            ...existing,
+            side: entry.side,
+            clientOrderId: entry.clientOrderId || existing.clientOrderId,
+        };
     } else {
         active.push(entry);
     }
@@ -646,9 +668,9 @@ function getMarketRulesSync(exchange: DevmmExchange): MarketRules {
         if (exchange === "nonkyc") {
             return { minNotional: 1, minQty: 1, qtyStep: 1, priceTick: 1e-12 };
         } else if (exchange === "dextrade") {
-            return { minNotional: 5, minQty: 1, qtyStep: 1, priceTick: 1e-10 };
+            return { minNotional: 5, minQty: 1, qtyStep: 1, priceTick: 1e-8 };
         } else {
-            return { minNotional: 1.0, minQty: 1, qtyStep: 1, priceTick: 1e-8 };
+            return { minNotional: 0.0015, minQty: 1, qtyStep: 1, priceTick: 1e-8 };
         }
     }
 }
@@ -776,9 +798,12 @@ async function listOpenOrders(
     try {
         if (exchange === "nonkyc") {
             const res = await listNonKycOpenOrders(accessKey, secretKey, "PEPEW_USDT");
-            if (!res.ok || !Array.isArray(res.data)) return [];
-            return res.data.map((o: any) => ({
-                id: normalizeOrderId(o.id),
+            if (!res.ok) return [];
+            const rawOrders = Array.isArray(res.orders)
+                ? res.orders
+                : (Array.isArray(res.data) ? res.data : (Array.isArray((res as any)?.data?.orders) ? (res as any).data.orders : []));
+            return rawOrders.map((o: any) => ({
+                id: normalizeOrderId(o.order_id || o.id),
                 side: normalizeOrderSide(o.side),
                 clientOrderId: o.userProvidedId || o.clientOrderId || undefined
             }));
@@ -803,6 +828,18 @@ async function listOpenOrders(
     } catch {
         return [];
     }
+}
+
+function summarizeOpenOrdersBySide(orders: Array<{ side: string }>): { buy: number; sell: number; unknown: number } {
+    let buy = 0;
+    let sell = 0;
+    let unknown = 0;
+    for (const order of orders) {
+        if (order.side === "BUY") buy++;
+        else if (order.side === "SELL") sell++;
+        else unknown++;
+    }
+    return { buy, sell, unknown };
 }
 
 // Main tick function
@@ -1127,22 +1164,40 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             log("debug", exchange, `Inventory guard: skip SELL, usdt_share ${(usdtShare * 100).toFixed(1)}% > max ${(config.inventory_max_usdt_share * 100).toFixed(0)}%`);
         }
 
+        const buyOffsetPct = normalizePercentRatio(config.buy_offset_pct, 0.02);
+        const sellOffsetPct = normalizePercentRatio(config.sell_offset_pct, 0.01);
+
         // Calculate order prices
-        let buyPrice = roundToTick(mid * (1 - config.buy_offset_pct), priceTickUsed);
-        let sellPrice = roundToTick(mid * (1 + config.sell_offset_pct), priceTickUsed);
+        let quoteMid = mid;
+        let quoteAnchor = "ORDERBOOK_MID";
+        const anchorFromExchange = await fetchExchangePrice(exchange as ExchangeName, "PEPEW/USDT").catch(() => null);
+        if (anchorFromExchange?.price && anchorFromExchange.price > 0) {
+            quoteMid = anchorFromExchange.price;
+            quoteAnchor = `EXCHANGE_${anchorFromExchange.source}`;
+        }
+        if ((!anchorFromExchange || !anchorFromExchange.price || anchorFromExchange.price <= 0) && (forceSpreadMode || ob.bookSource !== "orderbook")) {
+            const anchorFromAgg = await fetchAggregatedPrice("PEPEW/USDT").catch(() => null);
+            if (anchorFromAgg?.price && anchorFromAgg.price > 0) {
+                quoteMid = anchorFromAgg.price;
+                quoteAnchor = "AGG";
+            }
+        }
+
+        let buyPrice = floorToTick(quoteMid * (1 - buyOffsetPct), priceTickUsed);
+        let sellPrice = ceilToTick(quoteMid * (1 + sellOffsetPct), priceTickUsed);
         if (forceSpreadMode) {
-            buyPrice = roundToTick(mid - forceSpreadTicks * priceTickUsed, priceTickUsed);
-            sellPrice = roundToTick(mid + forceSpreadTicks * priceTickUsed, priceTickUsed);
+            buyPrice = floorToTick(quoteMid - forceSpreadTicks * priceTickUsed, priceTickUsed);
+            sellPrice = ceilToTick(quoteMid + forceSpreadTicks * priceTickUsed, priceTickUsed);
             log(
                 "info",
                 exchange,
-                `FORCE_SPREAD quotes bid=${buyPrice} ask=${sellPrice} mid=${mid} forceSpreadTicks=${forceSpreadTicks} priceTickUsed=${priceTickUsed}`
+                `FORCE_SPREAD quotes bid=${buyPrice} ask=${sellPrice} quoteMid=${quoteMid} anchor=${quoteAnchor} forceSpreadTicks=${forceSpreadTicks} priceTickUsed=${priceTickUsed}`
             );
         }
 
         // No-crossing guard against top-of-book
-        const maxBuy = roundToTick(ob.ask - priceTickUsed, priceTickUsed);
-        const minSell = roundToTick(ob.bid + priceTickUsed, priceTickUsed);
+        const maxBuy = floorToTick(ob.ask - priceTickUsed, priceTickUsed);
+        const minSell = ceilToTick(ob.bid + priceTickUsed, priceTickUsed);
         if (Number.isFinite(maxBuy) && maxBuy > 0 && buyPrice >= ob.ask) {
             buyPrice = maxBuy;
         }
@@ -1217,6 +1272,13 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             const hasPrefix = o.clientOrderId?.startsWith("PPW-DEVMM-");
             return isTracked || hasPrefix;
         });
+        let rawOpenSummary = summarizeOpenOrdersBySide(rawOpenOrders);
+        let managedOpenSummary = summarizeOpenOrdersBySide(openOrders);
+        log(
+            "info",
+            exchange,
+            `openOrders raw=${rawOpenOrders.length} managed=${openOrders.length} rawBuy=${rawOpenSummary.buy} rawSell=${rawOpenSummary.sell} rawUnknown=${rawOpenSummary.unknown} managedBuy=${managedOpenSummary.buy} managedSell=${managedOpenSummary.sell} trackedBuy=${state.open_buy_order_id || "none"} trackedSell=${state.open_sell_order_id || "none"}`
+        );
         let pendingOrders = reconcilePendingWithVisibleOrders(exchange, now, rawOpenOrders);
 
         // Hard Guard: Max open orders per exchange
@@ -1291,16 +1353,22 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                 if (exchange === "nestex" || exchange === "dextrade") {
                     if (wasLocallyPlacedOrder(exchange, trackedOrderId)) {
                         if (exchange === "nestex") {
-                            addPendingOrder(exchange, { orderId: trackedOrderId, side }, now);
-                            pendingOrders = pruneAndGetPendingOrders(exchange, now);
-                            log(
-                                "info",
-                                exchange,
-                                `ORDER_NOT_VISIBLE side=${side} order_id=${trackedOrderId} action=KEEP_PENDING_NOT_VISIBLE pendingCount=${pendingOrders.length} visibilityGraceMs=${getVisibilityGraceMs(exchange)}`
-                            );
-                            return;
+                            const oppositeSide: PendingOrderSide = side === "BUY" ? "SELL" : "BUY";
+                            const oppositeSideVisible = rawOpenOrders.some((o) => o.side === oppositeSide);
+                            if (!oppositeSideVisible) {
+                                addPendingOrder(exchange, { orderId: trackedOrderId, side }, now);
+                                pendingOrders = pruneAndGetPendingOrders(exchange, now);
+                                log(
+                                    "info",
+                                    exchange,
+                                    `ORDER_NOT_VISIBLE side=${side} order_id=${trackedOrderId} action=KEEP_PENDING_NOT_VISIBLE pendingCount=${pendingOrders.length} visibilityGraceMs=${getVisibilityGraceMs(exchange)}`
+                                );
+                                return;
+                            }
+                            log("info", exchange, `ASSUMED_FILL side=${side} order_id=${trackedOrderId} reason=OPPOSITE_SIDE_VISIBLE`);
+                        } else {
+                            log("info", exchange, `ASSUMED_FILL side=${side} order_id=${trackedOrderId} reason=VISIBILITY_TIMEOUT`);
                         }
-                        log("info", exchange, `ASSUMED_FILL side=${side} order_id=${trackedOrderId} reason=VISIBILITY_TIMEOUT`);
                         try {
                             const price = side === "BUY" ? state.last_bid || mid : state.last_ask || mid;
                             const orderQuote = config.order_quote_usdt;
@@ -1313,7 +1381,7 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                                 qtyPepew: qty,
                                 quoteUsdt: orderQuote,
                                 orderId: trackedOrderId,
-                                tradeId: "ASSUMED_VISIBILITY_TIMEOUT",
+                                tradeId: exchange === "nestex" ? "ASSUMED_OPPOSITE_SIDE_VISIBLE" : "ASSUMED_VISIBILITY_TIMEOUT",
                             });
                             incrementDevmmTurnover(exchange, config.symbol, orderQuote);
                         } catch (err: any) {
@@ -1622,7 +1690,7 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                     orderResults.push(`BUY:FAILED:${result.error || "UNKNOWN"}`);
                     const errLower = (result.error || "").toLowerCase();
                     if (errLower.includes("post") || errLower.includes("maker") || errLower.includes("crossing")) {
-                        currentBuyPrice = roundToTick(currentBuyPrice - priceTickUsed, priceTickUsed);
+                        currentBuyPrice = floorToTick(currentBuyPrice - priceTickUsed, priceTickUsed);
                         retries++;
                         log("debug", exchange, `Post-only reject, retrying buy at ${currentBuyPrice} (attempt ${retries})`);
                         continue;
@@ -1716,7 +1784,7 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                     orderResults.push(`SELL:FAILED:${result.error || "UNKNOWN"}`);
                     const errLower = (result.error || "").toLowerCase();
                     if (errLower.includes("post") || errLower.includes("maker") || errLower.includes("crossing")) {
-                        currentSellPrice = roundToTick(currentSellPrice + priceTickUsed, priceTickUsed);
+                        currentSellPrice = ceilToTick(currentSellPrice + priceTickUsed, priceTickUsed);
                         retries++;
                         log("debug", exchange, `Post-only reject, retrying sell at ${currentSellPrice} (attempt ${retries})`);
                         continue;
@@ -1793,6 +1861,8 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
         const pauseIssueCode = mapPauseReasonToIssueCode(finalReason || null);
         if (pauseIssueCode) issueCodes.add(pauseIssueCode);
         const issueCodeSummary = Array.from(issueCodes).join("|") || "NONE";
+        rawOpenSummary = summarizeOpenOrdersBySide(rawOpenOrders);
+        managedOpenSummary = summarizeOpenOrdersBySide(openOrders);
         const decisionForState = issueCodeSummary === "NONE" ? decision : `${decision}|${issueCodeSummary}`;
         transitionDevmmState(exchange, config.symbol, finalStatus as any, finalReason, {
             lastOkAgeSec: balances.lastOkAgeSec,
@@ -1806,7 +1876,7 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
         log(
             "info",
             exchange,
-            `tick strategyId=${config.id} phase=${phase} bootstrapDone=${bootstrapLifecycle.done} openOrders=${openOrders.length} pendingCount=${finalPendingCount} dailyCapBypassed=${dailyCapBypassed} status=${finalStatus} decision=${decision} skipReason=${Array.from(skipReasons).join("|") || "NONE"} issueCode=${issueCodeSummary} orderAttempt=${orderAttempts.join("|") || "NONE"} orderResult=${orderResults.join("|") || "NONE"} capBlockedDaily=${capBlockedDaily} capBlockedHourly=${capBlockedHourly} bid=${ob.bid} ask=${ob.ask} inv=${invStr} maxNewOrdersPerTick=${maxNewOrdersPerTick} forceSpreadTicks=${forceSpreadTicks} priceTickUsed=${priceTickUsed}`
+            `tick strategyId=${config.id} phase=${phase} bootstrapDone=${bootstrapLifecycle.done} managedOpenOrders=${openOrders.length} rawOpenOrders=${rawOpenOrders.length} rawBuy=${rawOpenSummary.buy} rawSell=${rawOpenSummary.sell} rawUnknown=${rawOpenSummary.unknown} managedBuy=${managedOpenSummary.buy} managedSell=${managedOpenSummary.sell} pendingCount=${finalPendingCount} dailyCapBypassed=${dailyCapBypassed} status=${finalStatus} decision=${decision} skipReason=${Array.from(skipReasons).join("|") || "NONE"} issueCode=${issueCodeSummary} orderAttempt=${orderAttempts.join("|") || "NONE"} orderResult=${orderResults.join("|") || "NONE"} capBlockedDaily=${capBlockedDaily} capBlockedHourly=${capBlockedHourly} bid=${ob.bid} ask=${ob.ask} inv=${invStr} maxNewOrdersPerTick=${maxNewOrdersPerTick} forceSpreadTicks=${forceSpreadTicks} priceTickUsed=${priceTickUsed}`
         );
 
     } catch (err: any) {

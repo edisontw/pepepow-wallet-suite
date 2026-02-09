@@ -14,12 +14,11 @@ import {
     insertGridOrder,
     getOpenGridOrders,
     updateGridOrderStatus,
-    getGridOrderByLevel,
 } from "../db.js";
 import { decryptKeyPair } from "../crypto.js";
 import { createDexTradeOrder, cancelDexTradeOrder, listDexTradeOpenOrders } from "../exchanges/dextrade.js";
 import { createNonKycOrder, cancelNonKycOrder, getNonkycMarketRules, getNonKycOrderById, listNonKycOpenOrders } from "../exchanges/nonkyc.js";
-import { placeNestExLimitOrder, cancelNestExOrder } from "../exchanges/nestex.js";
+import { placeNestExLimitOrder, cancelNestExOrder, listNestExOpenOrders } from "../exchanges/nestex.js";
 import { ExchangeName, getBaseAsset, getExchangeSymbol, getQuoteUnit } from "../lib/markets.js";
 import { getMinNotional, getPricePrecision, getQtyPrecision } from "../lib/exchanges.js";
 import { fetchExchangePrice } from "./price.js";
@@ -87,6 +86,44 @@ export function roundToTick(value: number, tick: number): number {
     return Math.round(value / tick) * tick;
 }
 
+function floorToTick(value: number, tick: number): number {
+    if (!Number.isFinite(value) || !Number.isFinite(tick) || tick <= 0) return value;
+    return Math.floor(value / tick) * tick;
+}
+
+function ceilToTick(value: number, tick: number): number {
+    if (!Number.isFinite(value) || !Number.isFinite(tick) || tick <= 0) return value;
+    return Math.ceil(value / tick) * tick;
+}
+
+function inferTickPrecision(tick: number): number {
+    if (!Number.isFinite(tick) || tick <= 0) return 8;
+    const text = tick.toString();
+    if (text.includes("e-")) {
+        const exp = Number(text.split("e-")[1]);
+        if (Number.isFinite(exp) && exp >= 0) return exp;
+    }
+    const dot = text.indexOf(".");
+    return dot >= 0 ? text.length - dot - 1 : 0;
+}
+
+function buildPriceKey(price: number, tick: number): string {
+    const precision = Math.min(14, Math.max(8, inferTickPrecision(tick) + 2));
+    return price.toFixed(precision);
+}
+
+function buildLegacyPriceKey(price: number): string {
+    return price.toFixed(8);
+}
+
+function normalizeGridStepPct(raw: number): { stepPct: number; normalizedFromPercent: boolean } {
+    if (!Number.isFinite(raw)) return { stepPct: raw, normalizedFromPercent: false };
+    if (raw >= 1) {
+        return { stepPct: raw / 100, normalizedFromPercent: true };
+    }
+    return { stepPct: raw, normalizedFromPercent: false };
+}
+
 export async function getMarketRules(exchange: ExchangeName, symbol: string, quoteCcy: string): Promise<MarketRules> {
     if (exchange === "nonkyc") {
         const rules = await getNonkycMarketRules(symbol);
@@ -142,17 +179,28 @@ export const gridRunner: StrategyRunner = {
 
 
                 const gridLevels = Math.max(1, Math.floor(params.grid_levels ?? 10));
-                const stepPct = params.grid_step_pct ?? 0.01;
+                const rawStepPct = params.grid_step_pct ?? 0.01;
+                const normalizedStep = normalizeGridStepPct(rawStepPct);
+                const stepPct = normalizedStep.stepPct;
                 const refreshSec = params.refresh_sec ?? DEFAULT_REFRESH_SEC;
                 const allowSell = params.allow_sell ?? true;
+                const targetBuyLevels = gridLevels;
+                const targetSellLevels = allowSell ? gridLevels : 0;
+                const targetTotalLevels = targetBuyLevels + targetSellLevels;
                 const totalBudget = params.total_quote_budget ?? 0;
-                const perOrderQuote = params.quote_per_order || params.per_order_quote || (totalBudget > 0 ? totalBudget / gridLevels : 1);
+                const perOrderQuote = params.quote_per_order || params.per_order_quote || (totalBudget > 0 ? totalBudget / Math.max(1, targetBuyLevels) : 1);
 
                 if (!Number.isFinite(stepPct) || stepPct <= 0 || !Number.isFinite(perOrderQuote) || perOrderQuote <= 0) {
                     return {
                         success: false,
                         error: { message: "GRID params invalid: check step/budget." }
                     };
+                }
+                if (normalizedStep.normalizedFromPercent) {
+                    console.warn(
+                        `[gridRunner] strategy=${config.id} normalized grid_step_pct from ${rawStepPct} to ${stepPct} (percent->ratio)`
+                    );
+                    params.grid_step_pct = stepPct;
                 }
 
                 let priceResult;
@@ -298,6 +346,37 @@ export const gridRunner: StrategyRunner = {
                         balanceTs = balanceResult.metadata.fetchedAt;
                         balanceStalenessMs = balanceResult.metadata.cacheAgeMs;
                     }
+
+                    // SYNC WITH EXCHANGE to avoid stale local tracked orders.
+                    try {
+                        const exchangeOrders = await listNestExOpenOrders(
+                            apiKey,
+                            apiSecret,
+                            config.pair,
+                            `USER:${config.tg_user_id}`,
+                            { exhaustive: true, includeNoCur: true }
+                        );
+                        if (exchangeOrders.ok && Array.isArray(exchangeOrders.orders)) {
+                            const exchangeIds = exchangeOrders.orders.map((o: any) => String(o.order_id || o.id || ""));
+                            let syncCount = 0;
+                            for (const lo of localOpenOrders) {
+                                if (!exchangeIds.includes(String(lo.order_id))) {
+                                    // It's gone from exchange. Only sync if not brand new (propagation delay).
+                                    if (now - lo.created_at > 10000) {
+                                        updateGridOrderStatus(lo.order_id, "FILLED");
+                                        updateStrategyOrderStatusRegistry(exchange, lo.order_id, "FILLED");
+                                        syncCount++;
+                                    }
+                                }
+                            }
+                            if (syncCount > 0) {
+                                console.log(`[gridRunner] config=${config.id} synced ${syncCount} phantom orders (nestex)`);
+                                localOpenOrders = getOpenGridOrders(config.id);
+                            }
+                        }
+                    } catch (err) {
+                        console.warn(`[gridRunner] config=${config.id} sync failed (nestex):`, err);
+                    }
                 }
 
                 logStrategyTickContract({
@@ -313,12 +392,34 @@ export const gridRunner: StrategyRunner = {
 
                 // --- 2. RECONCILE (DEDUPLICATE) ---
                 // We use price_key (rounded price string) for unique level tracking
-                const groups = new Map<string, typeof localOpenOrders>();
-                for (const o of localOpenOrders) {
-                    const key = `${o.side}|${o.price_key}`;
-                    if (!groups.has(key)) groups.set(key, []);
-                    groups.get(key)!.push(o);
-                }
+                const toTickUnit = (price: number): string => String(Math.round(price / rules.priceTick));
+                const baseTickUnit = Math.round(normalizedBase / rules.priceTick);
+                const buildGroups = (orders: typeof localOpenOrders): Map<string, typeof localOpenOrders> => {
+                    const m = new Map<string, typeof localOpenOrders>();
+                    for (const o of orders) {
+                        const key = `${o.side}|${o.price_key}`;
+                        if (!m.has(key)) m.set(key, []);
+                        m.get(key)!.push(o);
+                    }
+                    return m;
+                };
+                const cancelOpenGridOrder = async (order: typeof localOpenOrders[number], reason: string): Promise<boolean> => {
+                    console.log(`[gridRunner] config=${config.id} ${reason} id=${order.order_id} side=${order.side} priceKey=${order.price_key}`);
+                    if (config.trade_mode === "REAL" && exchange === "nonkyc") {
+                        const cancelResult = await cancelNonKycOrder(apiKey, apiSecret, order.order_id);
+                        if (!(cancelResult.ok || cancelResult.status === 404)) return false;
+                    } else if (config.trade_mode === "REAL" && exchange === "dextrade") {
+                        const cancelResult = await cancelDexTradeOrder(apiKey, apiSecret, order.order_id, symbol);
+                        if (!(cancelResult.ok || cancelResult.status === 404)) return false;
+                    } else if (config.trade_mode === "REAL" && exchange === "nestex") {
+                        const cancelResult = await cancelNestExOrder(apiKey, apiSecret, order.order_id, `USER:${config.tg_user_id}`);
+                        if (!(cancelResult.ok || cancelResult.status === 404)) return false;
+                    }
+                    updateGridOrderStatus(order.order_id, "CANCELLED");
+                    updateStrategyOrderStatusRegistry(exchange, order.order_id, "CANCELLED");
+                    return true;
+                };
+                let groups = buildGroups(localOpenOrders);
 
                 let cancelledDuplicates = 0;
                 for (const [key, orders] of groups.entries()) {
@@ -327,86 +428,161 @@ export const gridRunner: StrategyRunner = {
                         const toKeep = orders[orders.length - 1];
                         const toCancel = orders.slice(0, -1);
                         for (const o of toCancel) {
-                            console.log(`[gridRunner] config=${config.id} DEDUPE_CANCEL: ${key} id=${o.order_id}`);
-                            if (config.trade_mode === "REAL" && exchange === "nonkyc") {
-                                const cancelResult = await cancelNonKycOrder(apiKey, apiSecret, o.order_id);
-                                if (cancelResult.ok || cancelResult.status === 404) {
-                                    updateGridOrderStatus(o.order_id, "CANCELLED");
-                                    updateStrategyOrderStatusRegistry(exchange, o.order_id, "CANCELLED");
-                                    cancelledDuplicates++;
-                                }
-                            } else if (config.trade_mode === "REAL" && exchange === "dextrade") {
-                                const cancelResult = await cancelDexTradeOrder(apiKey, apiSecret, o.order_id, symbol);
-                                if (cancelResult.ok || cancelResult.status === 404) {
-                                    updateGridOrderStatus(o.order_id, "CANCELLED");
-                                    updateStrategyOrderStatusRegistry(exchange, o.order_id, "CANCELLED");
-                                    cancelledDuplicates++;
-                                }
-                            } else if (config.trade_mode === "REAL" && exchange === "nestex") {
-                                const cancelResult = await cancelNestExOrder(apiKey, apiSecret, o.order_id, `USER:${config.tg_user_id}`);
-                                if (cancelResult.ok || cancelResult.status === 404) {
-                                    updateGridOrderStatus(o.order_id, "CANCELLED");
-                                    updateStrategyOrderStatusRegistry(exchange, o.order_id, "CANCELLED");
-                                    cancelledDuplicates++;
-                                }
-                            } else {
-                                updateGridOrderStatus(o.order_id, "CANCELLED");
-                                updateStrategyOrderStatusRegistry(exchange, o.order_id, "CANCELLED");
-                                cancelledDuplicates++;
-                            }
+                            const cancelled = await cancelOpenGridOrder(o, `DEDUPE_CANCEL key=${key}`);
+                            if (cancelled) cancelledDuplicates++;
                         }
                         groups.set(key, [toKeep]);
                     }
                 }
+                if (cancelledDuplicates > 0) {
+                    localOpenOrders = getOpenGridOrders(config.id);
+                    groups = buildGroups(localOpenOrders);
+                }
+
+                // Cross-side collision cleanup (same tick has both BUY and SELL) to avoid self-trade loops.
+                let cancelledCrossSide = 0;
+                const byTick = new Map<string, typeof localOpenOrders>();
+                for (const o of localOpenOrders) {
+                    const px = Number(o.price_key);
+                    if (!Number.isFinite(px) || px <= 0) continue;
+                    const tickKey = toTickUnit(roundToTick(px, rules.priceTick));
+                    if (!byTick.has(tickKey)) byTick.set(tickKey, []);
+                    byTick.get(tickKey)!.push(o);
+                }
+                for (const [tickKey, orders] of byTick.entries()) {
+                    const hasBuy = orders.some((o) => o.side === "BUY");
+                    const hasSell = orders.some((o) => o.side === "SELL");
+                    if (!hasBuy || !hasSell) continue;
+                    const unit = Number(tickKey);
+                    for (const o of orders) {
+                        const cancelBuyAtOrAboveBase = o.side === "BUY" && Number.isFinite(unit) && unit >= baseTickUnit;
+                        const cancelSellAtOrBelowBase = o.side === "SELL" && Number.isFinite(unit) && unit <= baseTickUnit;
+                        const cancelAtCenterTick = Number.isFinite(unit) && unit === baseTickUnit;
+                        if (!cancelBuyAtOrAboveBase && !cancelSellAtOrBelowBase && !cancelAtCenterTick) continue;
+                        const cancelled = await cancelOpenGridOrder(o, `CROSS_SIDE_CANCEL tick=${tickKey}`);
+                        if (cancelled) cancelledCrossSide++;
+                    }
+                }
+                if (cancelledCrossSide > 0) {
+                    localOpenOrders = getOpenGridOrders(config.id);
+                    groups = buildGroups(localOpenOrders);
+                }
 
                 // Refresh check
                 const lastRun = config.last_run_at || 0;
-                if (lastRun > 0 && now - lastRun < refreshSec * 1000 && cancelledDuplicates === 0 && localOpenOrders.length > 0) {
+                const currentBuyCountForRefresh = Array.from(groups.values()).filter(g => g[0].side === "BUY").length;
+                const currentSellCountForRefresh = Array.from(groups.values()).filter(g => g[0].side === "SELL").length;
+                const meetsTargetOnRefresh =
+                    currentBuyCountForRefresh >= targetBuyLevels &&
+                    currentSellCountForRefresh >= targetSellLevels;
+                if (
+                    lastRun > 0 &&
+                    now - lastRun < refreshSec * 1000 &&
+                    cancelledDuplicates === 0 &&
+                    cancelledCrossSide === 0 &&
+                    localOpenOrders.length > 0 &&
+                    meetsTargetOnRefresh
+                ) {
                     console.log(`[grid][return] reason=REFRESH_WAIT detail=elapsed=${now - lastRun}ms refreshSec=${refreshSec}`);
                     return { success: true };
                 }
 
 
                 // --- 3. TARGET GENERATION & GAP FILLING ---
-                const targetLevels: Array<{ side: string; price: number; qty: number; priceKey: string }> = [];
-                for (let level = 1; level <= gridLevels; level++) {
-                    const bPriceRaw = normalizedBase * (1 - stepPct * level);
-                    const bPrice = roundToTick(bPriceRaw, rules.priceTick);
-                    const bPriceKey = bPrice.toFixed(8);
+                const targetLevels: Array<{
+                    side: "BUY" | "SELL";
+                    level: number;
+                    price: number;
+                    qty: number;
+                    priceKey: string;
+                    legacyPriceKey: string;
+                }> = [];
+                const buyTickUnits = new Set<string>();
+                const sellTickUnits = new Set<string>();
+                const existingBuyTickUnits = new Set<string>();
+                const existingSellTickUnits = new Set<string>();
+                for (const o of localOpenOrders) {
+                    const price = Number(o.price_key);
+                    if (!Number.isFinite(price) || price <= 0) continue;
+                    const unit = toTickUnit(roundToTick(price, rules.priceTick));
+                    if (o.side === "BUY") existingBuyTickUnits.add(unit);
+                    if (o.side === "SELL") existingSellTickUnits.add(unit);
+                }
 
-                    targetLevels.push({
-                        side: "BUY",
-                        price: bPrice,
-                        qty: roundToStep(perOrderQuote / bPrice, rules.qtyStep),
-                        priceKey: bPriceKey
-                    });
+                for (let level = 1; level <= gridLevels; level++) {
+                    // BUY side (base and below): enforce unique tick prices by nudging outward when needed.
+                    const bPriceRaw = normalizedBase * (1 - stepPct * level);
+                    let bPrice = floorToTick(bPriceRaw, rules.priceTick);
+                    let buyNudge = 0;
+                    while (Number.isFinite(bPrice) && bPrice > 0 && buyNudge < 128) {
+                        const unit = toTickUnit(bPrice);
+                        const needSeparation = Number(unit) >= baseTickUnit;
+                        const collidesWithOwnBuy = buyTickUnits.has(unit) || existingBuyTickUnits.has(unit);
+                        const collidesWithSell = sellTickUnits.has(unit) || existingSellTickUnits.has(unit);
+                        if (!needSeparation && !collidesWithOwnBuy && !collidesWithSell) break;
+                        bPrice = floorToTick(bPrice - rules.priceTick, rules.priceTick);
+                        buyNudge += 1;
+                    }
+                    if (!Number.isFinite(bPrice) || bPrice <= 0) {
+                        skipReasons.push(`SKIP: BUY level=${level} invalid price after tick dedupe`);
+                    } else {
+                        buyTickUnits.add(toTickUnit(bPrice));
+                        targetLevels.push({
+                            side: "BUY",
+                            level,
+                            price: bPrice,
+                            qty: roundToStep(perOrderQuote / bPrice, rules.qtyStep),
+                            priceKey: buildPriceKey(bPrice, rules.priceTick),
+                            legacyPriceKey: buildLegacyPriceKey(bPrice),
+                        });
+                    }
 
                     if (allowSell) {
                         const sPriceRaw = normalizedBase * (1 + stepPct * level);
-                        const sPrice = roundToTick(sPriceRaw, rules.priceTick);
-                        const sPriceKey = sPrice.toFixed(8);
-
-                        targetLevels.push({
-                            side: "SELL",
-                            price: sPrice,
-                            qty: roundToStep(perOrderQuote / sPrice, rules.qtyStep),
-                            priceKey: sPriceKey
-                        });
+                        let sPrice = ceilToTick(sPriceRaw, rules.priceTick);
+                        let sellNudge = 0;
+                        while (Number.isFinite(sPrice) && sPrice > 0 && sellNudge < 128) {
+                            const unit = toTickUnit(sPrice);
+                            const needSeparation = Number(unit) <= baseTickUnit;
+                            const collidesWithOwnSell = sellTickUnits.has(unit) || existingSellTickUnits.has(unit);
+                            const collidesWithBuy = buyTickUnits.has(unit) || existingBuyTickUnits.has(unit);
+                            if (!needSeparation && !collidesWithOwnSell && !collidesWithBuy) break;
+                            sPrice = ceilToTick(sPrice + rules.priceTick, rules.priceTick);
+                            sellNudge += 1;
+                        }
+                        if (!Number.isFinite(sPrice) || sPrice <= 0) {
+                            skipReasons.push(`SKIP: SELL level=${level} invalid price after tick dedupe`);
+                        } else {
+                            sellTickUnits.add(toTickUnit(sPrice));
+                            targetLevels.push({
+                                side: "SELL",
+                                level,
+                                price: sPrice,
+                                qty: roundToStep(perOrderQuote / sPrice, rules.qtyStep),
+                                priceKey: buildPriceKey(sPrice, rules.priceTick),
+                                legacyPriceKey: buildLegacyPriceKey(sPrice),
+                            });
+                        }
                     }
                 }
+
+                console.log(
+                    `[gridRunner] strategy=${config.id} pair=${config.pair} levels=${gridLevels} targetBuy=${targetBuyLevels} targetSell=${targetSellLevels} targetTotal=${targetTotalLevels} stepPct=${stepPct} tick=${rules.priceTick} buyTargets=${targetLevels.filter(t => t.side === "BUY").length} sellTargets=${targetLevels.filter(t => t.side === "SELL").length}`
+                );
 
                 const toCreate: typeof targetLevels = [];
                 for (const t of targetLevels) {
                     const key = `${t.side}|${t.priceKey}`;
-                    if (!groups.has(key)) toCreate.push(t);
+                    const legacyKey = `${t.side}|${t.legacyPriceKey}`;
+                    if (!groups.has(key) && !groups.has(legacyKey)) toCreate.push(t);
                 }
 
                 // --- 4. LIMITS & FUND PROTECTION ---
                 const currentBuyCount = Array.from(groups.values()).filter(g => g[0].side === "BUY").length;
                 const currentSellCount = Array.from(groups.values()).filter(g => g[0].side === "SELL").length;
 
-                const buyRoom = Math.max(0, gridLevels - currentBuyCount);
-                const sellRoom = Math.max(0, gridLevels - currentSellCount);
+                const buyRoom = Math.max(0, targetBuyLevels - currentBuyCount);
+                const sellRoom = Math.max(0, targetSellLevels - currentSellCount);
 
                 const finalToCreateBuy = toCreate.filter(o => o.side === "BUY").slice(0, buyRoom);
                 const finalToCreateSell = toCreate.filter(o => o.side === "SELL").slice(0, sellRoom);
@@ -439,19 +615,22 @@ export const gridRunner: StrategyRunner = {
                     const notional = order.qty * order.price;
                     if (rules.minNotional > 0 && notional < rules.minNotional) {
                         const suggest = (rules.minNotional * 1.05);
-                        skipReasons.push(`SKIP: MIN_NOTIONAL <${rules.minNotional.toFixed(4)} ${quoteCcy}; suggest >= ${suggest.toFixed(4)} ${quoteCcy}`);
+                        skipReasons.push(`SKIP: ${order.side} level=${order.level} MIN_NOTIONAL <${rules.minNotional.toFixed(4)} ${quoteCcy}; suggest >= ${suggest.toFixed(4)} ${quoteCcy}`);
                         continue;
                     }
                     if (rules.minQty > 0 && order.qty < rules.minQty) {
-                        skipReasons.push(`SKIP: Qty too small (${order.qty.toExponential(2)} < ${rules.minQty})`);
+                        skipReasons.push(`SKIP: ${order.side} level=${order.level} QTY_TOO_SMALL (${order.qty.toExponential(2)} < ${rules.minQty})`);
                         continue;
                     }
 
 
                     // Final safety: check grid_order table again before placement
-                    const existing = getGridOrderByLevel(config.id, order.side, order.priceKey);
-                    if (existing) {
-                        console.log(`[gridRunner] config=${config.id} level ${order.side}|${order.priceKey} already has OPEN order ${existing.order_id}, skipping.`);
+                    const groupKey = `${order.side}|${order.priceKey}`;
+                    const legacyGroupKey = `${order.side}|${order.legacyPriceKey}`;
+                    const existingOrders = groups.get(groupKey) || groups.get(legacyGroupKey) || [];
+                    if (existingOrders.length > 0) {
+                        const existingId = existingOrders[0]?.order_id || "unknown";
+                        console.log(`[gridRunner] config=${config.id} level ${order.side}|${order.priceKey} already has OPEN order ${existingId}, skipping.`);
                         continue;
                     }
 
@@ -660,20 +839,19 @@ export const gridRunner: StrategyRunner = {
                 }
 
                 // Update tracked order IDs for reliable stopping
-                const allActiveOrderIds = [
-                    ...localOpenOrders.map(o => o.order_id),
-                    ...createdIds
-                ];
-
-                const finalOpenCount = currentBuyCount + currentSellCount + createdIds.length;
-                const finalBuyCount = currentBuyCount + createdBuy;
-                const finalSellCount = currentSellCount + createdSell;
+                const liveOpenOrders = getOpenGridOrders(config.id);
+                const allActiveOrderIds = liveOpenOrders.map((o) => o.order_id);
+                const finalBuyCount = liveOpenOrders.filter((o) => o.side === "BUY").length;
+                const finalSellCount = liveOpenOrders.filter((o) => o.side === "SELL").length;
+                const finalOpenCount = liveOpenOrders.length;
 
                 // Update cumulative counts
                 params.total_placed = (params.total_placed || 0) + createdIds.length;
                 params.total_cancelled = (params.total_cancelled || 0) + cancelledDuplicates;
 
-                const actionSummary = `GRID: tracked=${finalOpenCount} (buy=${finalBuyCount} sell=${finalSellCount}) placed=${createdIds.length} cancelled=${cancelledDuplicates} (totalPlaced=${params.total_placed})`;
+                const actionSummary =
+                    `GRID: rule=BUY:${targetBuyLevels}+SELL:${targetSellLevels}(total=${targetTotalLevels}) ` +
+                    `tracked=${finalOpenCount} (buy=${finalBuyCount} sell=${finalSellCount}) placed=${createdIds.length} cancelled=${cancelledDuplicates} (totalPlaced=${params.total_placed})`;
                 const primarySkip = skipReasons[0];
                 const lastAction = (createdIds.length === 0 && primarySkip)
                     ? (primarySkip.startsWith("SKIP:") ? primarySkip : `GRID SKIP: ${primarySkip}`)

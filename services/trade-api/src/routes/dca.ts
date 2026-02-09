@@ -104,6 +104,7 @@ const DcaTargetSchema = z.object({
 router.post("/v1/dca/config", (req, res) => {
     try {
         const parsed = DcaConfigSchema.parse(req.body);
+
         const tradeMode = "REAL";
         const symbolInput = parsed.symbol || parsed.pair || "";
 

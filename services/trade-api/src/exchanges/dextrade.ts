@@ -101,6 +101,12 @@ function mapSide(side: DexTradeOrderSide): number {
     return side === "BUY" ? 0 : 1;
 }
 
+function formatDexTradeRate(rate: number): string {
+    if (!Number.isFinite(rate) || rate <= 0) return String(rate);
+    // Dex-Trade accepts up to 8 decimal places for limit price.
+    return rate.toFixed(8).replace(/(?:\.0+|(\.\d+?)0+)$/, "$1");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // API Functions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +126,7 @@ export async function createDexTradeOrder(req: DexTradeOrderRequest): Promise<De
         if (typeof req.rate !== "number" || !Number.isFinite(req.rate)) {
             return { ok: false, status: 400, error: "Rate is required for LIMIT orders" };
         }
-        params.rate = String(req.rate);
+        params.rate = formatDexTradeRate(req.rate);
     }
 
     // request_id must be incrementing - use microsecond timestamp

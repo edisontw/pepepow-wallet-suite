@@ -75,19 +75,25 @@ export async function cancelOutstandingOrders(configId: number): Promise<{ cance
                         const { getMarketRules, roundToTick, normalizePrice } = await import("./gridRunner.js");
                         const params = JSON.parse(config.params_json);
                         const basePrice = params.base_price || 0;
-                        const gridLevels = params.grid_levels || 10;
-                        const stepPct = params.grid_step_pct || 0.01;
+                        const gridLevels = Math.max(1, Math.floor(params.grid_levels || 10));
+                        const rawStepPct = params.grid_step_pct || 0.01;
+                        const stepPct = rawStepPct >= 1 ? rawStepPct / 100 : rawStepPct;
 
                         if (basePrice > 0) {
                             const symbol = config.pair; // simplified
                             const rules = await getMarketRules(exchange, symbol, "USDT");
                             const normalizedBase = normalizePrice(basePrice);
+                            const toKey = (price: number): string => price.toFixed(14);
 
                             for (let i = 1; i <= gridLevels; i++) {
                                 const buyPrice = roundToTick(normalizedBase * (1 - stepPct * i), rules.priceTick);
                                 const sellPrice = roundToTick(normalizedBase * (1 + stepPct * i), rules.priceTick);
-                                gridPriceLadder.add(buyPrice.toFixed(8));
-                                gridPriceLadder.add(sellPrice.toFixed(8));
+                                if (Number.isFinite(buyPrice) && buyPrice > 0) {
+                                    gridPriceLadder.add(toKey(buyPrice));
+                                }
+                                if (Number.isFinite(sellPrice) && sellPrice > 0) {
+                                    gridPriceLadder.add(toKey(sellPrice));
+                                }
                             }
                         }
                     } catch (err) {
@@ -108,7 +114,7 @@ export async function cancelOutstandingOrders(configId: number): Promise<{ cance
                     // GRID specific fallback details
                     if (config.strategy === "GRID" && gridPriceLadder.size > 0) {
                         const orderPrice = Number(ro.price);
-                        const orderPriceKey = orderPrice.toFixed(8);
+                        const orderPriceKey = orderPrice.toFixed(14);
                         const isMatchPrice = gridPriceLadder.has(orderPriceKey);
 
                         // Check if order was created after strategy start (allow 5 min buffer)
@@ -221,7 +227,9 @@ export async function cancelOutstandingOrders(configId: number): Promise<{ cance
                 status = "FAILED";
             } else {
                 const res = await cancelNestExOrder(apiKey, apiSecret, orderId, `USER:${tgUserId}`);
-                if (res.ok) {
+                if (res.ok && res.alreadyClosed) {
+                    status = "ALREADY_CLOSED";
+                } else if (res.ok) {
                     status = "CANCELLED";
                 } else if (res.status === 404 || (res.error && /not found|already.*closed/i.test(res.error))) {
                     status = "ALREADY_CLOSED";

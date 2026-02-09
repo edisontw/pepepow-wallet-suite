@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import {
+import db, {
     getStrategyConfigsByUser,
     getRecentStrategyOrders,
     getRecentStrategyFills,
@@ -18,6 +18,7 @@ import {
     getOpenGridOrders,
     cancelOpenGridOrders,
     updateGridOrderStatus,
+    getDevmmReport,
 } from "../db.js";
 import { ExchangeName, formatPairDisplay, normalizePairSymbol, validatePair, getExchangeSymbol } from "../lib/markets.js";
 import { listExchangeSpecs, getExchangeSpec, normalizeExchangeId } from "../registry/exchanges.js";
@@ -131,6 +132,73 @@ async function collectBalanceSummaryForUser(tgUserId: string): Promise<Array<{
     }
 
     return balances;
+}
+
+type ReportPeriod = "daily" | "weekly" | "monthly";
+type ReportExchange = "nonkyc" | "dextrade" | "nestex";
+type StrategyReportKey = "dca" | "grid" | "mm" | "devmm" | "total";
+
+type StrategyReportMetric = {
+    strategy: StrategyReportKey;
+    fillCount: number;
+    orderCount: number;
+    quoteVolume: number;
+    baseVolume: number;
+    fee: number;
+    netQuote: number;
+};
+
+function getIsoWeek(date: Date): number {
+    const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    const dayNum = d.getUTCDay() || 7;
+    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+}
+
+function resolveReportWindow(period: ReportPeriod, now = Date.now()): { startTs: number; endTs: number; bucket: string } {
+    const offsetMs = 8 * 60 * 60 * 1000;
+    const localNow = new Date(now + offsetMs);
+    const year = localNow.getUTCFullYear();
+    const month = localNow.getUTCMonth();
+    const date = localNow.getUTCDate();
+    let startLocalTs = 0;
+    let endLocalTs = 0;
+    let bucket = "";
+
+    if (period === "daily") {
+        startLocalTs = Date.UTC(year, month, date);
+        endLocalTs = Date.UTC(year, month, date + 1);
+        bucket = localNow.toISOString().slice(0, 10);
+    } else if (period === "weekly") {
+        const weekday = localNow.getUTCDay() || 7;
+        const mondayDate = date - weekday + 1;
+        startLocalTs = Date.UTC(year, month, mondayDate);
+        endLocalTs = Date.UTC(year, month, mondayDate + 7);
+        bucket = `${year}-W${String(getIsoWeek(localNow)).padStart(2, "0")}`;
+    } else {
+        startLocalTs = Date.UTC(year, month, 1);
+        endLocalTs = Date.UTC(year, month + 1, 1);
+        bucket = `${year}-${String(month + 1).padStart(2, "0")}`;
+    }
+
+    return {
+        startTs: startLocalTs - offsetMs,
+        endTs: endLocalTs - offsetMs,
+        bucket,
+    };
+}
+
+function zeroMetric(strategy: StrategyReportKey): StrategyReportMetric {
+    return {
+        strategy,
+        fillCount: 0,
+        orderCount: 0,
+        quoteVolume: 0,
+        baseVolume: 0,
+        fee: 0,
+        netQuote: 0,
+    };
 }
 
 // POST /v1/strategy/config/upsert
@@ -482,6 +550,128 @@ router.get("/v1/strategy/status", async (req, res) => {
     } catch (err: any) {
         console.error(`[strategy] status error: ${err.message}`);
         res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// GET /v1/strategy/report?tg_user_id=...&exchange=...&period=...
+router.get("/v1/strategy/report", (req, res) => {
+    try {
+        const tgUserId = String(req.query.tg_user_id || req.query.tgUserId || "").trim();
+        const exchange = String(req.query.exchange || "").trim().toLowerCase() as ReportExchange;
+        const period = String(req.query.period || "daily").trim().toLowerCase() as ReportPeriod;
+
+        if (!tgUserId) {
+            return res.status(400).json({ ok: false, error: "tg_user_id query param required" });
+        }
+        if (!["nonkyc", "dextrade", "nestex"].includes(exchange)) {
+            return res.status(400).json({ ok: false, error: "INVALID_EXCHANGE" });
+        }
+        if (!["daily", "weekly", "monthly"].includes(period)) {
+            return res.status(400).json({ ok: false, error: "INVALID_PERIOD" });
+        }
+
+        const { startTs, endTs, bucket } = resolveReportWindow(period);
+        const rows = db.prepare(`
+            SELECT
+                UPPER(TRIM(o.strategy)) AS strategy,
+                COUNT(f.id) AS fill_count,
+                COUNT(DISTINCT f.order_id) AS order_count,
+                SUM(f.qty) AS base_volume,
+                SUM(f.price * f.qty) AS quote_volume,
+                SUM(COALESCE(f.fee, 0)) AS fee_total,
+                SUM(CASE WHEN UPPER(TRIM(o.side)) = 'SELL' THEN (f.price * f.qty) ELSE 0 END)
+                - SUM(CASE WHEN UPPER(TRIM(o.side)) = 'BUY' THEN (f.price * f.qty) ELSE 0 END)
+                - SUM(COALESCE(f.fee, 0)) AS net_quote
+            FROM trade_strategy_fill f
+            JOIN trade_strategy_order o ON o.id = f.order_id
+            WHERE o.tg_user_id = ?
+              AND LOWER(TRIM(o.exchange)) = ?
+              AND f.ts >= ?
+              AND f.ts < ?
+            GROUP BY UPPER(TRIM(o.strategy))
+        `).all(tgUserId, exchange, startTs, endTs) as Array<{
+            strategy: string;
+            fill_count: number;
+            order_count: number;
+            base_volume: number;
+            quote_volume: number;
+            fee_total: number;
+            net_quote: number;
+        }>;
+
+        const report: Record<StrategyReportKey, StrategyReportMetric> = {
+            dca: zeroMetric("dca"),
+            grid: zeroMetric("grid"),
+            mm: zeroMetric("mm"),
+            devmm: zeroMetric("devmm"),
+            total: zeroMetric("total"),
+        };
+
+        for (const row of rows) {
+            const strategy = row.strategy === "DCA"
+                ? "dca"
+                : row.strategy === "GRID"
+                    ? "grid"
+                    : row.strategy === "MM"
+                        ? "mm"
+                        : null;
+            if (!strategy) continue;
+            report[strategy] = {
+                strategy,
+                fillCount: Number(row.fill_count || 0),
+                orderCount: Number(row.order_count || 0),
+                quoteVolume: Number(row.quote_volume || 0),
+                baseVolume: Number(row.base_volume || 0),
+                fee: Number(row.fee_total || 0),
+                netQuote: Number(row.net_quote || 0),
+            };
+        }
+
+        const devmm = getDevmmReport(exchange, period, bucket);
+        if (devmm) {
+            const devmmFee = Number(devmm.totalFeeUsdt || 0);
+            report.devmm = {
+                strategy: "devmm",
+                fillCount: Number(devmm.fillCount || 0),
+                orderCount: Number(devmm.fillCount || 0),
+                quoteVolume: Number(devmm.totalTurnoverUsdt || 0),
+                baseVolume: Number((devmm.buyQtyPepew || 0) + (devmm.sellQtyPepew || 0)),
+                fee: devmmFee,
+                netQuote: Number((devmm.netUsdtChange || 0) - devmmFee),
+            };
+        }
+
+        const total = zeroMetric("total");
+        for (const key of ["dca", "grid", "mm", "devmm"] as const) {
+            total.fillCount += report[key].fillCount;
+            total.orderCount += report[key].orderCount;
+            total.quoteVolume += report[key].quoteVolume;
+            total.baseVolume += report[key].baseVolume;
+            total.fee += report[key].fee;
+            total.netQuote += report[key].netQuote;
+        }
+        report.total = total;
+
+        console.log(
+            `[strategy] report period=${period} exchange=${exchange} user=${tgUserId.slice(0, 8)}... totals=${JSON.stringify({
+                dca: report.dca.quoteVolume,
+                grid: report.grid.quoteVolume,
+                mm: report.mm.quoteVolume,
+                devmm: report.devmm.quoteVolume,
+                total: report.total.quoteVolume,
+            })}`
+        );
+
+        return res.json({
+            ok: true,
+            period,
+            exchange,
+            bucket,
+            report,
+        });
+    } catch (err: any) {
+        console.error(`[strategy] report error: ${err.message}`);
+        return res.status(500).json({ ok: false, error: err.message });
     }
 });
 

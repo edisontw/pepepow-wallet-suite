@@ -10,6 +10,7 @@ import {
     isExperimental,
 } from "../lib/markets.js";
 import { getRegistryPromptHelpers } from "../lib/registryPrompt.js";
+import { sendMainMenu } from "./mainMenu.js";
 
 const DCA_STATE_TTL_MS = 15 * 60 * 1000;
 const DCA_CALLBACK_MAX_BYTES = 64;
@@ -187,6 +188,7 @@ export async function handleDca(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, { step: "dca.no_user", text: "❌ Could not identify user." });
+        await sendMainMenu(ctx);
         return;
     }
 
@@ -204,6 +206,7 @@ export async function handleDcaSet(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, { step: "dca_set.no_user", text: "❌ Could not identify user." });
+        await sendMainMenu(ctx);
         return;
     }
 
@@ -268,6 +271,7 @@ export async function handleDcaSet(ctx: Context): Promise<void> {
                 step: "dca_set.api_error",
                 text: `❌ Failed: ${result.error || "Unknown error"}`,
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -296,6 +300,7 @@ export async function handleDcaSet(ctx: Context): Promise<void> {
         const message = messageLines.join("\n");
 
         await safeSend(ctx, { step: "dca_set.success", text: message });
+        await sendMainMenu(ctx);
     } catch (err: any) {
         if (err instanceof ApiError) {
             console.error(`[dca_set] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
@@ -306,6 +311,7 @@ export async function handleDcaSet(ctx: Context): Promise<void> {
             step: "dca_set.error",
             text: "❌ Failed to update config. Please try again.",
         });
+        await sendMainMenu(ctx);
     }
 }
 
@@ -313,6 +319,7 @@ export async function handleDcaStart(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, { step: "dca_start.no_user", text: "❌ Could not identify user." });
+        await sendMainMenu(ctx);
         return;
     }
 
@@ -333,6 +340,7 @@ export async function handleDcaStart(ctx: Context): Promise<void> {
                 step: "dca_start.no_config",
                 text: "No DCA config found. Use /dca to create one.",
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -358,6 +366,7 @@ export async function handleDcaStart(ctx: Context): Promise<void> {
                 step: "dca_start",
                 text: messageLines.join("\n"),
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -377,14 +386,16 @@ export async function handleDcaStart(ctx: Context): Promise<void> {
             const statusLabel = err.status ?? "n/a";
             await safeSend(ctx, {
                 step: "dca_start",
-                text: `❌ Failed (HTTP ${statusLabel}).`,
+                text: `❌ Failed (HTTP ${statusLabel}). ${err.message}`,
             });
+            await sendMainMenu(ctx);
         } else {
             console.error(`[dca_start] Error: ${err?.message || err}`);
             await safeSend(ctx, {
                 step: "dca_start",
                 text: "❌ Failed (HTTP n/a).",
             });
+            await sendMainMenu(ctx);
         }
     }
 }
@@ -393,6 +404,7 @@ export async function handleDcaStop(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, { step: "dca_stop.no_user", text: "❌ Could not identify user." });
+        await sendMainMenu(ctx);
         return;
     }
 
@@ -413,6 +425,7 @@ export async function handleDcaStop(ctx: Context): Promise<void> {
                 step: "dca_stop.no_config",
                 text: "No DCA config found. Use /dca to create one.",
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -422,6 +435,7 @@ export async function handleDcaStop(ctx: Context): Promise<void> {
                 step: "dca_stop.none_active",
                 text: "No active DCA configs. Use /dca_start to begin.",
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -454,6 +468,7 @@ export async function handleDcaStop(ctx: Context): Promise<void> {
                 step: "dca_stop.success",
                 text: messageLines.filter(Boolean).join("\n"),
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -477,6 +492,7 @@ export async function handleDcaStop(ctx: Context): Promise<void> {
             step: "dca_stop.error",
             text: "❌ Failed to stop DCA. Please try again.",
         });
+        await sendMainMenu(ctx);
     }
 }
 
@@ -487,6 +503,7 @@ export async function handleDcaStatus(ctx: Context): Promise<void> {
             step: "dca_status.no_user",
             text: "❌ Could not identify user (missing Telegram ID).",
         });
+        await sendMainMenu(ctx);
         return;
     }
     const tgUserId = String(rawTgUserId);
@@ -500,6 +517,7 @@ export async function handleDcaStatus(ctx: Context): Promise<void> {
                 step: "dca_status.api_error",
                 text: "❌ Failed to fetch status. Please try again.",
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -508,6 +526,7 @@ export async function handleDcaStatus(ctx: Context): Promise<void> {
                 step: "dca_status.no_config",
                 text: "No DCA config found. Use /dca to create one.",
             });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -553,6 +572,7 @@ export async function handleDcaStatus(ctx: Context): Promise<void> {
         }
 
         await safeSend(ctx, { step: "dca_status.success", text: lines.join("\n") });
+        await sendMainMenu(ctx);
     } catch (err: any) {
         if (err instanceof ApiError) {
             console.error(`[dca_status] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
@@ -568,6 +588,7 @@ export async function handleDcaStatus(ctx: Context): Promise<void> {
                 step: "dca_status.http_error",
                 text: `❌ Failed to fetch status (HTTP ${statusLabel}).${reason}${hint}`,
             });
+            await sendMainMenu(ctx);
             return;
         }
         console.error(`[dca_status] Error: ${err?.message || err}`);
@@ -575,6 +596,7 @@ export async function handleDcaStatus(ctx: Context): Promise<void> {
             step: "dca_status.error",
             text: "❌ Failed to fetch status. Please try again.",
         });
+        await sendMainMenu(ctx);
     }
 }
 
@@ -641,10 +663,19 @@ export async function handleDcaCallback(ctx: Context): Promise<boolean> {
                 preferEdit: true,
             });
             await safeAnswerCallbackQuery(ctx, `dca_${action}.done`);
+            await sendMainMenu(ctx);
             return true;
         } catch (err: any) {
             if (err instanceof ApiError) {
                 console.error(`[dca_${action}] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
+                await safeWizardMessage(ctx, {
+                    step: `dca_${action}.error`,
+                    text: `Failed to ${action} DCA: ${err.message}`,
+                    preferEdit: true,
+                });
+                await safeAnswerCallbackQuery(ctx, `dca_${action}.error`);
+                await sendMainMenu(ctx);
+                return true;
             } else {
                 console.error(`[dca_${action}] Error: ${err?.message || err}`);
             }
@@ -654,6 +685,7 @@ export async function handleDcaCallback(ctx: Context): Promise<boolean> {
                 preferEdit: true,
             });
             await safeAnswerCallbackQuery(ctx, `dca_${action}.error`);
+            await sendMainMenu(ctx);
             return true;
         }
     }
@@ -746,6 +778,7 @@ export async function handleDcaTextInput(ctx: Context): Promise<boolean> {
             step: "dca_text.expired",
             text: "⌛ DCA setup expired. Please run /dca again.",
         });
+        await sendMainMenu(ctx);
         return true;
     }
 
@@ -850,6 +883,7 @@ export async function handleDcaTextInput(ctx: Context): Promise<boolean> {
                     step: "dca_wizard.final",
                     text: `❌ Failed to save DCA config (API error: ${result.error || "Unknown error"}).`,
                 });
+                await sendMainMenu(ctx);
                 return true;
             }
 
@@ -859,7 +893,7 @@ export async function handleDcaTextInput(ctx: Context): Promise<boolean> {
             const pairDisplay = formatPairDisplay(exchangeName, cfg.symbol);
 
             const message = [
-                `✅ DCA created and started (REAL)`,
+                `✅ DCA created and started`,
                 `Exchange: ${exchangeDisplay}`,
                 `Pair: ${pairDisplay}`,
                 `Budget: ${cfg.budget} ${cfg.quoteCcy}`,
@@ -872,14 +906,16 @@ export async function handleDcaTextInput(ctx: Context): Promise<boolean> {
                 step: "dca_wizard.final",
                 text: message,
             });
+            await sendMainMenu(ctx);
             return true;
         } catch (err: any) {
             pendingDca.delete(tgUserId);
             console.error(`[dca_wizard] Error: ${err?.message || err}`);
             await safeSend(ctx, {
                 step: "dca_wizard.final",
-                text: "❌ Failed to save DCA config. Please try again.",
+                text: err instanceof ApiError ? `❌ ${err.message}` : "❌ Failed to save DCA config. Please try again.",
             });
+            await sendMainMenu(ctx);
             return true;
         }
     }

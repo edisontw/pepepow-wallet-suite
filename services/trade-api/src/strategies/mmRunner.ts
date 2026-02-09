@@ -1,5 +1,6 @@
 import {
     cancelOpenStrategyOrders,
+    closeMissingStrategyOrdersRegistry,
     getExchangeKey,
     getOpenStrategyOrders,
     getStrategyConfigById,
@@ -16,7 +17,7 @@ import {
 import { decryptKeyPair } from "../crypto.js";
 import { createDexTradeOrder, listDexTradeOpenOrders, cancelDexTradeOrder } from "../exchanges/dextrade.js";
 import { createNonKycOrder, cancelNonKycOrder, getNonkycMarketRules, listNonKycOpenOrders } from "../exchanges/nonkyc.js";
-import { placeNestExLimitOrder, cancelNestExOrder } from "../exchanges/nestex.js";
+import { placeNestExLimitOrder, cancelNestExOrder, listNestExOpenOrders } from "../exchanges/nestex.js";
 import { ExchangeName, getBaseAsset, getExchangeSymbol, getQuoteUnit } from "../lib/markets.js";
 import { getMinNotional, getPricePrecision, getQtyPrecision } from "../lib/exchanges.js";
 import { fetchAggregatedPrice, fetchExchangePrice, fetchExchangeTopOfBook } from "./price.js";
@@ -98,9 +99,31 @@ function roundToStep(value: number, step: number): number {
     return Math.floor(value / step) * step;
 }
 
+function ceilToStep(value: number, step: number): number {
+    if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) return value;
+    return Math.ceil(value / step) * step;
+}
+
 function roundToTick(value: number, tick: number): number {
     if (!Number.isFinite(value) || !Number.isFinite(tick) || tick <= 0) return value;
     return Math.round(value / tick) * tick;
+}
+
+function floorToTick(value: number, tick: number): number {
+    if (!Number.isFinite(value) || !Number.isFinite(tick) || tick <= 0) return value;
+    return Math.floor(value / tick) * tick;
+}
+
+function ceilToTick(value: number, tick: number): number {
+    if (!Number.isFinite(value) || !Number.isFinite(tick) || tick <= 0) return value;
+    return Math.ceil(value / tick) * tick;
+}
+
+function normalizePercentRatio(value: number, fallback: number): number {
+    if (!Number.isFinite(value)) return fallback;
+    if (value <= 0) return fallback;
+    if (value >= 1) return value / 100;
+    return value;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -112,6 +135,21 @@ function clamp(value: number, min: number, max: number): number {
 
 function isFinitePositive(value: number | null | undefined): value is number {
     return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function normalizeMmOrderSide(value: any): "buy" | "sell" | "unknown" {
+    const raw = String(value ?? "").trim().toLowerCase();
+    if (!raw) return "unknown";
+    if (raw === "buy" || raw === "bid" || raw === "b" || raw === "0") return "buy";
+    if (raw === "sell" || raw === "ask" || raw === "s" || raw === "1") return "sell";
+    if (raw.includes("buy") || raw.includes("bid")) return "buy";
+    if (raw.includes("sell") || raw.includes("ask")) return "sell";
+    return "unknown";
+}
+
+function isIdempotentCancelMessage(value: string | undefined | null): boolean {
+    if (!value) return false;
+    return /not found|not exist|already.*(closed|cancel)|canceled|cancelled|check the order_id/i.test(value);
 }
 
 function inferTickFromPrice(price: number, maxDecimals = 12): number | null {
@@ -250,17 +288,31 @@ function applyCrossingGuard(params: {
     const bestBid = Number.isFinite(params.bestBid) ? (params.bestBid as number) : null;
     const bestAsk = Number.isFinite(params.bestAsk) ? (params.bestAsk as number) : null;
     const tick = params.tick;
+    const toTickUnit = (value: number): number => Math.round(value / tick);
 
     if (typeof bid === "number") {
         if (!bestAsk || bestAsk <= 0) {
             skipBuy = true;
         } else if (bid >= bestAsk) {
-            const adjusted = roundToTick(bestAsk - tick, tick);
+            const adjusted = floorToTick(bestAsk - tick, tick);
             if (!Number.isFinite(adjusted) || adjusted <= 0 || adjusted >= bestAsk) {
                 skipBuy = true;
             } else {
                 bid = adjusted;
                 adjustedBuy = true;
+            }
+        }
+        if (!skipBuy && Number.isFinite(tick) && tick > 0 && Number.isFinite(bestAsk) && Number.isFinite(bid)) {
+            const askUnit = toTickUnit(bestAsk as number);
+            let bidUnit = toTickUnit(bid as number);
+            if (bidUnit >= askUnit) {
+                bidUnit = askUnit - 1;
+                if (bidUnit <= 0) {
+                    skipBuy = true;
+                } else {
+                    bid = floorToTick(bidUnit * tick, tick);
+                    adjustedBuy = true;
+                }
             }
         }
         if (!skipBuy && bestAsk && bid >= bestAsk) {
@@ -272,11 +324,20 @@ function applyCrossingGuard(params: {
         if (!bestBid || bestBid <= 0) {
             skipSell = true;
         } else if (ask <= bestBid) {
-            const adjusted = roundToTick(bestBid + tick, tick);
+            const adjusted = ceilToTick(bestBid + tick, tick);
             if (!Number.isFinite(adjusted) || adjusted <= bestBid) {
                 skipSell = true;
             } else {
                 ask = adjusted;
+                adjustedSell = true;
+            }
+        }
+        if (!skipSell && Number.isFinite(tick) && tick > 0 && Number.isFinite(bestBid) && Number.isFinite(ask)) {
+            const bidUnit = toTickUnit(bestBid as number);
+            let askUnit = toTickUnit(ask as number);
+            if (askUnit <= bidUnit) {
+                askUnit = bidUnit + 1;
+                ask = ceilToTick(askUnit * tick, tick);
                 adjustedSell = true;
             }
         }
@@ -286,6 +347,59 @@ function applyCrossingGuard(params: {
     }
 
     return { bid, ask, skipBuy, skipSell, adjustedBuy, adjustedSell };
+}
+
+function inferTickPrecision(tick: number): number {
+    if (!Number.isFinite(tick) || tick <= 0) return 8;
+    const asText = tick.toString();
+    if (asText.includes("e-")) {
+        const exp = Number(asText.split("e-")[1]);
+        if (Number.isFinite(exp) && exp >= 0) return exp;
+    }
+    const dot = asText.indexOf(".");
+    return dot >= 0 ? asText.length - dot - 1 : 0;
+}
+
+function toTickUnitKey(price: number, tick: number): string {
+    if (!Number.isFinite(price)) return "nan";
+    if (!Number.isFinite(tick) || tick <= 0) return normalizePrice(price).toString();
+    return String(Math.round(price / tick));
+}
+
+function formatPriceByTick(price: number, tick: number): string {
+    if (!Number.isFinite(price)) return "nan";
+    const precision = Math.min(14, Math.max(0, inferTickPrecision(tick)));
+    return price.toFixed(precision);
+}
+
+function moveOutwardByTick(params: {
+    side: "BUY" | "SELL";
+    candidate: number;
+    tick: number;
+    seenUnits: Set<string>;
+    maxAttempts?: number;
+}): { price: number | null; attempts: number } {
+    const maxAttempts = params.maxAttempts ?? 64;
+    if (!Number.isFinite(params.candidate) || params.candidate <= 0 || !Number.isFinite(params.tick) || params.tick <= 0) {
+        return { price: null, attempts: 0 };
+    }
+
+    let candidate = params.candidate;
+    let attempts = 0;
+    while (attempts <= maxAttempts) {
+        if (candidate > 0) {
+            const key = toTickUnitKey(candidate, params.tick);
+            if (!params.seenUnits.has(key)) {
+                params.seenUnits.add(key);
+                return { price: candidate, attempts };
+            }
+        }
+        candidate = params.side === "BUY"
+            ? floorToTick(candidate - params.tick, params.tick)
+            : ceilToTick(candidate + params.tick, params.tick);
+        attempts += 1;
+    }
+    return { price: null, attempts };
 }
 
 function computeInventoryBiasedQuotes(params: {
@@ -441,12 +555,14 @@ export const mmRunner: StrategyRunner = {
                 }
 
                 const params = safeParse(config.params_json);
-                const spreadPct = params.spread_pct ?? 0.01;
+                const rawSpreadPct = params.spread_pct ?? 0.01;
+                const spreadPct = normalizePercentRatio(rawSpreadPct, 0.01);
                 // Support both new quote_per_order and legacy order_quote
                 const quotePerOrder = params.quote_per_order ?? params.order_quote ?? 1;
                 const ordersPerSide = params.orders_per_side ?? 1;
                 const refreshSec = params.refresh_sec ?? DEFAULT_REFRESH_SEC;
-                const midSource = params.mid_source ?? "aggregated";
+                const requestedMidSource = params.mid_source === "aggregated" ? "aggregated" : "exchange";
+                let effectiveMidSource: "exchange" | "aggregated_fallback" = "exchange";
                 const maxPositionBase = params.max_position_base ?? 0;
                 const mmMode: MmMode = params.mode ?? "TWO_SIDED";
                 const minBaseInventory = params.min_base_inventory ?? 0;
@@ -477,6 +593,9 @@ export const mmRunner: StrategyRunner = {
 
                 // Log orders_per_side config
                 console.log(`[mmRunner] config=${config.id} orders_per_side=${ordersPerSide} quote_per_order=${quotePerOrder}`);
+                if (rawSpreadPct !== spreadPct) {
+                    console.warn(`[mmRunner] config=${config.id} normalized spread_pct from ${rawSpreadPct} to ${spreadPct}`);
+                }
 
                 if (!Number.isFinite(spreadPct) || spreadPct <= 0 || !Number.isFinite(quotePerOrder) || quotePerOrder <= 0) {
                     return {
@@ -491,11 +610,14 @@ export const mmRunner: StrategyRunner = {
 
                 let priceResult = null;
                 try {
-                    if (midSource === "aggregated") {
-                        priceResult = await fetchAggregatedPrice(config.pair);
-                    }
-                    if (!priceResult) {
-                        priceResult = await fetchExchangePrice(config.exchange as ExchangeName, config.pair);
+                    // Always prefer local exchange mid for quoting stability.
+                    priceResult = await fetchExchangePrice(config.exchange as ExchangeName, config.pair);
+                    if (!priceResult && requestedMidSource === "aggregated") {
+                        const agg = await fetchAggregatedPrice(config.pair);
+                        if (agg) {
+                            priceResult = agg;
+                            effectiveMidSource = "aggregated_fallback";
+                        }
                     }
                 } catch (err: any) {
                     return {
@@ -561,33 +683,107 @@ export const mmRunner: StrategyRunner = {
 
                 // --- 1. RECONCILE WITH EXCHANGE ---
                 let exchangeOpenOrders: any[] = [];
-                const localOpenRegistry = getOpenStrategyOrdersRegistry(String(config.id));
+                let localOpenRegistry = getOpenStrategyOrdersRegistry(String(config.id));
+                let openOrdersSource = "none";
                 if (config.trade_mode === "REAL") {
                     try {
                         if (exchange === "nonkyc") {
                             const res = await listNonKycOpenOrders(apiKey, apiSecret, symbol);
-                            if (res.ok) exchangeOpenOrders = res.orders || [];
+                            if (res.ok) {
+                                exchangeOpenOrders = res.orders || [];
+                                openOrdersSource = "exchange";
+                            } else {
+                                openOrdersSource = `exchange_error:${res.reason || res.error || "unknown"}`;
+                            }
                         } else if (exchange === "dextrade") {
                             const res = await listDexTradeOpenOrders(apiKey, apiSecret, symbol);
-                            if (res.ok) exchangeOpenOrders = res.orders || [];
+                            if (res.ok) {
+                                exchangeOpenOrders = res.orders || [];
+                                openOrdersSource = "exchange";
+                            } else {
+                                openOrdersSource = `exchange_error:${res.error || "unknown"}`;
+                            }
                         } else if (exchange === "nestex") {
-                            exchangeOpenOrders = localOpenRegistry.map(o => ({
-                                order_id: o.order_id,
-                                side: String(o.side || "").toLowerCase(),
-                            }));
+                            const res = await listNestExOpenOrders(
+                                apiKey,
+                                apiSecret,
+                                config.pair,
+                                `USER:${config.tg_user_id}`,
+                                { exhaustive: true, includeNoCur: true }
+                            );
+                            if (res.ok && Array.isArray(res.orders)) {
+                                exchangeOpenOrders = res.orders.map((o: any) => ({
+                                    order_id: String(o.order_id || o.id || ""),
+                                    side: normalizeMmOrderSide(o.side ?? o.type ?? o.order_type ?? o.raw?.side ?? o.raw?.type ?? o.raw?.order_type),
+                                    price: Number(o.price ?? o.raw?.price ?? 0),
+                                    quantity: Number(o.quantity ?? o.raw?.quantity ?? o.raw?.qty ?? 0),
+                                    created_at: Number(o.raw?.time || o.raw?.created_at || 0) * 1000,
+                                }));
+                                openOrdersSource = "exchange";
+                            } else {
+                                // Fallback: preserve behavior if NestEx openOrders endpoint fails.
+                                exchangeOpenOrders = localOpenRegistry.map(o => ({
+                                    order_id: o.order_id,
+                                    side: normalizeMmOrderSide(o.side),
+                                }));
+                                openOrdersSource = "local_registry_fallback";
+                            }
                         }
                     } catch (err) {
                         console.warn(`[mmRunner] config=${config.id} open orders fetch failed:`, err);
+                        openOrdersSource = "exception";
+                    }
+                } else {
+                    openOrdersSource = "paper_or_disabled";
+                }
+                if (exchangeOpenOrders.length === 0 && localOpenRegistry.length > 0 && exchange === "nestex" && openOrdersSource !== "exchange") {
+                    exchangeOpenOrders = localOpenRegistry.map(o => ({
+                        order_id: o.order_id,
+                        side: normalizeMmOrderSide(o.side),
+                    }));
+                    if (openOrdersSource === "none") {
+                        openOrdersSource = "local_registry_fallback";
                     }
                 }
 
+                if (config.trade_mode === "REAL" && openOrdersSource === "exchange" && (exchange === "nonkyc" || exchange === "dextrade" || exchange === "nestex")) {
+                    const liveOrderIds = exchangeOpenOrders
+                        .map((o: any) => String(o?.order_id ?? "").trim())
+                        .filter(Boolean);
+                    const closedMissing = closeMissingStrategyOrdersRegistry(
+                        String(config.id),
+                        exchange,
+                        config.pair,
+                        liveOrderIds,
+                        "CLOSED"
+                    );
+                    if (closedMissing > 0) {
+                        localOpenRegistry = getOpenStrategyOrdersRegistry(String(config.id));
+                        console.log(
+                            `[mmRunner] reconciled local registry config=${config.id} exchange=${exchange} pair=${config.pair} closedMissing=${closedMissing} live=${liveOrderIds.length}`
+                        );
+                    }
+                }
+
+                const managedOrderIdSet = new Set(localOpenRegistry.map((o) => String(o.order_id || "").trim()).filter(Boolean));
+
                 // Group by side
-                const openBuys = exchangeOpenOrders.filter(o => String(o.side || "").toLowerCase() === "buy");
-                const openSells = exchangeOpenOrders.filter(o => String(o.side || "").toLowerCase() === "sell");
+                const openBuys = exchangeOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "buy");
+                const openSells = exchangeOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "sell");
+                const openUnknown = exchangeOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "unknown");
+                const managedOpenOrders = exchangeOpenOrders.filter((o) => managedOrderIdSet.has(String(o.order_id || "").trim()));
+                const managedOpenBuys = managedOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "buy");
+                const managedOpenSells = managedOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "sell");
+                const managedOpenUnknown = managedOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "unknown");
+                console.log(
+                    `[mmRunner] openOrders config=${config.id} source=${openOrdersSource} total=${exchangeOpenOrders.length} buy=${openBuys.length} sell=${openSells.length} unknown=${openUnknown.length} managedTotal=${managedOpenOrders.length} managedBuy=${managedOpenBuys.length} managedSell=${managedOpenSells.length} managedUnknown=${managedOpenUnknown.length} registryOpen=${localOpenRegistry.length}`
+                );
 
                 // --- 2. CANCEL EXCESS/STALE ORDERS ---
                 let totalCancelled = 0;
-                const myOrderIdSet = new Set(localOpenRegistry.map(o => o.order_id));
+                let totalAlreadyClosed = 0;
+                let totalCancelFailed = 0;
+                const myOrderIdSet = managedOrderIdSet;
 
                 const cancelOrders = async (orders: any[]) => {
                     // Filter to only cancel orders in our registry OR matching conservative criteria
@@ -632,7 +828,7 @@ export const mmRunner: StrategyRunner = {
                             console.warn(`[mmRunner] Skipping non-numeric NestEx order_id=${orderId}`);
                             continue;
                         }
-                        let res: { ok: boolean; status?: number; error?: string } = { ok: false };
+                        let res: { ok: boolean; status?: number; error?: string; alreadyClosed?: boolean } = { ok: false };
                         if (exchange === "nonkyc") {
                             res = await cancelNonKycOrder(apiKey, apiSecret, o.order_id);
                         } else if (exchange === "dextrade") {
@@ -641,22 +837,21 @@ export const mmRunner: StrategyRunner = {
                             res = await cancelNestExOrder(apiKey, apiSecret, orderId, `USER:${config.tg_user_id}`);
                         }
 
-                        if (res.ok) {
+                        if (res.ok && (res.alreadyClosed || isIdempotentCancelMessage(res.error))) {
+                            totalAlreadyClosed++;
+                            updateStrategyOrderStatusRegistry(exchange, orderId, "CLOSED");
+                        } else if (res.ok) {
+                            totalCancelled++;
                             updateStrategyOrderStatusRegistry(exchange, orderId, "CANCELLED");
+                        } else if (isIdempotentCancelMessage(res.error)) {
+                            totalAlreadyClosed++;
+                            updateStrategyOrderStatusRegistry(exchange, orderId, "CLOSED");
+                        } else {
+                            totalCancelFailed++;
+                            console.warn(`[mmRunner] cancel failed exchange=${exchange} orderId=${orderId} error=${res.error || "unknown"}`);
                         }
                     }
                 };
-
-                // Enforce orders_per_side: cancel excess
-                if (openBuys.length > ordersPerSide) {
-                    // Cancel oldest if list is sorted, otherwise just oldest by created_at if skip/limit
-                    const excess = openBuys.slice(0, openBuys.length - ordersPerSide);
-                    await cancelOrders(excess);
-                }
-                if (openSells.length > ordersPerSide) {
-                    const excess = openSells.slice(0, openSells.length - ordersPerSide);
-                    await cancelOrders(excess);
-                }
 
                 if (inventoryBase !== (params.inventory_base ?? 0) || inventoryQuote !== (params.inventory_quote ?? quotePerOrder * 10)) {
                     updateStrategyParams(config.id, JSON.stringify({
@@ -665,7 +860,7 @@ export const mmRunner: StrategyRunner = {
                         quote_per_order: quotePerOrder,
                         order_quote: quotePerOrder, // Keep for backward compatibility
                         refresh_sec: refreshSec,
-                        mid_source: midSource,
+                        mid_source: effectiveMidSource === "exchange" ? "exchange" : "aggregated",
                         max_position_base: maxPositionBase,
                         inventory_base: inventoryBase,
                         inventory_quote: inventoryQuote,
@@ -677,8 +872,18 @@ export const mmRunner: StrategyRunner = {
                     return { success: true };
                 }
 
+                // Enforce orders_per_side only on managed orders.
+                if (managedOpenBuys.length > ordersPerSide) {
+                    const excess = managedOpenBuys.slice(0, managedOpenBuys.length - ordersPerSide);
+                    await cancelOrders(excess);
+                }
+                if (managedOpenSells.length > ordersPerSide) {
+                    const excess = managedOpenSells.slice(0, managedOpenSells.length - ordersPerSide);
+                    await cancelOrders(excess);
+                }
+
                 const baseRules = await getMarketRules(exchange, symbol, quoteCcy);
-                const halfSpread = spreadPct / 2;
+                const sideSpread = spreadPct;
 
                 const topOfBook = await fetchExchangeTopOfBook(exchange, config.pair);
                 const rawBestBid = topOfBook?.bestBid ?? null;
@@ -719,6 +924,26 @@ export const mmRunner: StrategyRunner = {
                 const midForBias = hasBestBid && hasBestAsk
                     ? ((bestBid as number) + (bestAsk as number)) / 2
                     : mid;
+                const bookMid = hasBestBid && hasBestAsk
+                    ? ((bestBid as number) + (bestAsk as number)) / 2
+                    : null;
+                let quoteMid = mid;
+                let midAnchor = "source";
+                if (bookMid && Number.isFinite(bookMid) && bookMid > 0) {
+                    const deviation = Math.abs(mid - bookMid) / bookMid;
+                    const clampThreshold = Math.max(spreadPct * 2, 0.03);
+                    if (deviation > clampThreshold) {
+                        quoteMid = bookMid;
+                        midAnchor = "book_clamped";
+                        console.log(
+                            `[mmRunner] mid-clamp config=${config.id} exchange=${exchange} sourceMid=${mid} bookMid=${bookMid} deviationPct=${(deviation * 100).toFixed(2)} thresholdPct=${(clampThreshold * 100).toFixed(2)}`
+                        );
+                    }
+                }
+                if (exchange === "dextrade" && Number.isFinite(mid) && mid > 0 && quoteMid > mid) {
+                    quoteMid = mid;
+                    midAnchor = `${midAnchor}+source_cap`;
+                }
 
                 const bias = computeInventoryBiasedQuotes({
                     quotePerOrder,
@@ -756,24 +981,6 @@ export const mmRunner: StrategyRunner = {
                     guards: skipReasons,
                 });
 
-                // --- 2. CANCEL EXCESS/STALE ORDERS ---
-                // Enforce orders_per_side: cancel all if we want fresh orders every tick (standard MM)
-                // or just cancel the ones that are too far from mid.
-                // Given the user request "refresh every 15s" and "runaway orders",
-                // the safest is to cancel all open orders for this config before placing new ones,
-                // OR strictly cancel the ones we fetched.
-                if (exchangeOpenOrders.length > 0) {
-                    await cancelOrders(exchangeOpenOrders);
-                }
-
-                // Clean up local DB if any (sync)
-                const localOpenOrders = getOpenStrategyOrders(config.id);
-                if (localOpenOrders.length > 0) {
-                    for (const lo of localOpenOrders) {
-                        updateStrategyOrderStatus(lo.id, "CANCELED");
-                    }
-                }
-
                 const placeOrder = async (
                     side: "BUY" | "SELL",
                     price: number,
@@ -786,14 +993,19 @@ export const mmRunner: StrategyRunner = {
                         recordSkip("STOPPING", { silent: true });
                         return;
                     }
+                    let workingQty = qty;
+                    let workingNotional = notional;
                     const baseAsset = getBaseAsset(exchange, config.pair) || "BASE";
                     const quoteAsset = quoteCcy;
+                    const minNotionalTarget = rules.minNotional > 0
+                        ? (exchange === "nonkyc" ? rules.minNotional * 1.05 : rules.minNotional)
+                        : 0;
 
                     if (exchange === "nestex") {
                         const minPrice = 1e-12;
                         const maxPrice = 0.01;
                         if (!Number.isFinite(price) || price <= 0 || price < minPrice || price > maxPrice) {
-                            orderTrace.push({ side, price, qty, notional, status: "SKIP", reason: "PRICE_SANITY_FAILED" });
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "SKIP", reason: "PRICE_SANITY_FAILED" });
                             recordSkip(`${side}: PRICE_SANITY_FAILED`);
                             return;
                         }
@@ -802,7 +1014,7 @@ export const mmRunner: StrategyRunner = {
                             if (midCheck) {
                                 const spread = ((bestAsk as number) - (bestBid as number)) / midCheck;
                                 if (!Number.isFinite(spread) || spread > 0.2) {
-                                    orderTrace.push({ side, price, qty, notional, status: "SKIP", reason: "PRICE_SANITY_SPREAD" });
+                                    orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "SKIP", reason: "PRICE_SANITY_SPREAD" });
                                     recordSkip(`${side}: PRICE_SANITY_SPREAD`);
                                     return;
                                 }
@@ -810,21 +1022,38 @@ export const mmRunner: StrategyRunner = {
                         }
                     }
 
-                    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(qty) || qty <= 0) {
-                        orderTrace.push({ side, price, qty, notional, status: "SKIP", reason: "MIN_QTY" });
+                    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(workingQty) || workingQty <= 0) {
+                        orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "SKIP", reason: "MIN_QTY" });
                         const msg = `${side}: MIN_QTY`;
                         recordSkip(msg);
                         return;
                     }
-                    if (rules.minQty > 0 && qty < rules.minQty) {
-                        orderTrace.push({ side, price, qty, notional, status: "SKIP", reason: "MIN_QTY" });
-                        const msg = `${side}: MIN_QTY (have ${qty.toFixed(0)}, need >= ${rules.minQty.toFixed(0)})`;
+                    if (rules.minQty > 0 && workingQty < rules.minQty) {
+                        orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "SKIP", reason: "MIN_QTY" });
+                        const msg = `${side}: MIN_QTY (have ${workingQty.toFixed(0)}, need >= ${rules.minQty.toFixed(0)})`;
                         recordSkip(msg);
                         return;
                     }
-                    if (rules.minNotional > 0 && notional < rules.minNotional) {
-                        orderTrace.push({ side, price, qty, notional, status: "SKIP", reason: "MIN_NOTIONAL" });
-                        const suggest = (rules.minNotional * 1.05);
+
+                    // Conservative uplift for edge-case rounding drift near min-notional threshold.
+                    if (minNotionalTarget > 0 && workingNotional < minNotionalTarget) {
+                        const shortfallRatio = (minNotionalTarget - workingNotional) / minNotionalTarget;
+                        const upliftThreshold = exchange === "nonkyc" ? 0.1 : 0.02;
+                        if (shortfallRatio > 0 && shortfallRatio <= upliftThreshold && rules.qtyStep > 0) {
+                            const minQtyForNotional = ceilToStep(minNotionalTarget / price, rules.qtyStep);
+                            if (Number.isFinite(minQtyForNotional) && minQtyForNotional > workingQty) {
+                                const adjustedQty = Number(minQtyForNotional.toFixed(12));
+                                const adjustedNotional = adjustedQty * price;
+                                if (adjustedNotional >= minNotionalTarget) {
+                                    workingQty = adjustedQty;
+                                    workingNotional = adjustedNotional;
+                                }
+                            }
+                        }
+                    }
+                    if (minNotionalTarget > 0 && workingNotional < minNotionalTarget) {
+                        orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "SKIP", reason: "MIN_NOTIONAL" });
+                        const suggest = Math.max(rules.minNotional * 1.05, minNotionalTarget);
                         const msg = `${side}: MIN_NOTIONAL <${rules.minNotional.toFixed(4)} ${quoteAsset}; suggest >= ${suggest.toFixed(4)} ${quoteAsset}`;
                         recordSkip(msg);
                         return;
@@ -832,23 +1061,23 @@ export const mmRunner: StrategyRunner = {
 
                     // Enhanced inventory checks
                     if (side === "BUY") {
-                        if (inventoryQuote < notional) {
-                            orderTrace.push({ side, price, qty, notional, status: "SKIP", reason: "NO_INVENTORY" });
-                            const msg = `${side}: NO_INVENTORY (have ${inventoryQuote.toFixed(2)} ${quoteAsset}, need >= ${notional.toFixed(2)} ${quoteAsset})`;
+                        if (inventoryQuote < workingNotional) {
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "SKIP", reason: "NO_INVENTORY" });
+                            const msg = `${side}: NO_INVENTORY (have ${inventoryQuote.toFixed(2)} ${quoteAsset}, need >= ${workingNotional.toFixed(2)} ${quoteAsset})`;
                             recordSkip(msg);
                             return;
                         }
                     }
                     if (side === "SELL") {
-                        if (inventoryBase < qty) {
-                            orderTrace.push({ side, price, qty, notional, status: "SKIP", reason: "NO_INVENTORY" });
-                            const msg = `${side}: NO_INVENTORY (have ${inventoryBase.toFixed(0)} ${baseAsset}, need >= ${qty.toFixed(0)} ${baseAsset})`;
+                        if (inventoryBase < workingQty) {
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "SKIP", reason: "NO_INVENTORY" });
+                            const msg = `${side}: NO_INVENTORY (have ${inventoryBase.toFixed(0)} ${baseAsset}, need >= ${workingQty.toFixed(0)} ${baseAsset})`;
                             recordSkip(msg);
                             return;
                         }
                     }
 
-                    console.log(`[mmRunner] placing ${side} ${symbol} qty=${qty} price=${price}`);
+                    console.log(`[mmRunner] placing ${side} ${symbol} qty=${workingQty} price=${price}`);
 
                     if (exchange === "nonkyc") {
                         const orderResult = await createNonKycOrder({
@@ -856,7 +1085,7 @@ export const mmRunner: StrategyRunner = {
                             secretKey: apiSecret,
                             symbol,
                             side: side.toLowerCase() as "buy" | "sell",
-                            quantity: qty,
+                            quantity: workingQty,
                             price,
                             orderType: "limit",
                         });
@@ -876,7 +1105,7 @@ export const mmRunner: StrategyRunner = {
                                 tradeMode: config.trade_mode,
                                 side,
                                 price,
-                                qty,
+                                qty: workingQty,
                                 quoteQty: quoteAmount,
                                 status: "OPEN",
                                 exchangeOrderId,
@@ -890,16 +1119,16 @@ export const mmRunner: StrategyRunner = {
                                 client_order_id: clientOrderId,
                                 side,
                                 price: String(price),
-                                qty: String(qty),
+                                qty: String(workingQty),
                                 status: "OPEN",
                             });
 
                             actions.push(`${side}`);
-                            orderTrace.push({ side, price, qty, notional, status: "PLACED", reason: note });
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "PLACED", reason: note });
                         } else {
                             const errorCode = orderResult.reason || "ORDER_FAILED";
                             recordSkip(`${side}: ${errorCode}`);
-                            orderTrace.push({ side, price, qty, notional, status: "FAILED", reason: errorCode });
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "FAILED", reason: errorCode });
                         }
                     } else if (exchange === "dextrade") {
                         const orderResult = await createDexTradeOrder({
@@ -908,7 +1137,7 @@ export const mmRunner: StrategyRunner = {
                             pair: symbol,
                             side,
                             tradeType: "LIMIT",
-                            volume: qty,
+                            volume: workingQty,
                             rate: price,
                         });
                         if (orderResult.ok) {
@@ -927,7 +1156,7 @@ export const mmRunner: StrategyRunner = {
                                 tradeMode: config.trade_mode,
                                 side,
                                 price,
-                                qty,
+                                qty: workingQty,
                                 quoteQty: quoteAmount,
                                 status: "OPEN",
                                 exchangeOrderId,
@@ -941,15 +1170,15 @@ export const mmRunner: StrategyRunner = {
                                 client_order_id: clientOrderId,
                                 side,
                                 price: String(price),
-                                qty: String(qty),
+                                qty: String(workingQty),
                                 status: "OPEN",
                             });
 
                             actions.push(`${side}`);
-                            orderTrace.push({ side, price, qty, notional, status: "PLACED", reason: note });
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "PLACED", reason: note });
                         } else {
                             recordSkip(`${side}: ORDER_FAILED`);
-                            orderTrace.push({ side, price, qty, notional, status: "FAILED", reason: "ORDER_FAILED" });
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "FAILED", reason: "ORDER_FAILED" });
                         }
                     } else if (exchange === "nestex") {
                         const orderResult = await placeNestExLimitOrder({
@@ -957,11 +1186,11 @@ export const mmRunner: StrategyRunner = {
                             apiSecret,
                             cur: symbol,
                             side,
-                            qty,
+                            qty: workingQty,
                             price,
                             rateLimitKey: `USER:${config.tg_user_id}`,
                             pair: config.pair,
-                            baseQty: qty,
+                            baseQty: workingQty,
                             quoteQty: quoteAmount,
                         });
                         if (orderResult.ok) {
@@ -980,7 +1209,7 @@ export const mmRunner: StrategyRunner = {
                                 tradeMode: config.trade_mode,
                                 side,
                                 price,
-                                qty,
+                                qty: workingQty,
                                 quoteQty: quoteAmount,
                                 status: "OPEN",
                                 exchangeOrderId,
@@ -996,7 +1225,7 @@ export const mmRunner: StrategyRunner = {
                                     client_order_id: clientOrderId,
                                     side,
                                     price: String(price),
-                                    qty: String(qty),
+                                    qty: String(workingQty),
                                     status: "OPEN",
                                 });
                             } else {
@@ -1004,12 +1233,12 @@ export const mmRunner: StrategyRunner = {
                             }
 
                             actions.push(`${side}`);
-                            orderTrace.push({ side, price, qty, notional, status: "PLACED", reason: note });
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "PLACED", reason: note });
                             console.log(`[mmRunner] nestex placed exchangeOrderId=${exchangeOrderId ?? "n/a"} clientOrderId=${clientOrderId}`);
                         } else {
                             const errorCode = orderResult.error || "ORDER_FAILED";
                             recordSkip(`${side}: ${errorCode}`);
-                            orderTrace.push({ side, price, qty, notional, status: "FAILED", reason: "ORDER_FAILED" });
+                            orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "FAILED", reason: "ORDER_FAILED" });
                         }
                     }
                 };
@@ -1023,16 +1252,17 @@ export const mmRunner: StrategyRunner = {
                 let allowSell = shouldPlaceSell;
 
                 if (exchange === "dextrade" && dextradeTopReason) {
-                    recordSkip(dextradeTopReason, { silent: true });
+                    recordSkip(`BUY: ${dextradeTopReason}`, { silent: true });
+                    recordSkip(`SELL: ${dextradeTopReason}`, { silent: true });
                     allowBuy = false;
                     allowSell = false;
                 } else {
                     if (allowBuy && !hasBestAsk) {
-                        recordSkip("CROSSING_GUARD", { silent: true });
+                        recordSkip("BUY: CROSSING_GUARD", { silent: true });
                         allowBuy = false;
                     }
                     if (allowSell && !hasBestBid) {
-                        recordSkip("CROSSING_GUARD", { silent: true });
+                        recordSkip("SELL: CROSSING_GUARD", { silent: true });
                         allowSell = false;
                     }
                 }
@@ -1065,9 +1295,37 @@ export const mmRunner: StrategyRunner = {
                     const sellReason = allowSell ? "OK" : (skipReasons[0] || "SKIP");
                     console.log(`[nestex:order] decision: allowBuy=${allowBuy} allowSell=${allowSell} buyReason=${buyReason} sellReason=${sellReason}`);
                 }
+                const buySlots = allowBuy ? Math.max(0, ordersPerSide - managedOpenBuys.length) : 0;
+                const sellSlots = allowSell ? Math.max(0, ordersPerSide - managedOpenSells.length) : 0;
+                console.log(
+                    `[mmRunner] decision config=${config.id} exchange=${exchange} mode=${mmMode} allowBuy=${allowBuy} allowSell=${allowSell} buySlots=${buySlots} sellSlots=${sellSlots} skipReasons=${skipReasons.join(" | ") || "NONE"}`
+                );
 
-                const rawBidSample = roundToTick(normalizePrice(mid * (1 - halfSpread)), rules.priceTick);
-                const rawAskSample = roundToTick(normalizePrice(mid * (1 + halfSpread)), rules.priceTick);
+                const rawBidSample = floorToTick(normalizePrice(quoteMid * (1 - sideSpread)), rules.priceTick);
+                const rawAskSample = ceilToTick(normalizePrice(quoteMid * (1 + sideSpread)), rules.priceTick);
+                const tick = rules.priceTick;
+                const sourceMidTick = roundToTick(normalizePrice(mid), tick);
+                const hasSourceMidTick = Number.isFinite(sourceMidTick) && sourceMidTick > 0;
+                const buySeenTickUnits = new Set<string>();
+                const sellSeenTickUnits = new Set<string>();
+                for (const o of managedOpenBuys) {
+                    const openPrice = Number(o?.price);
+                    if (Number.isFinite(openPrice) && openPrice > 0) {
+                        buySeenTickUnits.add(toTickUnitKey(roundToTick(openPrice, tick), tick));
+                    }
+                }
+                for (const o of managedOpenSells) {
+                    const openPrice = Number(o?.price);
+                    if (Number.isFinite(openPrice) && openPrice > 0) {
+                        sellSeenTickUnits.add(toTickUnitKey(roundToTick(openPrice, tick), tick));
+                    }
+                }
+                const buyRawLadder: number[] = [];
+                const buyRoundedLadder: number[] = [];
+                const buyFinalLadder: number[] = [];
+                const sellRawLadder: number[] = [];
+                const sellRoundedLadder: number[] = [];
+                const sellFinalLadder: number[] = [];
 
                 if (exchange === "nestex" && NESTEX_ORDER_DEBUG) {
                     const bb = Number.isFinite(bestBid as number) ? Number(bestBid) : null;
@@ -1077,24 +1335,47 @@ export const mmRunner: StrategyRunner = {
 
                 // BUY LADDER
                 if (allowBuy) {
-                    for (let i = 0; i < ordersPerSide; i++) {
+                    for (let i = 0; i < buySlots; i++) {
                         if (shouldAbort()) {
                             recordSkip("STOPPING", { silent: true });
                             break;
                         }
-                        const tierSpread = halfSpread * (i + 1);
-                        const rawPrice = roundToTick(normalizePrice(mid * (1 - tierSpread)), rules.priceTick);
+                        const tierSpread = sideSpread * (i + 1);
+                        const rawInput = normalizePrice(quoteMid * (1 - tierSpread));
+                        const rawPrice = floorToTick(rawInput, tick);
+                        buyRawLadder.push(rawInput);
+                        buyRoundedLadder.push(rawPrice);
                         const guard = applyCrossingGuard({
                             bid: rawPrice,
                             bestAsk,
                             bestBid,
-                            tick: rules.priceTick,
+                            tick,
                         });
                         if (guard.skipBuy) {
-                            recordSkip("CROSSING_GUARD", { silent: true });
+                            recordSkip("BUY: CROSSING_GUARD", { silent: true });
                             continue;
                         }
-                        const price = guard.bid ?? rawPrice;
+                        const deduped = moveOutwardByTick({
+                            side: "BUY",
+                            candidate: guard.bid ?? rawPrice,
+                            tick,
+                            seenUnits: buySeenTickUnits,
+                            maxAttempts: Math.max(16, ordersPerSide * 8),
+                        });
+                        if (!Number.isFinite(deduped.price) || (deduped.price as number) <= 0) {
+                            recordSkip("BUY: DUPLICATE_TICK_PRICE", { silent: true });
+                            continue;
+                        }
+                        const price = deduped.price as number;
+                        if (exchange === "dextrade" && hasSourceMidTick && price > sourceMidTick) {
+                            recordSkip(`BUY: REF_MID_CAP (${price} > ${sourceMidTick})`, { silent: true });
+                            continue;
+                        }
+                        if (hasBestAsk && price >= (bestAsk as number)) {
+                            recordSkip(`BUY: HARD_NO_CROSSING (${price} >= ${bestAsk})`, { silent: true });
+                            continue;
+                        }
+                        buyFinalLadder.push(price);
                         const qty = roundToStep(buyQuotePerOrder / price, rules.qtyStep);
                         const notional = qty * price;
                         await placeOrder("BUY", price, qty, notional, buyQuotePerOrder, guard.adjustedBuy ? "ADJUSTED" : undefined);
@@ -1103,28 +1384,58 @@ export const mmRunner: StrategyRunner = {
 
                 // SELL LADDER
                 if (allowSell) {
-                    for (let i = 0; i < ordersPerSide; i++) {
+                    for (let i = 0; i < sellSlots; i++) {
                         if (shouldAbort()) {
                             recordSkip("STOPPING", { silent: true });
                             break;
                         }
-                        const tierSpread = halfSpread * (i + 1);
-                        const rawPrice = roundToTick(normalizePrice(mid * (1 + tierSpread)), rules.priceTick);
+                        const tierSpread = sideSpread * (i + 1);
+                        const rawInput = normalizePrice(quoteMid * (1 + tierSpread));
+                        const rawPrice = ceilToTick(rawInput, tick);
+                        sellRawLadder.push(rawInput);
+                        sellRoundedLadder.push(rawPrice);
                         const guard = applyCrossingGuard({
                             ask: rawPrice,
                             bestAsk,
                             bestBid,
-                            tick: rules.priceTick,
+                            tick,
                         });
                         if (guard.skipSell) {
-                            recordSkip("CROSSING_GUARD", { silent: true });
+                            recordSkip("SELL: CROSSING_GUARD", { silent: true });
                             continue;
                         }
-                        const price = guard.ask ?? rawPrice;
+                        const deduped = moveOutwardByTick({
+                            side: "SELL",
+                            candidate: guard.ask ?? rawPrice,
+                            tick,
+                            seenUnits: sellSeenTickUnits,
+                            maxAttempts: Math.max(16, ordersPerSide * 8),
+                        });
+                        if (!Number.isFinite(deduped.price) || (deduped.price as number) <= 0) {
+                            recordSkip("SELL: DUPLICATE_TICK_PRICE", { silent: true });
+                            continue;
+                        }
+                        const price = deduped.price as number;
+                        if (exchange === "dextrade" && hasSourceMidTick && price < sourceMidTick) {
+                            recordSkip(`SELL: REF_MID_FLOOR (${price} < ${sourceMidTick})`, { silent: true });
+                            continue;
+                        }
+                        if (hasBestBid && price <= (bestBid as number)) {
+                            recordSkip(`SELL: HARD_NO_CROSSING (${price} <= ${bestBid})`, { silent: true });
+                            continue;
+                        }
+                        sellFinalLadder.push(price);
                         const qty = roundToStep(sellQuotePerOrder / price, rules.qtyStep);
                         const notional = qty * price;
                         await placeOrder("SELL", price, qty, notional, sellQuotePerOrder, guard.adjustedSell ? "ADJUSTED" : undefined);
                     }
+                }
+
+                if (buyRawLadder.length > 0 || sellRawLadder.length > 0) {
+                    const fmt = (values: number[]) => values.map((v) => formatPriceByTick(v, tick)).join(",");
+                    console.log(
+                        `[mmRunner] ladder config=${config.id} exchange=${exchange} tick=${tick} buyRaw=[${fmt(buyRawLadder)}] buyRounded=[${fmt(buyRoundedLadder)}] buyFinal=[${fmt(buyFinalLadder)}] sellRaw=[${fmt(sellRawLadder)}] sellRounded=[${fmt(sellRoundedLadder)}] sellFinal=[${fmt(sellFinalLadder)}]`
+                    );
                 }
 
                 if (exchange === "dextrade" && orderTrace.length === 0) {
@@ -1141,6 +1452,8 @@ export const mmRunner: StrategyRunner = {
                     configId: config.id,
                     exchange,
                     pair: config.pair,
+                    openOrdersSource,
+                    midAnchor,
                     rules,
                     orders: orderTrace,
                     openOrders: exchangeOpenOrders.length,
@@ -1149,13 +1462,20 @@ export const mmRunner: StrategyRunner = {
                     ordersPerSide,
                     quotePerOrder,
                     cancelledCount: totalCancelled,
+                    alreadyClosedCount: totalAlreadyClosed,
+                    cancelFailedCount: totalCancelFailed,
                 };
                 console.log(`[mmRunner] trace ${JSON.stringify(trace)}`);
                 console.log(`[mmRunner] summary: config=${config.id} buyPlaced=${placedBuy} sellPlaced=${placedSell} orders_per_side=${ordersPerSide}`);
 
                 // Persist status tracking fields
+                const estimatedOpenAfterTick = Math.max(
+                    0,
+                    exchangeOpenOrders.length - totalCancelled - totalAlreadyClosed
+                ) + placedBuy + placedSell;
+                const sideSkips = skipReasons.filter((reason) => reason.startsWith("BUY:") || reason.startsWith("SELL:"));
                 const lastAction = actions.length > 0
-                    ? `PLACED ${actions.join(",")}`
+                    ? `PLACED ${actions.join(",")}${sideSkips.length > 0 ? `; SKIP ${sideSkips.slice(0, 2).join(" | ")}` : ""}`
                     : (errors.length > 0 ? "SKIP" : (skipReasons.length > 0 ? `SKIP: ${skipReasons[0]}` : "OK"));
                 updateStrategyParams(config.id, JSON.stringify({
                     ...params,
@@ -1165,7 +1485,7 @@ export const mmRunner: StrategyRunner = {
                     // Keep order_quote for backward compatibility
                     order_quote: quotePerOrder,
                     refresh_sec: refreshSec,
-                    mid_source: midSource,
+                    mid_source: effectiveMidSource === "exchange" ? "exchange" : "aggregated",
                     max_position_base: maxPositionBase,
                     mode: mmMode,
                     min_base_inventory: minBaseInventory,
@@ -1174,7 +1494,7 @@ export const mmRunner: StrategyRunner = {
                     inventory_quote: inventoryQuote,
                     last_action: lastAction,
                     last_action_at: now,
-                    open_orders_count: exchangeOpenOrders.length,
+                    open_orders_count: estimatedOpenAfterTick,
                     placed_buy: placedBuy,
                     placed_sell: placedSell,
                     skip_reasons: skipReasons.slice(0, 3) || [],

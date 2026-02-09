@@ -1,8 +1,13 @@
-import { Context } from "grammy";
-import { ApiError, getStrategyStatus, StrategyConfig, StrategyFill } from "../api.js";
+import { Context, InlineKeyboard } from "grammy";
+import { ApiError, devmmStatus, DevmmStatusEntry, getStrategyStatus, StrategyConfig, StrategyFill } from "../api.js";
 import { safeSend } from "../utils/telegram.js";
 import { safeText, truncateText } from "../utils/strings.js";
 import { ExchangeName } from "../lib/markets.js";
+import { handleDca } from "./dca.js";
+import { handleGrid } from "./grid.js";
+import { handleMm } from "./mm.js";
+import { handleDevmm } from "./devmm.js";
+import { sendMainMenu } from "./mainMenu.js";
 
 function exchangeLabel(exchange: ExchangeName): string {
     if (exchange === "nonkyc") return "NonKYC";
@@ -51,6 +56,25 @@ function formatTimeAgo(ts: number): string {
     if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
     const hours = Math.floor(sec / 3600);
     return `${hours}h ago`;
+}
+
+const STRATEGY_CALLBACK_PREFIX = "strategy:";
+const STRATEGY_CALLBACK_MAX_BYTES = 64;
+
+function buildStrategyCallback(action: string, value: string): string {
+    const data = `${STRATEGY_CALLBACK_PREFIX}${action}:${value}`;
+    if (Buffer.byteLength(data, "utf8") > STRATEGY_CALLBACK_MAX_BYTES) {
+        return `${STRATEGY_CALLBACK_PREFIX}invalid`;
+    }
+    return data;
+}
+
+async function safeAnswerCallbackQuery(ctx: Context, step: string): Promise<void> {
+    try {
+        await ctx.answerCallbackQuery();
+    } catch (err: any) {
+        console.error(`[strategy] ${step} answerCallbackQuery failed: ${err?.message || err}`);
+    }
 }
 
 /**
@@ -159,7 +183,7 @@ function formatCompactParams(config: StrategyConfig, sharedBalance?: { freeUSDT:
 
         if (skipReasons.length > 0) {
             // Include details like (have X, need Y)
-            statusLine += `\n   skip: ${skipReasons[0]}`;
+            statusLine += `\n   skip: ${skipReasons.slice(0, 2).join(" | ")}`;
         }
 
         return statusLine;
@@ -232,26 +256,71 @@ function formatAggregatedFill(fill: AggregatedFill): string {
     return `- ${fill.strategy} ${exchange} ${fill.pair}: ${fill.side} ${qtyStr} @ ${priceStr}${countSuffix}`;
 }
 
-export async function handleStrategyStatus(ctx: Context): Promise<void> {
+function formatDevmmCompact(entry: DevmmStatusEntry): string {
+    const status = entry.status || "STOPPED";
+    const turnover = entry.turnover?.todayUsdt ?? 0;
+    const fee = entry.turnover?.capDayUsdt ?? 0;
+    const openOrders = (entry.orders?.buyOrderId ? 1 : 0) + (entry.orders?.sellOrderId ? 1 : 0);
+    const reason = entry.pauseReason || entry.lastErrorCode || entry.lastError || "-";
+    return `${exchangeLabel(entry.exchange as ExchangeName)}: ${status} | open=${openOrders} | turnover=${formatQuantity(turnover)} | cap=${formatQuantity(fee)} | reason=${truncateText(reason, 80)}`;
+}
+
+function formatDevmmDetail(entry: DevmmStatusEntry): string {
+    const lines: string[] = [];
+    if (entry.market?.mid) {
+        lines.push(`mid=${formatPrice(entry.market.mid)}`);
+    }
+    if (entry.turnover) {
+        lines.push(`hour=${formatQuantity(entry.turnover.hourUsdt)}/${formatQuantity(entry.turnover.capHourUsdt)}`);
+    }
+    if (entry.inventory && !("status" in entry.inventory)) {
+        lines.push(`inventoryUSDT=${formatQuantity(entry.inventory.usdtBalance)}`);
+    }
+    if (entry.lastDecision) {
+        lines.push(`decision=${truncateText(entry.lastDecision, 80)}`);
+    }
+    return lines.join(" | ");
+}
+
+export async function handleStatus(ctx: Context): Promise<void> {
     const rawTgUserId = ctx.from?.id;
     if (!rawTgUserId) {
-        await safeSend(ctx, { step: "strategy_status.no_user", text: "❌ Could not identify user (missing Telegram ID)." });
+        await safeSend(ctx, { step: "status.no_user", text: "❌ Could not identify user (missing Telegram ID)." });
+        await sendMainMenu(ctx);
         return;
     }
     const tgUserId = String(rawTgUserId);
 
     try {
         const data = await getStrategyStatus(tgUserId);
+        let devmmEntries: DevmmStatusEntry[] = [];
+        try {
+            const devmm = await devmmStatus();
+            if (devmm.ok && devmm.exchanges) {
+                devmmEntries = devmm.exchanges;
+            }
+        } catch (devmmErr: any) {
+            console.warn(`[status] failed to fetch devmm status: ${devmmErr?.message || devmmErr}`);
+        }
 
         if (!data.ok) {
-            await safeSend(ctx, { step: "strategy_status.api_error", text: "❌ Failed to fetch status. Please try again." });
+            await safeSend(ctx, { step: "status.api_error", text: "❌ Failed to fetch status. Please try again." });
+            await sendMainMenu(ctx);
             return;
         }
 
         const realConfigs = (data.configs || []).filter(c => c.tradeMode === "REAL" && c.enabled);
 
         if (realConfigs.length === 0) {
-            await safeSend(ctx, { step: "strategy_status.none", text: "No active strategy config found. Use /dca, /grid, or /mm to start one." });
+            const lines = ["No active strategy config found. Use /dca, /grid, or /mm to start one."];
+            if (devmmEntries.length > 0) {
+                lines.push("", "DevMM summary:");
+                for (const entry of devmmEntries) {
+                    lines.push(`- ${formatDevmmCompact(entry)}`);
+                }
+            }
+            await safeSend(ctx, { step: "status.none", text: lines.join("\n") });
+            await sendMainMenu(ctx);
             return;
         }
 
@@ -261,39 +330,37 @@ export async function handleStrategyStatus(ctx: Context): Promise<void> {
                 const label = exchangeLabel(bal.exchange as ExchangeName);
                 if (bal.ok) {
                     const snap = bal.snapshot;
-                    const usdt = snap?.assets?.USDT;
-                    const bnb = snap?.assets?.BNB;
-                    const pepew = snap?.assets?.PEPEW;
+                    const usdt = snap?.assets?.USDT || { free: bal.assets.USDT, total: bal.assets.USDT };
+                    const bnb = snap?.assets?.BNB || { free: bal.assets.BNB, total: bal.assets.BNB };
+                    const pepew = snap?.assets?.PEPEW || { free: bal.assets.PEPEW, total: bal.assets.PEPEW };
                     const updatedTs = snap?.ts || bal.lastOkTs || null;
                     const parts: string[] = [];
-                    if (usdt) parts.push(`USDT ${usdt.free.toFixed(4)}/${usdt.total.toFixed(4)}`);
-                    if (bnb) parts.push(`BNB ${bnb.free.toFixed(4)}/${bnb.total.toFixed(4)}`);
-                    if (pepew) parts.push(`PEPEW ${pepew.free.toExponential(2)}/${pepew.total.toExponential(2)}`);
-                    if (!parts.length) {
-                        parts.push(`${bal.assets.USDT.toFixed(4)} USDT`);
-                        parts.push(`${bal.assets.PEPEW.toExponential(2)} PEPEW`);
+                    parts.push(`USDT ${usdt.free.toFixed(4)}/${usdt.total.toFixed(4)}`);
+                    if (bal.exchange === "nonkyc") {
+                        parts.push(`BNB ${bnb.free.toFixed(4)}/${bnb.total.toFixed(4)}`);
                     }
-                    balanceLines.push(`📊 ${label} Balance: ${parts.join(" | ")} | updated ${formatDateTime(updatedTs)}`);
+                    parts.push(`PEPEW ${pepew.free.toExponential(2)}/${pepew.total.toExponential(2)}`);
+                    balanceLines.push(`${label} balance: ${parts.join(" | ")} | ${formatDateTime(updatedTs)}`);
                 } else {
                     const reason = bal.errCode || bal.reason || "BALANCE_FETCH_FAILED";
-                    const detail = bal.error ? truncateText(safeText(bal.error), 120) : "";
                     const lastOk = bal.lastOkTs ? formatDateTime(bal.lastOkTs) : "-";
-                    balanceLines.push(`📊 ${label} Balance: (unavailable: ${reason}) (lastOk: ${lastOk})${detail ? ` - ${detail}` : ""}`);
+                    balanceLines.push(`${label} balance: unavailable (${reason}, lastOk ${lastOk})`);
                 }
             }
         } else if (data.debug) {
             // Fallback to debug balance if balances array missing
             const usdtStr = data.debug.freeQuote.toFixed(4);
             const pepewStr = data.debug.freePEPEW.toExponential(2);
-            balanceLines.push(`📊 NonKYC Balance: ${usdtStr} USDT/BNB | ${pepewStr} PEPEW`);
+            balanceLines.push(`NonKYC balance: USDT ${usdtStr} | PEPEW ${pepewStr}`);
         }
 
-        // Compact config display: 2 lines per config
+        // Compact status display
         const lines: string[] = [];
         if (balanceLines.length > 0) {
             lines.push(...balanceLines);
+            lines.push("");
         }
-        lines.push("Your strategies:", "");
+        lines.push("Strategies:");
         realConfigs.forEach((cfg, index) => {
             const exchangeDisplay =
                 cfg.exchange === "nonkyc" || cfg.exchange === "dextrade" || cfg.exchange === "nestex"
@@ -301,96 +368,108 @@ export async function handleStrategyStatus(ctx: Context): Promise<void> {
                     : cfg.exchange;
             let status = cfg.enabled ? "ACTIVE" : "STOPPED";
             if (cfg.disabledReason) {
-                status = `🔴 AUTO-STOPPED (${cfg.disabledReason})`;
+                status = `AUTO-STOPPED (${cfg.disabledReason})`;
             } else if (cfg.backoff && cfg.backoff.remainingSec > 0) {
-                status = `⚠️ BACKOFF (${formatInterval(cfg.backoff.remainingSec)})`;
+                status = `BACKOFF ${formatInterval(cfg.backoff.remainingSec)}`;
             }
 
-            // Line 1: Strategy Exchange Pair Mode Status
             lines.push(
-                `${index + 1}) ${cfg.strategy}  ${exchangeDisplay}  ${cfg.pair}  ${cfg.tradeMode}  ${status}`
+                `${index + 1}. ${cfg.strategy} ${exchangeDisplay} ${cfg.pair} ${status}`
             );
-            // Line 2: Compact params with pipe separators
             const sharedBal = data.debug ? { freeUSDT: data.debug.freeQuote, freePEPEW: data.debug.freePEPEW } : null;
             lines.push(`   ${formatCompactParams(cfg, sharedBal)}`);
-
-            // Line 3: Last action if present
-            if (cfg.lastAction) {
-                const isGridNewFormat = cfg.strategy === "GRID" && (cfg.lastAction.startsWith("GRID tick ok:") || cfg.lastAction.startsWith("GRID:"));
-                if (!isGridNewFormat) {
-                    const actionTime = cfg.lastActionAt ? formatTimeAgo(cfg.lastActionAt) : "";
-                    const action = truncateText(safeText(cfg.lastAction), 200);
-                    lines.push(`   Last Action: ${action}${actionTime ? ` (${actionTime})` : ""}`);
-                }
-            }
-
-            // Line 3.5: Inventory warning if present
-            if (cfg.inventoryWarning) {
-                lines.push(`   ⚠️ ${cfg.inventoryWarning}`);
-            }
-
-            // Line 4: Failure info if present (only show if within last 30 minutes)
-            const STALE_ERROR_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
-            if (cfg.lastFailure) {
-                const f = cfg.lastFailure;
-                const ageMs = Date.now() - f.lastSeenAt;
-                const isStale = ageMs > STALE_ERROR_THRESHOLD_MS;
-
-                // Only show errors that are recent OR if strategy is in backoff/disabled
-                if (!isStale || cfg.disabledReason || (cfg.backoff && cfg.backoff.remainingSec > 0)) {
-                    const message = f.message ? truncateText(safeText(f.message), 200) : "";
-
-                    // Filter out old/irrelevant GRID error strings
-                    const isForbidden = /exchangeOpenOrders|Orders not found|after placing/i.test(message);
-
-                    if (!isForbidden) {
-                        const timeAgo = formatTimeAgo(f.lastSeenAt);
-                        lines.push(`   Last Error Code: ${f.category} (${timeAgo})`);
-                        if (f.httpStatus) {
-                            lines.push(`   Last Error Status: ${f.httpStatus}`);
-                        }
-                        if (f.exchangeCode) {
-                            lines.push(`   Last Error Exchange Code: ${f.exchangeCode}`);
-                        }
-                        if (message) {
-                            lines.push(`   Last Error Message: ${message}`);
-                        }
-                    }
-                }
-            }
             lines.push("");
         });
 
-        // Aggregated fills (max 5 unique entries)
-        const fills = data.recentFills || [];
-        if (fills.length === 0) {
-            lines.push("Recent fills:", "- None");
-        } else {
-            lines.push("Recent fills:");
-            const aggregated = aggregateFills(fills.slice(0, 10));
-            aggregated.slice(0, 5).forEach((fill) => lines.push(formatAggregatedFill(fill)));
-        }
-
-        // Add Debug Trace if available
-        if (data.debug) {
-            const d = data.debug;
+        if (devmmEntries.length > 0) {
             lines.push("");
-            lines.push("🔍 Debug Trace (NonKYC Balance):");
-            lines.push(`- Source: ${d.balance_source}`);
-            lines.push(`- Cache: ${d.isCached ? "YES" : "NO"} (${formatInterval(Math.floor(d.cacheAgeMs / 1000))} old)`);
-            lines.push(`- Symbols Found: [${d.symbolsFound.join(", ")}]`);
-            lines.push(`- Free USDT/BNB: ${d.freeQuote.toFixed(6)}`);
-            lines.push(`- Free PEPEW: ${d.freePEPEW.toExponential(6)}`);
+            lines.push("DevMM summary:");
+            for (const entry of devmmEntries) {
+                lines.push(`- ${formatDevmmCompact(entry)}`);
+            }
+            lines.push("");
+            lines.push("DevMM details:");
+            for (const entry of devmmEntries) {
+                const detail = formatDevmmDetail(entry);
+                lines.push(`- ${exchangeLabel(entry.exchange as ExchangeName)}: ${detail || "-"}`);
+            }
         }
 
-        await safeSend(ctx, { step: "strategy_status.success", text: lines.join("\n") });
+        await safeSend(ctx, { step: "status.success", text: lines.join("\n") });
+        await sendMainMenu(ctx);
     } catch (err: any) {
         if (err instanceof ApiError) {
-            console.error(`[strategy_status] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
-            await safeSend(ctx, { step: "strategy_status.http", text: "❌ Failed to fetch status. Please try again." });
+            console.error(`[status] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
+            await safeSend(ctx, { step: "status.http", text: "❌ Failed to fetch status. Please try again." });
+            await sendMainMenu(ctx);
             return;
         }
-        console.error(`[strategy_status] Error: ${err?.message || err}`);
-        await safeSend(ctx, { step: "strategy_status.error", text: "❌ Failed to fetch status. Please try again." });
+        console.error(`[status] Error: ${err?.message || err}`);
+        await safeSend(ctx, { step: "status.error", text: "❌ Failed to fetch status. Please try again." });
+        await sendMainMenu(ctx);
     }
+}
+
+export async function handleStrategyMenu(ctx: Context): Promise<void> {
+    const keyboard = new InlineKeyboard()
+        .text("DCA", buildStrategyCallback("open", "dca"))
+        .text("GRID", buildStrategyCallback("open", "grid")).row()
+        .text("MM", buildStrategyCallback("open", "mm"))
+        .text("DEVMM", buildStrategyCallback("open", "devmm"));
+
+    await safeSend(ctx, {
+        step: "strategy.menu",
+        text: "Select strategy:",
+        replyMarkup: keyboard,
+    });
+}
+
+export async function handleStrategyMenuCallback(ctx: Context): Promise<boolean> {
+    const data = ctx.callbackQuery?.data || "";
+    if (!data.startsWith(STRATEGY_CALLBACK_PREFIX)) return false;
+
+    const payload = data.slice(STRATEGY_CALLBACK_PREFIX.length);
+    const [action, value] = payload.split(":");
+    await safeAnswerCallbackQuery(ctx, "strategy.menu.callback");
+
+    if (action !== "open") {
+        await safeSend(ctx, { step: "strategy.menu.invalid", text: "❌ Unknown strategy action." });
+        return true;
+    }
+
+    if (value === "dca") {
+        await handleDca(ctx);
+        return true;
+    }
+    if (value === "grid") {
+        await handleGrid(ctx);
+        return true;
+    }
+    if (value === "mm") {
+        await handleMm(ctx);
+        return true;
+    }
+    if (value === "devmm") {
+        await handleDevmm(ctx);
+        return true;
+    }
+
+    await safeSend(ctx, { step: "strategy.menu.unknown", text: "❌ Unknown strategy type." });
+    return true;
+}
+
+export async function handleStrategyStatus(ctx: Context): Promise<void> {
+    await safeSend(ctx, {
+        step: "status.alias.strategy_status",
+        text: "ℹ️ /strategy_status has been integrated into /status.",
+    });
+    await handleStatus(ctx);
+}
+
+export async function handleDevmmStatusAlias(ctx: Context): Promise<void> {
+    await safeSend(ctx, {
+        step: "status.alias.devmm_status",
+        text: "ℹ️ /devmm_status has been integrated into /status.",
+    });
+    await handleStatus(ctx);
 }

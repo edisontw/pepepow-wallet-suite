@@ -8,6 +8,7 @@
 import { Context, InlineKeyboard } from "grammy";
 import { ApiError, devmmStart, devmmStop, devmmStatus, devmmReport, DevmmStatusEntry, DevmmReportEntry } from "../api.js";
 import { safeSend, sendLongText } from "../utils/telegram.js";
+import { sendMainMenu } from "./mainMenu.js";
 
 type ExchangeName = "nonkyc" | "dextrade" | "nestex";
 
@@ -101,10 +102,10 @@ function parseCallbackData(data: string): { action: string; value: string } | nu
 // /devmm - Show menu
 export async function handleDevmm(ctx: Context): Promise<void> {
     const keyboard = new InlineKeyboard()
-        .text("Start DevMM", "devmm:start").row()
-        .text("Stop DevMM", "devmm:stop").row()
-        .text("Status", "devmm:status").row()
-        .text("Report", "devmm:report");
+        .text("Start", "devmm:start").row()
+        .text("Start All", buildCallbackData("start", "all")).row()
+        .text("Stop", "devmm:stop").row()
+        .text("Stop All", buildCallbackData("stop", "all"));
 
     await safeSend(ctx, {
         step: "devmm_menu",
@@ -141,7 +142,12 @@ export async function handleDevmmStart(ctx: Context): Promise<void> {
     });
 }
 
-async function startDevmmOnExchange(ctx: Context, exchange: ExchangeName): Promise<void> {
+async function startDevmmOnExchange(
+    ctx: Context,
+    exchange: ExchangeName,
+    options: { showMainMenu?: boolean } = {}
+): Promise<void> {
+    const showMainMenu = options.showMainMenu !== false;
     const tgUserId = getTgUserId(ctx);
     if (!tgUserId) {
         await safeSend(ctx, {
@@ -173,9 +179,11 @@ async function startDevmmOnExchange(ctx: Context, exchange: ExchangeName): Promi
         }
 
         await safeSend(ctx, { step: "devmm_start_success", text: msg });
+        if (showMainMenu) await sendMainMenu(ctx);
     } catch (err: any) {
         const msg = err instanceof ApiError ? `API error: ${err.message}` : `Error: ${err.message}`;
         await safeSend(ctx, { step: "devmm_start_exception", text: msg });
+        if (showMainMenu) await sendMainMenu(ctx);
     }
 }
 
@@ -203,7 +211,12 @@ export async function handleDevmmStop(ctx: Context): Promise<void> {
     });
 }
 
-async function stopDevmmOnExchange(ctx: Context, exchange: ExchangeName): Promise<void> {
+async function stopDevmmOnExchange(
+    ctx: Context,
+    exchange: ExchangeName,
+    options: { showMainMenu?: boolean } = {}
+): Promise<void> {
+    const showMainMenu = options.showMainMenu !== false;
     try {
         const res = await devmmStop(exchange);
         if (!res.ok) {
@@ -215,17 +228,28 @@ async function stopDevmmOnExchange(ctx: Context, exchange: ExchangeName): Promis
         }
 
         let msg = `DevMM stopped on ${exchangeLabel(exchange)}\n`;
+        if (res.ordersVisibleBefore !== undefined) {
+            msg += `Open before stop: ${res.ordersVisibleBefore}\n`;
+        }
+        if (res.ordersAttempted !== undefined) {
+            msg += `Cancel attempts: ${res.ordersAttempted}\n`;
+        }
         if (res.ordersCancelled !== undefined) {
             msg += `Orders cancelled: ${res.ordersCancelled}\n`;
+        }
+        if (res.ordersAlreadyClosed !== undefined && res.ordersAlreadyClosed > 0) {
+            msg += `Already closed: ${res.ordersAlreadyClosed}\n`;
         }
         if (res.ordersFailed !== undefined && res.ordersFailed > 0) {
             msg += `Failed to cancel: ${res.ordersFailed}\n`;
         }
 
         await safeSend(ctx, { step: "devmm_stop_success", text: msg });
+        if (showMainMenu) await sendMainMenu(ctx);
     } catch (err: any) {
         const msg = err instanceof ApiError ? `API error: ${err.message}` : `Error: ${err.message}`;
         await safeSend(ctx, { step: "devmm_stop_exception", text: msg });
+        if (showMainMenu) await sendMainMenu(ctx);
     }
 }
 
@@ -324,6 +348,15 @@ function formatStatusSummary(entry: DevmmStatusEntry): string {
         note = stripHtml(entry.pauseReason).slice(0, 40);
     } else if (entry.lastErrorCode) {
         note = stripHtml(entry.lastErrorCode).slice(0, 40);
+    } else if (entry.lastDecision) {
+        const decisionText = String(entry.lastDecision);
+        const skipMatch = decisionText.match(/SKIP_TICK:([A-Z0-9_]+)/);
+        const skippedSideMatch = decisionText.match(/SKIPPED:([A-Z+]+)/);
+        if (skipMatch?.[1]) {
+            note = skipMatch[1].slice(0, 40);
+        } else if (skippedSideMatch?.[1]) {
+            note = `SKIPPED_${skippedSideMatch[1]}`.slice(0, 40);
+        }
     }
     if (note) {
         parts.push(note);
@@ -522,19 +555,27 @@ export async function handleDevmmCallback(ctx: Context): Promise<boolean> {
     }
 
     // Literal matching for core actions
-    if (data === "devmm:status") {
-        await ctx.reply("Fetching DevMM status...").catch(() => { });
-        await handleDevmmStatus(ctx);
-        return true;
-    }
     if (data === "devmm:start") {
         return handleMenuCallback(ctx, "start");
     }
     if (data === "devmm:stop") {
         return handleMenuCallback(ctx, "stop");
     }
+    if (data === "devmm:status") {
+        await safeSend(ctx, {
+            step: "devmm.status.redirect",
+            text: "ℹ️ DevMM status has been integrated into /status.",
+        });
+        await sendMainMenu(ctx);
+        return true;
+    }
     if (data === "devmm:report") {
-        return handleMenuCallback(ctx, "report");
+        await safeSend(ctx, {
+            step: "devmm.report.redirect",
+            text: "ℹ️ DevMM report has been integrated into /report.",
+        });
+        await sendMainMenu(ctx);
+        return true;
     }
 
     // Pattern matching for parameterized actions
@@ -555,6 +596,13 @@ export async function handleDevmmCallback(ctx: Context): Promise<boolean> {
             case "menu": // Backward compatibility if any old buttons remain
                 return handleMenuCallback(ctx, value);
             case "start":
+                if (value === "all") {
+                    for (const ex of ["nonkyc", "dextrade", "nestex"] as ExchangeName[]) {
+                        await startDevmmOnExchange(ctx, ex, { showMainMenu: false });
+                    }
+                    await sendMainMenu(ctx);
+                    return true;
+                }
                 if (["nonkyc", "dextrade", "nestex"].includes(value)) {
                     await startDevmmOnExchange(ctx, value as ExchangeName);
                     return true;
@@ -563,8 +611,9 @@ export async function handleDevmmCallback(ctx: Context): Promise<boolean> {
             case "stop":
                 if (value === "all") {
                     for (const ex of ["nonkyc", "dextrade", "nestex"] as ExchangeName[]) {
-                        await stopDevmmOnExchange(ctx, ex);
+                        await stopDevmmOnExchange(ctx, ex, { showMainMenu: false });
                     }
+                    await sendMainMenu(ctx);
                     return true;
                 }
                 if (["nonkyc", "dextrade", "nestex"].includes(value)) {
@@ -572,22 +621,20 @@ export async function handleDevmmCallback(ctx: Context): Promise<boolean> {
                     return true;
                 }
                 break;
+            case "status":
+                await safeSend(ctx, {
+                    step: "devmm.status.alias",
+                    text: "ℹ️ DevMM status has been integrated into /status.",
+                });
+                await sendMainMenu(ctx);
+                return true;
             case "report":
-                if (["daily", "weekly", "monthly"].includes(value)) {
-                    const res = await devmmReport({ period: value as "daily" | "weekly" | "monthly" });
-                    if (res.ok && res.reports) {
-                        let msg = `DevMM ${value.charAt(0).toUpperCase() + value.slice(1)} Report\n` + "=".repeat(40) + "\n\n";
-                        for (const report of res.reports) {
-                            msg += formatReportEntry(report);
-                            msg += "\n";
-                        }
-                        await safeSend(ctx, { step: "devmm_report_period", text: msg });
-                    } else {
-                        await ctx.reply(`Failed to get report: ${res.error || "Unknown error"}`);
-                    }
-                    return true;
-                }
-                break;
+                await safeSend(ctx, {
+                    step: "devmm.report.alias",
+                    text: "ℹ️ DevMM report has been integrated into /report.",
+                });
+                await sendMainMenu(ctx);
+                return true;
         }
     } catch (err: any) {
         console.error(`[trade-bot] DevMM callback crash: ${err.message}`);
@@ -624,23 +671,6 @@ async function handleMenuCallback(ctx: Context, value: string): Promise<boolean>
                 step: "devmm_menu_stop",
                 text: "Select exchange to stop DevMM:",
                 replyMarkup: stopKeyboard,
-            });
-            return true;
-
-        case "status":
-            await handleDevmmStatus(ctx);
-            return true;
-
-        case "report":
-            // Show period selection
-            const reportKeyboard = new InlineKeyboard()
-                .text("Daily", buildCallbackData("report", "daily")).row()
-                .text("Weekly", buildCallbackData("report", "weekly")).row()
-                .text("Monthly", buildCallbackData("report", "monthly"));
-            await safeSend(ctx, {
-                step: "devmm_menu_report",
-                text: "Select report period:",
-                replyMarkup: reportKeyboard,
             });
             return true;
     }

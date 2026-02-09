@@ -734,6 +734,20 @@ export interface NonKycOpenOrdersResult {
     debug?: NonKycErrorDetails;
 }
 
+function isNonKycOpenStatus(status: string): boolean {
+    const normalized = String(status || "")
+        .trim()
+        .toUpperCase()
+        .replace(/[\s_-]+/g, "");
+    if (!normalized) return false;
+    return normalized === "OPEN"
+        || normalized === "PARTIALLYFILLED"
+        || normalized === "PARTIALFILLED"
+        || normalized === "PENDING"
+        || normalized === "NEW"
+        || normalized === "ACTIVE";
+}
+
 /**
  * List open orders on NonKYC exchange
  * @param accessKey API access key
@@ -806,11 +820,8 @@ export async function listNonKycOpenOrders(
             });
         }
 
-        // Filter for open status (NonKYC typically uses 'Open', 'PartiallyFilled', 'Pending', etc.)
-        const openOrders = orders.filter(o => {
-            const s = o.status.toLowerCase();
-            return s === "open" || s === "partiallyfilled" || s === "pending" || s === "new" || s === "active";
-        });
+        // Keep all open-like states, including PARTIALLY_FILLED variants.
+        const openOrders = orders.filter((o) => isNonKycOpenStatus(o.status));
 
         if (orders.length > 0 && NONKYC_DEBUG) {
             console.log(`[nonkyc:debug] listOpenOrders first 3 keys:`, orders.slice(0, 3).map(o => Object.keys(o)));
@@ -896,4 +907,3 @@ export async function getNonKycOrderById(
         return { ok: false, status: 0, error: err?.message || "Network error", reason: "NETWORK_ERROR", debug };
     }
 }
-

@@ -45,7 +45,7 @@ const REGISTRY: Record<ExchangeId, ExchangeSpec> = {
             "PEPEW/USDT": "PEPEWUSDT",
         },
         precision: {
-            priceTick: 1e-10,
+            priceTick: 1e-8,
             qtyStep: 1,
             priceRounding: "round",
             qtyRounding: "floor",
@@ -84,7 +84,7 @@ const REGISTRY: Record<ExchangeId, ExchangeSpec> = {
         },
         limits: {
             byPair: {
-                "PEPEW/USDT": { minNotional: 1, minQuotePerOrder: 1 },
+                "PEPEW/USDT": { minNotional: 0.0015, minQuotePerOrder: 0.0015 },
             },
         },
         balancePolicy: {

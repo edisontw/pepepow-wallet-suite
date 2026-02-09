@@ -132,9 +132,12 @@ async function cancelAllDevmmOrders(
     accessKey: string,
     secretKey: string,
     trackedOrderIds: string[] = []
-): Promise<{ cancelled: number; failed: number }> {
+): Promise<{ attempted: number; visibleBefore: number; cancelled: number; alreadyClosed: number; failed: number }> {
     const rateLimitKey = `devmm:${exchange}`;
+    let attempted = 0;
+    let visibleBefore = 0;
     let cancelled = 0;
+    let alreadyClosed = 0;
     let failed = 0;
     const normalizeOrderId = (value: string | number | null | undefined): string => String(value ?? "").trim().replace(/\.0+$/, "");
     const isIdempotentCancelError = (error: string | null | undefined): boolean => {
@@ -163,14 +166,18 @@ async function cancelAllDevmmOrders(
 
     try {
         const orderIds = new Set<string>();
+        const visibleOrderIds = new Set<string>();
         const attemptedOrderIds = new Set<string>();
 
         if (exchange === "nonkyc") {
             const res = await listNonKycOpenOrders(accessKey, secretKey, "PEPEW_USDT");
-            if (res.ok && Array.isArray(res.data)) {
-                for (const o of res.data) {
-                    const id = normalizeOrderId((o as any).id);
-                    if (id) orderIds.add(id);
+            if (res.ok && Array.isArray(res.orders)) {
+                for (const o of res.orders) {
+                    const id = normalizeOrderId((o as any).order_id || (o as any).id);
+                    if (id) {
+                        orderIds.add(id);
+                        visibleOrderIds.add(id);
+                    }
                 }
             }
         } else if (exchange === "dextrade") {
@@ -178,7 +185,10 @@ async function cancelAllDevmmOrders(
             if (res.ok && Array.isArray(res.orders)) {
                 for (const o of res.orders) {
                     const id = normalizeOrderId((o as any).id || (o as any).order_id);
-                    if (id) orderIds.add(id);
+                    if (id) {
+                        orderIds.add(id);
+                        visibleOrderIds.add(id);
+                    }
                 }
             }
         } else if (exchange === "nestex") {
@@ -187,10 +197,14 @@ async function cancelAllDevmmOrders(
                 for (const o of res.orders) {
                     if (!isTargetNestExOrder(o)) continue;
                     const id = normalizeOrderId((o as any).order_id || (o as any).id);
-                    if (id) orderIds.add(id);
+                    if (id) {
+                        orderIds.add(id);
+                        visibleOrderIds.add(id);
+                    }
                 }
             }
         }
+        visibleBefore = visibleOrderIds.size;
 
         // Fallback when open-orders endpoint is unreliable: also cancel tracked IDs in devmm_state.
         for (const id of trackedOrderIds) {
@@ -201,45 +215,57 @@ async function cancelAllDevmmOrders(
         if (state?.open_buy_order_id) orderIds.add(normalizeOrderId(state.open_buy_order_id));
         if (state?.open_sell_order_id) orderIds.add(normalizeOrderId(state.open_sell_order_id));
 
-        const attemptCancel = async (orderId: string): Promise<void> => {
-            if (!orderId || attemptedOrderIds.has(orderId)) return;
+        const attemptCancel = async (orderId: string): Promise<"CANCELLED" | "ALREADY_CLOSED" | "FAILED" | null> => {
+            if (!orderId || attemptedOrderIds.has(orderId)) return null;
             attemptedOrderIds.add(orderId);
             try {
-                let success = false;
+                let outcome: "CANCELLED" | "ALREADY_CLOSED" | "FAILED" = "FAILED";
                 if (exchange === "nonkyc") {
                     const res = await cancelNonKycOrder(accessKey, secretKey, orderId);
-                    success = res.ok;
-                    if (!success && isIdempotentCancelError((res as any).error || (res as any).reason)) {
-                        success = true;
+                    if (res.ok) {
+                        outcome = "CANCELLED";
+                    } else if (isIdempotentCancelError((res as any).error || (res as any).reason)) {
+                        outcome = "ALREADY_CLOSED";
                     }
                 } else if (exchange === "dextrade") {
                     const res = await cancelDexTradeOrder(accessKey, secretKey, orderId, "PEPEWUSDT");
-                    success = res.ok || isIdempotentCancelError(res.error || (res as any).reason);
-                    if (!success) {
+                    if (res.ok) {
+                        outcome = "CANCELLED";
+                    } else if (isIdempotentCancelError(res.error || (res as any).reason)) {
+                        outcome = "ALREADY_CLOSED";
+                    } else {
                         const fallbackRes = await cancelDexTradeOrder(accessKey, secretKey, orderId);
-                        success = fallbackRes.ok || isIdempotentCancelError(fallbackRes.error || (fallbackRes as any).reason);
+                        if (fallbackRes.ok) {
+                            outcome = "CANCELLED";
+                        } else if (isIdempotentCancelError(fallbackRes.error || (fallbackRes as any).reason)) {
+                            outcome = "ALREADY_CLOSED";
+                        }
                     }
                 } else if (exchange === "nestex") {
                     const res = await cancelNestExOrder(accessKey, secretKey, orderId, rateLimitKey);
-                    success = res.ok || isIdempotentCancelError(res.error || (res as any).reason);
+                    if (res.ok && (res.alreadyClosed || isIdempotentCancelError(JSON.stringify(res.data)))) {
+                        outcome = "ALREADY_CLOSED";
+                    } else if (res.ok) {
+                        outcome = "CANCELLED";
+                    } else if (isIdempotentCancelError(res.error || (res as any).reason)) {
+                        outcome = "ALREADY_CLOSED";
+                    }
                 }
-
-                if (success) {
-                    cancelled++;
-                } else {
-                    failed++;
-                }
+                return outcome;
             } catch (err: any) {
                 if (isIdempotentCancelError(err?.message || "")) {
-                    cancelled++;
-                    return;
+                    return "ALREADY_CLOSED";
                 }
-                failed++;
+                return "FAILED";
             }
         };
 
         for (const orderId of orderIds) {
-            await attemptCancel(orderId);
+            const outcome = await attemptCancel(orderId);
+            if (!outcome) continue;
+            if (outcome === "CANCELLED") cancelled++;
+            else if (outcome === "ALREADY_CLOSED") alreadyClosed++;
+            else failed++;
         }
 
         // NestEx open-orders visibility can lag/be partial; do a few extra sweeps and cancel newly discovered IDs.
@@ -255,15 +281,20 @@ async function cancelAllDevmmOrders(
                     .filter((id: string) => !!id && !attemptedOrderIds.has(id));
                 if (newIds.length === 0) break;
                 for (const id of newIds) {
-                    await attemptCancel(id);
+                    const outcome = await attemptCancel(id);
+                    if (!outcome) continue;
+                    if (outcome === "CANCELLED") cancelled++;
+                    else if (outcome === "ALREADY_CLOSED") alreadyClosed++;
+                    else failed++;
                 }
             }
         }
+        attempted = attemptedOrderIds.size;
     } catch (err) {
         console.error(`[devmmApi] Failed to cancel orders: ${err}`);
     }
 
-    return { cancelled, failed };
+    return { attempted, visibleBefore, cancelled, alreadyClosed, failed };
 }
 
 // POST /v1/devmm/start
@@ -367,7 +398,7 @@ router.post("/v1/devmm/stop", async (req, res) => {
 
         // Cancel open orders
         const keys = await getKeys(exchange);
-        let cancelResult = { cancelled: 0, failed: 0 };
+        let cancelResult = { attempted: 0, visibleBefore: 0, cancelled: 0, alreadyClosed: 0, failed: 0 };
         if (keys) {
             cancelResult = await cancelAllDevmmOrders(exchange, keys.accessKey, keys.secretKey, trackedOrderIds);
         }
@@ -386,12 +417,17 @@ router.post("/v1/devmm/stop", async (req, res) => {
 
         console.log(`[devmm:stop] DB updated for ${exchange} ${symbol}`);
 
-        console.log(`[devmmApi] Stopped on ${exchange}, cancelled=${cancelResult.cancelled} failed=${cancelResult.failed}`);
+        console.log(
+            `[devmmApi] Stopped on ${exchange}, visibleBefore=${cancelResult.visibleBefore} attempted=${cancelResult.attempted} cancelled=${cancelResult.cancelled} alreadyClosed=${cancelResult.alreadyClosed} failed=${cancelResult.failed}`
+        );
 
         res.json({
             ok: true,
             message: `DevMM stopped on ${exchange}`,
+            ordersAttempted: cancelResult.attempted,
+            ordersVisibleBefore: cancelResult.visibleBefore,
             ordersCancelled: cancelResult.cancelled,
+            ordersAlreadyClosed: cancelResult.alreadyClosed,
             ordersFailed: cancelResult.failed,
         });
     } catch (err: any) {
@@ -539,6 +575,8 @@ router.get("/v1/devmm/status", (req, res) => {
             const pendingCount = getDevmmPendingCount(ex);
             const bootstrap = getDevmmBootstrapSnapshot(ex, symbol);
             const trackedOpenOrders = (state?.open_buy_order_id ? 1 : 0) + (state?.open_sell_order_id ? 1 : 0);
+            const trackedBuyOrders = state?.open_buy_order_id ? 1 : 0;
+            const trackedSellOrders = state?.open_sell_order_id ? 1 : 0;
             const parsedError = splitDevmmError(state?.last_error);
             let balanceLastOkTs: number | null = null;
             let balanceLastOkAgeSec: number | null = null;
@@ -569,6 +607,8 @@ router.get("/v1/devmm/status", (req, res) => {
                     issueCode: null,
                     isEnabled: false,
                     openOrders: 0,
+                    openOrdersBySide: { buy: 0, sell: 0 },
+                    openOrdersSource: "tracked_state",
                     pendingCount,
                     turnoverUsed: 0,
                     turnoverCap: 0,
@@ -629,6 +669,8 @@ router.get("/v1/devmm/status", (req, res) => {
                 pauseReason: state?.pause_reason || null,
                 issueCode: deriveDevmmIssueCode(state?.pause_reason || null, state?.last_decision || null),
                 openOrders: trackedOpenOrders,
+                openOrdersBySide: { buy: trackedBuyOrders, sell: trackedSellOrders },
+                openOrdersSource: "tracked_state",
                 pendingCount,
                 turnoverUsed: turnoverToday,
                 turnoverCap: capDay,
@@ -791,13 +833,17 @@ router.get("/v1/devmm/report", (req, res) => {
 router.get("/v1/devmm/debug/fills", (req, res) => {
     try {
         const limit = Number(req.query.limit || 5);
-        const exchange = req.query.exchange as string | undefined;
+        const exchangeRaw = req.query.exchange as string | undefined;
+        const exchange = exchangeRaw ? normalizeDevmmExchange(exchangeRaw) : null;
+        if (exchangeRaw && !exchange) {
+            return res.status(400).json({ ok: false, error: "INVALID_EXCHANGE", fills: [] });
+        }
 
         let query = "SELECT * FROM devmm_fills";
         const params: any[] = [];
 
         if (exchange) {
-            query += " WHERE exchange = ?";
+            query += " WHERE LOWER(TRIM(exchange)) = ?";
             params.push(exchange);
         }
 

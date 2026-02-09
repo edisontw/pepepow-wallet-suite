@@ -1,5 +1,6 @@
 import { Context } from "grammy";
 import { safeSend } from "../utils/telegram.js";
+import { sendMainMenu } from "./mainMenu.js";
 
 const DONATE_ADDRESS =
     process.env.DONATE_ADDRESS ||
@@ -7,64 +8,31 @@ const DONATE_ADDRESS =
     "PDep1ZNhCyqyRwjnQif8K6tPGsE7TvhyT6";
 
 export async function handleStart(ctx: Context): Promise<void> {
-    const message = [
-        "🐸 PEPEPOW Trade Bot",
+    const intro = [
+        "PEPEPOW Trade Bot",
         "",
-        "Welcome to the PEPEPOW DCA Trading Bot!",
-        "",
-        "This bot helps you set up Dollar Cost Averaging (DCA), GRID, and Market Making strategies for PEPEW tokens.",
-        "",
-        "Available Commands:",
-        "• /price - View current PEPEW prices",
-        "• /dca - Configure DCA (wizard)",
-        "• /dca_start - Start DCA",
-        "• /dca_stop - Stop DCA",
-        "• /grid - Configure GRID (wizard)",
-        "• /grid_start - Start GRID",
-        "• /grid_stop - Stop GRID",
-        "• /mm - Configure Market Maker (wizard)",
-        "• /mm_start - Start MM",
-        "• /mm_stop - Stop MM",
-        "• /devmm - Dev fee market making",
-        "• /devmm_status - View DevMM status",
-        "• /strategy_status - View all strategies",
-        "• /keys - Set exchange API keys",
-        "• /keys_status - View key status",
-        "• /keys_clear - Clear exchange keys",
-        "• /help - Show help and commands",
-        "• /donate - Support development",
-        "",
-        "Donate Address:",
-        `${DONATE_ADDRESS}`,
-        "",
-        "This bot is free to use. Consider donating to support development!",
+        "Use the menu buttons below to manage strategy setup, status, reports, stop actions, and API keys.",
     ].join("\n");
-
-    await safeSend(ctx, { step: "start", text: message });
+    await sendMainMenu(ctx, intro);
 }
 
 export async function handleHelp(ctx: Context): Promise<void> {
     const message = [
         "PEPEPOW Trade Bot Help",
         "",
-        "Main Commands:",
-        "• /dca - Set up Dollar-Cost Averaging",
-        "• /grid - Set up Grid trading",
-        "• /mm - Set up Market Making",
+        "Main menu commands:",
+        "• /start - Open main menu",
+        "• /strategy - Strategy menu",
+        "• /status - Unified status (strategy + DevMM)",
+        "• /report - Period + exchange report",
+        "• /stop - Stop strategies by exchange",
+        "• /key - Key shortcuts (/keys, /keys_status, /keys_clear)",
         "• /price - Check current prices",
-        "• /strategy_status - View all active strategies",
-        "• /keys - Configure exchange API keys",
-        "• /keys_status - Check API key status",
+        "• /donate - Donation address",
         "",
-        "Strategy Control:",
-        "• /dca_start, /dca_stop - Start/stop DCA",
-        "• /grid_start, /grid_stop - Start/stop GRID",
-        "• /mm_start, /mm_stop - Start/stop MM",
-        "",
-        "DevMM (Dev Fee Market Making):",
-        "• /devmm - Start/stop DevMM wizard",
-        "• /devmm_status - View status (all exchanges)",
-        "• /devmm_report - View trading report",
+        "Strategy wizards:",
+        "• /dca, /grid, /mm, /devmm",
+        "• Legacy alias: /strategy_status, /devmm_status, /devmm_report",
         "",
         "Security recommendations:",
         "• Use trade-only API keys (no withdrawal permission)",
@@ -77,8 +45,9 @@ export async function handleHelp(ctx: Context): Promise<void> {
         "• Dex-Trade (PEPEW/USDT)",
         "• NestEx (PEPEW/USDT)",
         "",
-        "Use /donate to support development!",
+        `Donate Address: ${DONATE_ADDRESS}`,
     ].join("\n");
 
     await safeSend(ctx, { step: "help", text: message });
+    await sendMainMenu(ctx);
 }
