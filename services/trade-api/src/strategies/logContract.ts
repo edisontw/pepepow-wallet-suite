@@ -1,5 +1,6 @@
 import { normalizeExchangeId, getExchangeSpec } from "../registry/exchanges.js";
 import { parsePair } from "../registry/pairs.js";
+import { tradeLog } from "../lib/tradeLogger.js";
 
 export function logStrategyTickContract(params: {
     strategyId: number | string;
@@ -34,21 +35,28 @@ export function logStrategyTickContract(params: {
         // keep incoming values for diagnostics
     }
 
-    console.log(
-        JSON.stringify({
-            strategyId: String(params.strategyId),
-            strategyType: params.strategyType,
-            requestedExchangeId: params.requestedExchangeId,
-            normalizedExchangeId,
-            resolvedExchangeId,
-            adapterKey,
-            canonicalPair,
-            exchangeSymbol: params.exchangeSymbol,
-            balanceTs: params.balanceTs ?? null,
-            balanceStalenessMs: params.balanceStalenessMs ?? null,
-            bestBid: params.bestBid ?? null,
-            bestAsk: params.bestAsk ?? null,
-            guards: params.guards || [],
-        })
-    );
+    const payload = {
+        strategyId: String(params.strategyId),
+        strategyType: params.strategyType,
+        requestedExchangeId: params.requestedExchangeId,
+        normalizedExchangeId,
+        resolvedExchangeId,
+        adapterKey,
+        canonicalPair,
+        exchangeSymbol: params.exchangeSymbol,
+        balanceTs: params.balanceTs ?? null,
+        balanceStalenessMs: params.balanceStalenessMs ?? null,
+        bestBid: params.bestBid ?? null,
+        bestAsk: params.bestAsk ?? null,
+        guards: params.guards || [],
+    };
+    tradeLog({
+        scope: "logContract",
+        level: "debug",
+        strategyId: params.strategyId,
+        exchange: normalizedExchangeId,
+        message: JSON.stringify(payload),
+        throttleKey: `logContract:${params.strategyType}:${params.strategyId}`,
+        throttleSec: 30,
+    });
 }

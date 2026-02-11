@@ -1,5 +1,6 @@
 import { Context, InlineKeyboard } from "grammy";
 import { ApiError, setDcaConfig, startDca, stopDca, getDcaStatus, cancelStrategyOrders } from "../api.js";
+import { renderMenu } from "../utils/menu.js";
 import { logTelegramError, safeSend } from "../utils/telegram.js";
 import { safeLower } from "../utils/strings.js";
 import {
@@ -199,7 +200,11 @@ export async function handleDca(ctx: Context): Promise<void> {
         .text("Dex-Trade", buildCallbackData("exchange", "dextrade"))
         .text("NestEx", buildCallbackData("exchange", "nestex"));
 
-    await safeSend(ctx, { step: "dca.exchange", text: "⚙️ Select exchange for DCA:", replyMarkup: keyboard });
+    await safeSend(ctx, {
+        step: "dca.exchange",
+        text: renderMenu("🏦 Select Exchange", "DCA setup\nNonKYC / Dex-Trade / NestEx"),
+        replyMarkup: keyboard,
+    });
 }
 
 export async function handleDcaSet(ctx: Context): Promise<void> {
@@ -717,7 +722,7 @@ export async function handleDcaCallback(ctx: Context): Promise<boolean> {
 
         await safeSend(ctx, {
             step: "dca_wizard.pair",
-            text: `Select pair for ${exchangeLabel(exchange)}:`,
+            text: renderMenu("🧩 Select Pair", `Exchange: ${exchangeLabel(exchange)}`),
             replyMarkup: keyboard,
         });
         await ctx.answerCallbackQuery();

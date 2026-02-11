@@ -1,22 +1,22 @@
 import { Context } from "grammy";
 import { safeSend } from "../utils/telegram.js";
+import { sendMainMenu } from "./mainMenu.js";
 
 const DONATE_ADDRESS =
     process.env.DONATE_ADDRESS ||
     process.env.TRADE_DONATE_ADDRESS ||
-    "PDep1ZNhCyqyRwjnQif8K6tPGsE7TvhyT6";
+    "PL8s5WjXUGhHVSo743dwEXGtsifV5YpdcD";
 
 export async function handleDonate(ctx: Context): Promise<void> {
     const message = [
-        "🎁 Support PEPEPOW Development",
+        "💖 Donation",
+        "──────────",
+        "Donation Address:",
+        `(PEPEW) ${DONATE_ADDRESS}`,
         "",
-        "Thank you for considering a donation!",
-        "",
-        "PEPEW Donate Address:",
-        `${DONATE_ADDRESS}`,
-        "",
-        "Your support helps keep this bot running and free for everyone!",
+        "⚠️ Only send PEPEW to this address",
     ].join("\n");
 
     await safeSend(ctx, { step: "donate", text: message });
+    await sendMainMenu(ctx);
 }

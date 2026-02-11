@@ -4,6 +4,7 @@ import { getNestExBalances } from "../exchanges/nestex.js";
 import { normalizeBalance } from "../balances/normalizeBalance.js";
 import { ExchangeName } from "./markets.js";
 import { BalanceSnapshot, ExchangeId } from "../registry/types.js";
+import { tradeLog } from "./tradeLogger.js";
 
 export interface NormalizedBalance {
     ok: boolean;
@@ -104,7 +105,14 @@ export async function getNormalizedBalances(
                 source: "cached",
                 stalenessMs,
             };
-            console.log(`[balance] BALANCE_CACHED_HIT exchangeId=${exchange} stalenessMs=${stalenessMs}`);
+            tradeLog({
+                scope: "balance",
+                level: "debug",
+                exchange,
+                message: `BALANCE_CACHED_HIT stalenessMs=${stalenessMs}`,
+                throttleKey: `balance:cached:${exchange}`,
+                throttleSec: 30,
+            });
             return fromSnapshot(snapshot);
         }
     }
@@ -137,9 +145,14 @@ export async function getNormalizedBalances(
             const nextFailCount = failCount + 1;
             const canUseCached = !!before?.snapshot && !!lastOkTs && (now - lastOkTs) < STALE_OK_MS;
             const action = canUseCached ? "USE_CACHED" : "HARD_FAIL";
-            console.warn(
-                `[balance] BALANCE_LIVE_FAIL exchangeId=${exchange} errCode=${code} httpStatus=${fetchResult.status ?? "n/a"} failCount=${nextFailCount} lastOkAgeSec=${lastOkAgeSec ?? "n/a"} action=${action}`
-            );
+            tradeLog({
+                scope: "balance",
+                level: "warn",
+                exchange,
+                message: `BALANCE_LIVE_FAIL errCode=${code} httpStatus=${fetchResult.status ?? "n/a"} failCount=${nextFailCount} lastOkAgeSec=${lastOkAgeSec ?? "n/a"} action=${action}`,
+                throttleKey: `balance:live-fail:${exchange}:${code}:${action}`,
+                throttleSec: 30,
+            });
 
             if (canUseCached && before?.snapshot) {
                 balanceCache.set(cacheKey, {
@@ -171,7 +184,14 @@ export async function getNormalizedBalances(
                 stalenessMs: 0,
                 ts: now,
             });
-            console.log(`[balance] BALANCE_LIVE_OK exchangeId=${exchange}`);
+            tradeLog({
+                scope: "balance",
+                level: "info",
+                exchange,
+                message: "BALANCE_LIVE_OK",
+                throttleKey: `balance:live-ok:${exchange}`,
+                throttleSec: 30,
+            });
             balanceCache.set(cacheKey, {
                 snapshot,
                 lastOkTs: now,
@@ -190,9 +210,14 @@ export async function getNormalizedBalances(
             const nextFailCount = failCount + 1;
             const canUseCached = !!before?.snapshot && !!lastOkTs && (now - lastOkTs) < STALE_OK_MS;
             const action = canUseCached ? "USE_CACHED" : "HARD_FAIL";
-            console.warn(
-                `[balance] BALANCE_LIVE_FAIL exchangeId=${exchange} errCode=${code} httpStatus=n/a failCount=${nextFailCount} lastOkAgeSec=${lastOkAgeSec ?? "n/a"} action=${action}`
-            );
+            tradeLog({
+                scope: "balance",
+                level: "warn",
+                exchange,
+                message: `BALANCE_LIVE_FAIL errCode=${code} httpStatus=n/a failCount=${nextFailCount} lastOkAgeSec=${lastOkAgeSec ?? "n/a"} action=${action}`,
+                throttleKey: `balance:live-fail:${exchange}:${code}:${action}`,
+                throttleSec: 30,
+            });
             if (canUseCached && before?.snapshot) {
                 balanceCache.set(cacheKey, {
                     snapshot: before.snapshot,

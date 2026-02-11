@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import { normalizePairSymbol } from "./lib/markets.js";
+import { tradeAuditLog } from "./lib/tradeLogger.js";
 
 const dbPath = process.env.TRADE_DB_PATH || path.join(process.cwd(), "trade.db");
 
@@ -138,6 +139,31 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_trade_strategy_event_config
   ON trade_strategy_event(config_id, ts);
 
+  CREATE TABLE IF NOT EXISTS trade_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    strategy_id TEXT NOT NULL,
+    strategy_type TEXT NOT NULL,
+    exchange TEXT NOT NULL,
+    pair TEXT NOT NULL,
+    action TEXT NOT NULL,
+    side TEXT,
+    price REAL,
+    qty REAL,
+    order_id TEXT,
+    reason TEXT,
+    latency_ms INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_trade_audit_ts
+  ON trade_audit(ts);
+
+  CREATE INDEX IF NOT EXISTS idx_trade_audit_strategy_ts
+  ON trade_audit(strategy_id, ts);
+
+  CREATE INDEX IF NOT EXISTS idx_trade_audit_action_ts
+  ON trade_audit(action, ts);
+
   CREATE TABLE IF NOT EXISTS exchange_key (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tg_user_id TEXT NOT NULL,
@@ -223,6 +249,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS devmm_state (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     exchange TEXT NOT NULL,
+    symbol TEXT NOT NULL DEFAULT 'PEPEW/USDT',
     status TEXT NOT NULL DEFAULT 'STOPPED',
     pause_reason TEXT,
     last_action TEXT,
@@ -532,6 +559,24 @@ export interface StrategyEvent {
     message: string;
 }
 
+export type TradeAuditAction = "place" | "cancel" | "fill" | "skip" | "error";
+
+export interface TradeAuditRecord {
+    id: number;
+    ts: number;
+    strategy_id: string;
+    strategy_type: string;
+    exchange: string;
+    pair: string;
+    action: TradeAuditAction;
+    side: string | null;
+    price: number | null;
+    qty: number | null;
+    order_id: string | null;
+    reason: string | null;
+    latency_ms: number | null;
+}
+
 export interface StrategyFailure {
     id: number;
     config_id: number;
@@ -824,6 +869,111 @@ export function updateStrategyParams(configId: number, paramsJson: string): void
     ).run(paramsJson, now, configId);
 }
 
+function normalizeAuditAction(action: string): TradeAuditAction {
+    const normalized = String(action || "").trim().toLowerCase();
+    if (normalized === "place" || normalized === "cancel" || normalized === "fill" || normalized === "skip" || normalized === "error") {
+        return normalized;
+    }
+    return "error";
+}
+
+function normalizeAuditReason(reason?: string | null): string | null {
+    if (reason === null || reason === undefined) return null;
+    const text = String(reason).trim();
+    if (!text) return null;
+    return text.slice(0, 160);
+}
+
+export function getTradeAuditRetentionDays(): number {
+    const parsed = Number(process.env.TRADE_AUDIT_RETENTION_DAYS || 60);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 60;
+    return Math.floor(parsed);
+}
+
+export function insertTradeAudit(params: {
+    ts?: number;
+    strategyId: string | number;
+    strategyType: string;
+    exchange: string;
+    pair: string;
+    action: TradeAuditAction | string;
+    side?: string | null;
+    price?: number | null;
+    qty?: number | null;
+    orderId?: string | null;
+    reason?: string | null;
+    latencyMs?: number | null;
+}): TradeAuditRecord {
+    const ts = Number.isFinite(params.ts as number) ? Number(params.ts) : Date.now();
+    const action = normalizeAuditAction(params.action);
+    const result = db.prepare(`
+        INSERT INTO trade_audit
+        (ts, strategy_id, strategy_type, exchange, pair, action, side, price, qty, order_id, reason, latency_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        ts,
+        String(params.strategyId),
+        String(params.strategyType || "UNKNOWN").toUpperCase(),
+        String(params.exchange || "unknown"),
+        String(params.pair || "unknown"),
+        action,
+        params.side ? String(params.side).toUpperCase() : null,
+        Number.isFinite(params.price as number) ? Number(params.price) : null,
+        Number.isFinite(params.qty as number) ? Number(params.qty) : null,
+        params.orderId ? String(params.orderId) : null,
+        normalizeAuditReason(params.reason),
+        Number.isFinite(params.latencyMs as number) ? Number(params.latencyMs) : null
+    );
+
+    const record: TradeAuditRecord = {
+        id: result.lastInsertRowid as number,
+        ts,
+        strategy_id: String(params.strategyId),
+        strategy_type: String(params.strategyType || "UNKNOWN").toUpperCase(),
+        exchange: String(params.exchange || "unknown"),
+        pair: String(params.pair || "unknown"),
+        action,
+        side: params.side ? String(params.side).toUpperCase() : null,
+        price: Number.isFinite(params.price as number) ? Number(params.price) : null,
+        qty: Number.isFinite(params.qty as number) ? Number(params.qty) : null,
+        order_id: params.orderId ? String(params.orderId) : null,
+        reason: normalizeAuditReason(params.reason),
+        latency_ms: Number.isFinite(params.latencyMs as number) ? Number(params.latencyMs) : null,
+    };
+
+    tradeAuditLog({
+        scope: "trade-audit",
+        strategyId: record.strategy_id,
+        exchange: record.exchange,
+        message: `action=${record.action} strategyType=${record.strategy_type} pair=${record.pair} side=${record.side || "n/a"} price=${record.price ?? "n/a"} qty=${record.qty ?? "n/a"} orderId=${record.order_id || "n/a"} reason=${record.reason || "n/a"}`,
+    });
+
+    return record;
+}
+
+export function cleanupTradeAudit(olderThanDays = getTradeAuditRetentionDays()): number {
+    const days = Number.isFinite(olderThanDays) && olderThanDays > 0 ? Math.floor(olderThanDays) : getTradeAuditRetentionDays();
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const result = db.prepare("DELETE FROM trade_audit WHERE ts < ?").run(cutoff);
+    return result.changes;
+}
+
+export function checkpointWal(mode: "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE" = "TRUNCATE"): {
+    busy: number;
+    log: number;
+    checkpointed: number;
+} {
+    const normalizedMode = String(mode || "TRUNCATE").toUpperCase() as "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE";
+    const row = db.prepare(`PRAGMA wal_checkpoint(${normalizedMode})`).get() as
+        | { busy?: number; log?: number; checkpointed?: number }
+        | undefined;
+    return {
+        busy: Number(row?.busy || 0),
+        log: Number(row?.log || 0),
+        checkpointed: Number(row?.checkpointed || 0),
+    };
+}
+
 export function insertStrategyOrder(params: {
     configId: number;
     tgUserId: string;
@@ -862,7 +1012,7 @@ export function insertStrategyOrder(params: {
         now
     );
 
-    return {
+    const created: StrategyOrder = {
         id: result.lastInsertRowid as number,
         config_id: params.configId,
         tg_user_id: params.tgUserId,
@@ -880,28 +1030,121 @@ export function insertStrategyOrder(params: {
         created_at: now,
         updated_at: now,
     };
+
+    insertTradeAudit({
+        ts: now,
+        strategyId: params.configId,
+        strategyType: params.strategy,
+        exchange: params.exchange,
+        pair: params.pair,
+        action: "place",
+        side: params.side,
+        price: params.price,
+        qty: params.qty,
+        orderId: params.exchangeOrderId ?? params.clientOrderId ?? String(created.id),
+        reason: params.status || "OPEN",
+    });
+
+    return created;
 }
 
 export function updateStrategyOrderStatus(orderId: number, status: string): void {
     const now = Date.now();
+    const existing = db.prepare(
+        "SELECT * FROM trade_strategy_order WHERE id = ?"
+    ).get(orderId) as StrategyOrder | undefined;
+
     db.prepare(
         "UPDATE trade_strategy_order SET status = ?, updated_at = ? WHERE id = ?"
     ).run(status, now, orderId);
+
+    if (!existing) return;
+
+    const normalized = String(status || "").toUpperCase();
+    if (normalized.includes("CANCEL")) {
+        insertTradeAudit({
+            ts: now,
+            strategyId: existing.config_id,
+            strategyType: existing.strategy,
+            exchange: existing.exchange,
+            pair: existing.pair,
+            action: "cancel",
+            side: existing.side,
+            price: existing.price,
+            qty: existing.qty,
+            orderId: existing.exchange_order_id ?? existing.client_order_id ?? String(orderId),
+            reason: normalized,
+        });
+    } else if (normalized === "FILLED") {
+        insertTradeAudit({
+            ts: now,
+            strategyId: existing.config_id,
+            strategyType: existing.strategy,
+            exchange: existing.exchange,
+            pair: existing.pair,
+            action: "fill",
+            side: existing.side,
+            price: existing.price,
+            qty: existing.qty,
+            orderId: existing.exchange_order_id ?? existing.client_order_id ?? String(orderId),
+            reason: normalized,
+        });
+    }
 }
 
 export function cancelOpenStrategyOrders(configId: number): number {
     const now = Date.now();
+    const openOrders = db.prepare(
+        "SELECT * FROM trade_strategy_order WHERE config_id = ? AND status = 'OPEN'"
+    ).all(configId) as StrategyOrder[];
+
     const result = db.prepare(
         "UPDATE trade_strategy_order SET status = 'CANCELED', updated_at = ? WHERE config_id = ? AND status = 'OPEN'"
     ).run(now, configId);
+
+    for (const order of openOrders) {
+        insertTradeAudit({
+            ts: now,
+            strategyId: order.config_id,
+            strategyType: order.strategy,
+            exchange: order.exchange,
+            pair: order.pair,
+            action: "cancel",
+            side: order.side,
+            price: order.price,
+            qty: order.qty,
+            orderId: order.exchange_order_id ?? order.client_order_id ?? String(order.id),
+            reason: "CANCELED",
+        });
+    }
+
     return result.changes;
 }
 
 export function cancelOpenGridOrders(configId: number): number {
     const now = Date.now();
+    const openOrders = db.prepare(
+        "SELECT * FROM grid_order WHERE config_id = ? AND status = 'OPEN'"
+    ).all(configId) as GridOrder[];
+
     const result = db.prepare(
         "UPDATE grid_order SET status = 'CANCELLED', updated_at = ? WHERE config_id = ? AND status = 'OPEN'"
     ).run(now, configId);
+
+    for (const order of openOrders) {
+        insertTradeAudit({
+            ts: now,
+            strategyId: order.config_id,
+            strategyType: "GRID",
+            exchange: order.exchange,
+            pair: order.pair,
+            action: "cancel",
+            side: order.side,
+            orderId: order.order_id,
+            reason: "CANCELLED",
+        });
+    }
+
     return result.changes;
 }
 
@@ -933,7 +1176,7 @@ export function insertStrategyFill(params: {
         VALUES (?, ?, ?, ?, ?, ?)
     `).run(params.orderId, params.configId, params.price, params.qty, params.fee ?? null, ts);
 
-    return {
+    const fill = {
         id: result.lastInsertRowid as number,
         order_id: params.orderId,
         config_id: params.configId,
@@ -942,6 +1185,28 @@ export function insertStrategyFill(params: {
         fee: params.fee ?? null,
         ts,
     };
+
+    const order = db.prepare(
+        "SELECT * FROM trade_strategy_order WHERE id = ?"
+    ).get(params.orderId) as StrategyOrder | undefined;
+
+    if (order) {
+        insertTradeAudit({
+            ts,
+            strategyId: order.config_id,
+            strategyType: order.strategy,
+            exchange: order.exchange,
+            pair: order.pair,
+            action: "fill",
+            side: order.side,
+            price: params.price,
+            qty: params.qty,
+            orderId: order.exchange_order_id ?? order.client_order_id ?? String(order.id),
+            reason: "FILL",
+        });
+    }
+
+    return fill;
 }
 
 export function insertStrategyEvent(params: {
@@ -1008,9 +1273,42 @@ export function insertGridOrder(params: {
 
 export function updateGridOrderStatus(orderId: string, status: string): void {
     const now = Date.now();
+    const existing = db.prepare(
+        "SELECT * FROM grid_order WHERE order_id = ? LIMIT 1"
+    ).get(orderId) as GridOrder | undefined;
+
     db.prepare(
         "UPDATE grid_order SET status = ?, updated_at = ? WHERE order_id = ?"
     ).run(status, now, orderId);
+
+    if (!existing) return;
+
+    const normalized = String(status || "").toUpperCase();
+    if (normalized === "FILLED") {
+        insertTradeAudit({
+            ts: now,
+            strategyId: existing.config_id,
+            strategyType: "GRID",
+            exchange: existing.exchange,
+            pair: existing.pair,
+            action: "fill",
+            side: existing.side,
+            orderId,
+            reason: "FILLED",
+        });
+    } else if (normalized.includes("CANCEL")) {
+        insertTradeAudit({
+            ts: now,
+            strategyId: existing.config_id,
+            strategyType: "GRID",
+            exchange: existing.exchange,
+            pair: existing.pair,
+            action: "cancel",
+            side: existing.side,
+            orderId,
+            reason: normalized,
+        });
+    }
 }
 
 export function getOpenGridOrders(configId: number): GridOrder[] {
@@ -1972,7 +2270,18 @@ export function getDevmmReport(exchange: DevmmExchange, periodType: "daily" | "w
     const exchangeKey = normalizeDevmmExchangeKey(exchange);
 
     const rows = db.prepare(`
-        SELECT UPPER(TRIM(side)) as side, SUM(quote_usdt) as total_quote, SUM(qty_pepew) as total_qty, SUM(fee_usdt) as total_fee, COUNT(*) as cnt
+        SELECT
+            UPPER(TRIM(side)) as side,
+            SUM(
+                CASE
+                    WHEN price IS NOT NULL AND price > 0 AND qty_pepew IS NOT NULL AND qty_pepew > 0
+                    THEN (price * qty_pepew)
+                    ELSE quote_usdt
+                END
+            ) as total_quote,
+            SUM(qty_pepew) as total_qty,
+            SUM(fee_usdt) as total_fee,
+            COUNT(*) as cnt
         FROM devmm_fills
         WHERE LOWER(TRIM(exchange)) = ? AND ${bucketColumn} = ? AND COALESCE(trade_id, '') != 'ASSUMED_VISIBILITY_TIMEOUT'
         GROUP BY UPPER(TRIM(side))

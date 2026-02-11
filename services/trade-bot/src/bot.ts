@@ -39,6 +39,7 @@ import {
     handleStrategyStatus,
     handleDevmmStatusAlias,
     handleStatus,
+    handleDebug,
 } from "./commands/strategy.js";
 import {
     handleKeys,
@@ -47,7 +48,7 @@ import {
     handleKeysCallback,
     handleKeysTextInput,
 } from "./commands/keys.js";
-import { handleMainMenuCallback } from "./commands/menu.js";
+import { handleMainMenuCallback, handleMainMenuText } from "./commands/menu.js";
 import { handleReport, handleReportCallback, handleDevmmReportAlias } from "./commands/report.js";
 import { handleStop, handleStopCallback } from "./commands/stop.js";
 import { handleKey, handleKeyCallback } from "./commands/key.js";
@@ -93,6 +94,7 @@ bot.command("devmm", handleDevmm);
 bot.command("devmm_start", handleDevmmStart);
 bot.command("devmm_stop", handleDevmmStop);
 bot.command("status", handleStatus);
+bot.command("debug", handleDebug);
 bot.command("strategy_status", handleStrategyStatus);
 bot.command("devmm_status", handleDevmmStatusAlias);
 bot.command("report", handleReport);
@@ -131,6 +133,7 @@ bot.on("callback_query:data", async (ctx) => {
 });
 
 bot.on("message:text", async (ctx) => {
+    if (await handleMainMenuText(ctx)) return;
     if (await handleKeysTextInput(ctx)) return;
     if (await handleDcaTextInput(ctx)) return;
     if (await handleGridTextInput(ctx)) return;

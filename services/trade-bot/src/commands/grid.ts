@@ -1,5 +1,6 @@
 import { Context, InlineKeyboard } from "grammy";
 import { ApiError, enableStrategyConfig, disableStrategyConfig, getStrategyStatus, upsertStrategyConfig, getKeysStatus, checkStrategyFunds, cancelStrategyOrders } from "../api.js";
+import { renderMenu } from "../utils/menu.js";
 import { logTelegramError, safeSend } from "../utils/telegram.js";
 import { ExchangeName, formatPairDisplay, formatPairLabel, getAllowedPairs } from "../lib/markets.js";
 import { getRegistryPromptHelpers } from "../lib/registryPrompt.js";
@@ -193,7 +194,11 @@ export async function handleGrid(ctx: Context): Promise<void> {
         .text("Dex-Trade", buildCallbackData("exchange", "dextrade"))
         .text("NestEx", buildCallbackData("exchange", "nestex"));
 
-    await safeSend(ctx, { step: "grid.exchange", text: "⚙️ Select exchange for GRID:", replyMarkup: keyboard });
+    await safeSend(ctx, {
+        step: "grid.exchange",
+        text: renderMenu("🏦 Select Exchange", "GRID setup\nNonKYC / Dex-Trade / NestEx"),
+        replyMarkup: keyboard,
+    });
 }
 
 export async function handleGridStart(ctx: Context): Promise<void> {
@@ -383,7 +388,11 @@ export async function handleGridCallback(ctx: Context): Promise<boolean> {
             keyboard.text(label, buildCallbackData("pair", pair.symbol)).row();
         });
 
-        await safeSend(ctx, { step: "grid.pair", text: "Select pair for GRID:", replyMarkup: keyboard });
+        await safeSend(ctx, {
+            step: "grid.pair",
+            text: renderMenu("🧩 Select Pair", "GRID pair selection"),
+            replyMarkup: keyboard,
+        });
         await safeAnswerCallbackQuery(ctx, "grid.cb.exchange");
         return true;
     }

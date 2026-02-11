@@ -4,7 +4,7 @@ import { Buffer } from "buffer";
 import { useTranslation } from "react-i18next";
 import { addressToScript, buildAndSignP2PKH, selectUtxos, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
 import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS, withAddress } from "../lib/api";
-import { broadcastTx, fetchRawTx, TxApiError } from "../lib/tx";
+import { broadcastTx, fetchRawTx, isTransientRawTxError, TxApiError } from "../lib/tx";
 import { fmtPEPEWFromSats, satsToCoin } from "../lib/format";
 import { triggerRefresh } from "../lib/refresh";
 import { hasPendingSpendTxid, recordPendingSpend } from "../lib/pending";
@@ -28,6 +28,31 @@ type ConsolidationPreview = {
   estimatedBytes: number;
 };
 
+type RawTxBatchFailure = {
+  txid: string;
+  error: string;
+  requestId?: string;
+  code?: string;
+  status?: number;
+};
+
+type RawTxBatchResult = {
+  ok: Array<{ txid: string; rawTx: string }>;
+  failed: RawTxBatchFailure[];
+  fromCache: number;
+  total: number;
+  durationMs: number;
+};
+
+type RawTxRetryContext = {
+  mode: "send" | "consolidate";
+  failedTxids: string[];
+  succeeded: number;
+  failed: number;
+  total: number;
+  requestIds: string[];
+};
+
 const DEFAULT_PATH = "m/44'/5'/0'/0/0";
 const COIN_MULTIPLIER = 100000000n;
 const MIN_SEND_SATS = 100000000;
@@ -39,6 +64,9 @@ const SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
 const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g;
 const LAST_RAWTX_KEY = "pepew_last_broadcast";
 const LAST_RAWTX_TTL_MS = 2 * 60 * 1000;
+const RAWTX_BATCH_CONCURRENCY = 4;
+const RAWTX_BATCH_RETRIES = 1;
+const RAWTX_RETRY_BACKOFF_MS = [200, 500];
 
 function parseCoinToSats(value: string) {
   const trimmed = value.trim();
@@ -192,11 +220,13 @@ export default function Send() {
   const [consolidating, setConsolidating] = useState(false);
   const [consolidateOpen, setConsolidateOpen] = useState(false);
   const [consolidatePreview, setConsolidatePreview] = useState<ConsolidationPreview | null>(null);
+  const [rawTxRetryContext, setRawTxRetryContext] = useState<RawTxRetryContext | null>(null);
   const [walletState, setWalletState] = useState<WalletState>(walletStore.getState());
   const resolveSeq = useRef(0);
   const mountedRef = useRef(true);
   const sendInFlightRef = useRef(false);
   const consolidateInFlightRef = useRef(false);
+  const rawTxCacheRef = useRef<Map<string, string>>(new Map());
   const lastSuccessSnapshotRef = useRef<{
     to: string;
     amount: string;
@@ -224,6 +254,7 @@ export default function Send() {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      rawTxCacheRef.current.clear();
     };
   }, []);
 
@@ -553,6 +584,7 @@ export default function Send() {
     setConsolidating(false);
     setConsolidateOpen(false);
     setConsolidatePreview(null);
+    setRawTxRetryContext(null);
     setTo("");
     setAmount("");
     setSubtractFee(false);
@@ -605,6 +637,163 @@ export default function Send() {
     }
     return null;
   };
+
+  const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+
+  const shouldOfferFailedOnlyRetry = (failed: number, total: number) => {
+    if (failed <= 1) return true;
+    if (total <= 0) return false;
+    return failed / total <= 0.1;
+  };
+
+  const summarizeRawTxBatchError = (result: RawTxBatchResult) => {
+    const requestIds = Array.from(new Set(
+      result.failed
+        .map((item) => item.requestId)
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+    ));
+    const requestIdSummary = requestIds.length ? requestIds.slice(0, 3).join(", ") : "-";
+    const failed = result.failed.length;
+    const total = result.total;
+    const timeoutLike = result.failed.some((item) =>
+      item.status === 504
+      || item.code === "UPSTREAM_TIMEOUT"
+      || item.code === "RPC_TIMEOUT"
+      || item.code === "INDEXER_TIMEOUT"
+      || /timeout/i.test(item.error)
+    );
+    const firstNotFound = result.failed.find((item) => item.status === 404);
+
+    if (failed === 1 && firstNotFound) {
+      const notFoundMessage = t("send.errors.txRawNotFound", { txid: firstNotFound.txid });
+      return {
+        message: requestIds.length ? `${notFoundMessage}. request-id: ${requestIds[0]}` : notFoundMessage,
+        requestIds,
+      };
+    }
+    if (timeoutLike && shouldOfferFailedOnlyRetry(failed, total)) {
+      return {
+        message: t("send.errors.txRawBatchPartialTimeout", { failed, total, requestIds: requestIdSummary }),
+        requestIds,
+      };
+    }
+    if (timeoutLike) {
+      return {
+        message: t("send.errors.txRawBatchManyTimeout", { failed, total, requestIds: requestIdSummary }),
+        requestIds,
+      };
+    }
+    if (shouldOfferFailedOnlyRetry(failed, total)) {
+      return {
+        message: t("send.errors.txRawBatchPartialFailed", { failed, total, requestIds: requestIdSummary }),
+        requestIds,
+      };
+    }
+    return {
+      message: t("send.errors.txRawBatchManyFailed", { failed, total, requestIds: requestIdSummary }),
+      requestIds,
+    };
+  };
+
+  const fetchRawTxWithRetry = useCallback(async (txid: string) => {
+    const cached = rawTxCacheRef.current.get(txid);
+    if (cached) {
+      return { txid, rawTx: cached, fromCache: true, attempts: 0 };
+    }
+
+    let attempt = 0;
+    while (attempt <= RAWTX_BATCH_RETRIES) {
+      attempt += 1;
+      try {
+        const rawTx = await fetchRawTx(txid);
+        rawTxCacheRef.current.set(txid, rawTx);
+        return { txid, rawTx, fromCache: false, attempts: attempt };
+      } catch (err: any) {
+        const willRetry = isTransientRawTxError(err) && attempt <= RAWTX_BATCH_RETRIES;
+        if (debugEnabled) {
+          console.warn("[rawtx-batch] fetch attempt failed", {
+            txid,
+            attempt,
+            willRetry,
+            status: err instanceof TxApiError ? err.status : undefined,
+            code: err instanceof TxApiError ? err.code : undefined,
+            requestId: err instanceof TxApiError ? err.requestId : undefined,
+            error: err instanceof TxApiError ? (err.detail || err.message) : (err?.message || String(err))
+          });
+        }
+        if (!willRetry) throw err;
+        const backoffMs = RAWTX_RETRY_BACKOFF_MS[Math.min(attempt - 1, RAWTX_RETRY_BACKOFF_MS.length - 1)];
+        await sleep(backoffMs);
+      }
+    }
+
+    throw new Error(`rawtx fetch retries exhausted: ${txid}`);
+  }, [debugEnabled]);
+
+  const fetchRawTxBatch = useCallback(async (txids: string[]): Promise<RawTxBatchResult> => {
+    const uniqueTxids = Array.from(new Set(txids.filter(Boolean)));
+    const startedAt = Date.now();
+    if (!uniqueTxids.length) {
+      return { ok: [], failed: [], fromCache: 0, total: 0, durationMs: 0 };
+    }
+
+    const ok: Array<{ txid: string; rawTx: string }> = [];
+    const failed: RawTxBatchFailure[] = [];
+    let fromCache = 0;
+    let nextIndex = 0;
+    const workerCount = Math.min(RAWTX_BATCH_CONCURRENCY, uniqueTxids.length);
+
+    if (debugEnabled) {
+      console.info("[rawtx-batch] start", {
+        total: uniqueTxids.length,
+        concurrency: workerCount,
+        retries: RAWTX_BATCH_RETRIES
+      });
+    }
+
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (nextIndex < uniqueTxids.length) {
+        const current = nextIndex;
+        nextIndex += 1;
+        const txid = uniqueTxids[current];
+        try {
+          const fetched = await fetchRawTxWithRetry(txid);
+          if (fetched.fromCache) fromCache += 1;
+          ok.push({ txid, rawTx: fetched.rawTx });
+        } catch (err: any) {
+          const errorText = err instanceof TxApiError ? (err.detail || err.message) : (err?.message || String(err));
+          failed.push({
+            txid,
+            error: errorText,
+            requestId: err instanceof TxApiError ? err.requestId : undefined,
+            code: err instanceof TxApiError ? err.code : undefined,
+            status: err instanceof TxApiError ? err.status : undefined,
+          });
+        }
+      }
+    });
+
+    await Promise.all(workers);
+    const durationMs = Date.now() - startedAt;
+
+    if (debugEnabled) {
+      console.info("[rawtx-batch] complete", {
+        total: uniqueTxids.length,
+        ok: ok.length,
+        failed: failed.length,
+        fromCache,
+        durationMs
+      });
+    }
+
+    return {
+      ok,
+      failed,
+      fromCache,
+      total: uniqueTxids.length,
+      durationMs
+    };
+  }, [debugEnabled, fetchRawTxWithRetry]);
 
   const prepareConsolidationPreview = () => {
     const st = walletStore.getState();
@@ -685,6 +874,7 @@ export default function Send() {
 
   const openConsolidateConfirm = () => {
     setErr(null);
+    setRawTxRetryContext(null);
     const preview = prepareConsolidationPreview();
     if (!preview) return;
     setConsolidatePreview(preview);
@@ -703,6 +893,7 @@ export default function Send() {
     consolidateInFlightRef.current = true;
     setConsolidating(true);
     setErr(null);
+    setRawTxRetryContext(null);
     setResult(null);
     setLastTxid(null);
     setSendStatusNote(null);
@@ -728,33 +919,46 @@ export default function Send() {
       }
 
       const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
+      // nonWitnessUtxo is required for each input; each txid fetch is independent, so bounded parallel fetch is safe.
+      const requiredTxids = preview.selected.map((u) => u.txid).filter((txid): txid is string => typeof txid === "string" && txid.length > 0);
+      const rawTxBatch = await fetchRawTxBatch(requiredTxids);
+      if (rawTxBatch.failed.length > 0) {
+        const summary = summarizeRawTxBatchError(rawTxBatch);
+        const canRetryFailedOnly = shouldOfferFailedOnlyRetry(rawTxBatch.failed.length, rawTxBatch.total);
+        if (canRetryFailedOnly) {
+          setRawTxRetryContext({
+            mode: "consolidate",
+            failedTxids: rawTxBatch.failed.map((item) => item.txid),
+            succeeded: rawTxBatch.ok.length,
+            failed: rawTxBatch.failed.length,
+            total: rawTxBatch.total,
+            requestIds: summary.requestIds,
+          });
+        } else {
+          setRawTxRetryContext(null);
+        }
+        setErr(summary.message);
+        return;
+      }
+
+      const rawTxByTxid = new Map(rawTxBatch.ok.map((item) => [item.txid, item.rawTx]));
       const inputs: ConsolidationInput[] = [];
       for (const u of preview.selected) {
         if (!u.txid || u.vout === undefined || !Number.isFinite(u.valueSats)) {
           console.error("[CONSOLIDATE_ASSERT] Invalid UTXO structure", u);
           throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
         }
-        try {
-          if (debugEnabled) console.info("[consolidate] fetching raw tx for signing", u.txid);
-          const hex = await fetchRawTx(u.txid);
-          if (!hex || typeof hex !== "string" || hex.length === 0) {
-            throw new Error(`fetchRawTx returned empty for ${u.txid}`);
-          }
-          inputs.push({
-            txid: u.txid,
-            vout: u.vout,
-            value: Number(u.valueSats),
-            nonWitnessUtxo: hex
-          });
-        } catch (e: any) {
-          console.error("[CONSOLIDATE_ASSERT] fetchRawTx failed", { txid: u.txid, error: e.message });
-          if (e instanceof TxApiError && e.status === 404) {
-            setErr(t("send.errors.txRawNotFound", { txid: u.txid }));
-          } else {
-            setErr(`${t("send.errors.txRawFailed", { txid: u.txid })}: ${e.message || String(e)}`);
-          }
+        const hex = rawTxByTxid.get(u.txid);
+        if (!hex || typeof hex !== "string" || hex.length === 0) {
+          setErr(t("send.errors.txRawFailed", { txid: u.txid }));
           return;
         }
+        inputs.push({
+          txid: u.txid,
+          vout: u.vout,
+          value: Number(u.valueSats),
+          nonWitnessUtxo: hex
+        });
       }
 
       const { rawTx, totalInSats, outputSats } = buildConsolidationTx({
@@ -874,6 +1078,7 @@ export default function Send() {
       setSendAttempted(true);
       setSending(true);
       setErr(null);
+      setRawTxRetryContext(null);
       setResult(null);
       setLastTxid(null);
       setSendStatusNote(null);
@@ -1010,6 +1215,31 @@ export default function Send() {
         }))
       });
 
+      // nonWitnessUtxo is required for each selected input; fetches are independent and can be parallelized.
+      const requiredTxids = picked
+        .map((u) => u.txid)
+        .filter((txid): txid is string => typeof txid === "string" && txid.length > 0);
+      const rawTxBatch = await fetchRawTxBatch(requiredTxids);
+      if (rawTxBatch.failed.length > 0) {
+        const summary = summarizeRawTxBatchError(rawTxBatch);
+        const canRetryFailedOnly = shouldOfferFailedOnlyRetry(rawTxBatch.failed.length, rawTxBatch.total);
+        if (canRetryFailedOnly) {
+          setRawTxRetryContext({
+            mode: "send",
+            failedTxids: rawTxBatch.failed.map((item) => item.txid),
+            succeeded: rawTxBatch.ok.length,
+            failed: rawTxBatch.failed.length,
+            total: rawTxBatch.total,
+            requestIds: summary.requestIds,
+          });
+        } else {
+          setRawTxRetryContext(null);
+        }
+        setErr(summary.message);
+        return;
+      }
+
+      const rawTxByTxid = new Map(rawTxBatch.ok.map((item) => [item.txid, item.rawTx]));
       const inputs = [];
       for (const u of picked) {
         // buildAndSignP2PKH requires nonWitnessUtxo (full raw tx) as hex string
@@ -1018,29 +1248,18 @@ export default function Send() {
           console.error("[SEND_ASSERT] Invalid UTXO structure", u);
           throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
         }
-
-        try {
-          if (debugEnabled) console.info("[send] fetching raw tx for signing", u.txid);
-          const hex = await fetchRawTx(u.txid);
-          if (!hex || typeof hex !== "string" || hex.length === 0) {
-            throw new Error(`fetchRawTx returned empty for ${u.txid}`);
-          }
-          // Pass hex string directly, NOT Buffer - buildAndSignP2PKH will convert it
-          inputs.push({
-            txid: u.txid,
-            vout: u.vout,
-            value: Number(u.amount || u.value),
-            nonWitnessUtxo: hex  // hex string, not Buffer
-          });
-        } catch (e: any) {
-          console.error("[SEND_ASSERT] fetchRawTx failed", { txid: u.txid, error: e.message });
-          if (e instanceof TxApiError && e.status === 404) {
-            setErr(t("send.errors.txRawNotFound", { txid: u.txid }));
-          } else {
-            setErr(`${t("send.errors.txRawFailed", { txid: u.txid })}: ${e.message || String(e)}`);
-          }
+        const hex = rawTxByTxid.get(u.txid);
+        if (!hex || typeof hex !== "string" || hex.length === 0) {
+          setErr(t("send.errors.txRawFailed", { txid: u.txid }));
           return;
         }
+        // Pass hex string directly, NOT Buffer - buildAndSignP2PKH will convert it
+        inputs.push({
+          txid: u.txid,
+          vout: u.vout,
+          value: Number(u.amount || u.value),
+          nonWitnessUtxo: hex  // hex string, not Buffer
+        });
       }
 
       if (debugEnabled) {
@@ -1192,6 +1411,16 @@ export default function Send() {
       setSending(false);
     }
   }
+
+  const retryFailedRawTxOnly = () => {
+    if (!rawTxRetryContext) return;
+    setErr(null);
+    if (rawTxRetryContext.mode === "send") {
+      void doSend();
+      return;
+    }
+    void doConsolidate();
+  };
 
   return (
     <AppLayout>
@@ -1368,6 +1597,24 @@ export default function Send() {
         </div>
 
         {err && <div className="error" style={{ marginTop: 12 }}>{err}</div>}
+        {err && rawTxRetryContext && (
+          <div className="row" style={{ marginTop: 8, alignItems: "center", gap: 8 }}>
+            <button
+              className="btn secondary"
+              onClick={retryFailedRawTxOnly}
+              disabled={sending || consolidating}
+            >
+              {t("send.retryFailedRawTx")}
+            </button>
+            <span className="muted">
+              {t("send.rawTxRetrySummary", {
+                ok: rawTxRetryContext.succeeded,
+                failed: rawTxRetryContext.failed,
+                total: rawTxRetryContext.total
+              })}
+            </span>
+          </div>
+        )}
         {result && (
           <div className="card" style={{ marginTop: 12 }}>
             <div>✅ {t("send.broadcasted")}: <code>{result}</code></div>

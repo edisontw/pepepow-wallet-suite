@@ -1,24 +1,25 @@
 import { Context, InlineKeyboard } from "grammy";
 import { safeSend } from "../utils/telegram.js";
+import { renderMenu } from "../utils/menu.js";
 import { handleKeys, handleKeysClear, handleKeysStatus } from "./keys.js";
-import { sendMainMenu } from "./mainMenu.js";
+import { sendMainMenu, withMenuNav } from "./mainMenu.js";
 
 function getTgUserId(ctx: Context): string {
     return String(ctx.from?.id || "");
 }
 
 function buildKeyMenuKeyboard(): InlineKeyboard {
-    return new InlineKeyboard()
+    return withMenuNav(new InlineKeyboard()
         .text("Set", "key:set")
         .text("Status", "key:status")
         .row()
-        .text("Clear", "key:clear");
+        .text("Clear", "key:clear"));
 }
 
 export async function handleKey(ctx: Context): Promise<void> {
     await safeSend(ctx, {
         step: "key.menu",
-        text: "Key shortcuts:",
+        text: renderMenu("🔑 API Key Shortcuts", "Choose what to manage:"),
         replyMarkup: buildKeyMenuKeyboard(),
     });
 }

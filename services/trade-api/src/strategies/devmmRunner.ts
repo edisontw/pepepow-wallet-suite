@@ -15,6 +15,7 @@ import {
     getDevmmState,
     getExchangeKey,
     incrementDevmmTurnover,
+    insertTradeAudit,
     insertDevmmFill,
     resetDevmmTurnover,
     setDevmmStatus,
@@ -28,6 +29,7 @@ import { ExchangeName } from "../lib/markets.js";
 import {
     createNonKycOrder,
     cancelNonKycOrder,
+    getNonKycOrderById,
     listNonKycOpenOrders,
 } from "../exchanges/nonkyc.js";
 import {
@@ -53,6 +55,7 @@ import {
     mapPauseReasonToIssueCode,
     mapSkipReasonToIssueCode,
 } from "./devmmCodes.js";
+import { tradeLog } from "../lib/tradeLogger.js";
 
 // Per-exchange lock to avoid overlapping ticks
 const runningExchanges = new Set<DevmmExchange>();
@@ -80,19 +83,59 @@ const DEVMM_BOOTSTRAP_ORDERS_PER_SIDE = 1;
 const DEVMM_BOOTSTRAP_BYPASS_DAILY_CAP =
     process.env.DEVMM_BOOTSTRAP_BYPASS_DAILY_CAP !== "0" && process.env.DEVMM_BOOTSTRAP_BYPASS_DAILY_CAP !== "false";
 const DEVMM_TARGET_MIN_ORDERS = Math.max(1, Number(process.env.DEVMM_TARGET_MIN_ORDERS || 2));
+const NESTEX_TARGET_NOTIONAL_USDT = 1;
 
 // Log control: avoid spamming on every tick
 const DEBUG_DEVMM = process.env.DEBUG_DEVMM === "1" || process.env.DEBUG_DEVMM === "true";
+const DEVMM_LOG_THROTTLE_SEC = Math.max(5, Number(process.env.LOG_THROTTLE_SEC || 30));
+const DEVMM_SKIP_AUDIT_THROTTLE_MS = Math.max(5_000, Number(process.env.DEVMM_SKIP_AUDIT_THROTTLE_MS || 30_000));
+const devmmSkipAuditAt = new Map<string, number>();
+
+function buildDevmmThrottleKey(exchange: DevmmExchange, message: string): string | null {
+    const upper = String(message || "").toUpperCase();
+    if (!upper) return null;
+
+    const reasonMatch = upper.match(/SKIP_TICK:([A-Z0-9_]+)/);
+    if (reasonMatch?.[1]) return `skip:${exchange}:${reasonMatch[1]}`;
+    const orderResultMatch = upper.match(/ORDERRESULT\\s+PHASE=([A-Z_]+)\\s+SIDE=([A-Z_]+)\\s+RESULT=([A-Z_]+)/);
+    if (orderResultMatch?.[3]) return `orderResult:${exchange}:${orderResultMatch[2]}:${orderResultMatch[3]}`;
+
+    if (upper.startsWith("TICK STRATEGYID=")) return `tick:${exchange}`;
+    if (upper.startsWith("OPENORDERS ")) return `openOrders:${exchange}`;
+    if (upper.startsWith("ORDERATTEMPT ")) return `orderAttempt:${exchange}`;
+    if (upper.includes("PAUSED:")) return `paused:${exchange}:${upper.replace(/[^A-Z0-9_]+/g, "_").slice(0, 64)}`;
+    return null;
+}
+
+function extractStrategyIdFromMessage(message: string): number | null {
+    const match = String(message || "").match(/(?:strategyId|config|id)=(\\d+)/i);
+    if (!match?.[1]) return null;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : null;
+}
+
+function shouldRecordDevmmSkipAudit(exchange: DevmmExchange, reason: string, now: number): boolean {
+    const key = `${exchange}:${reason}`;
+    const prev = devmmSkipAuditAt.get(key) || 0;
+    if (now - prev < DEVMM_SKIP_AUDIT_THROTTLE_MS) return false;
+    devmmSkipAuditAt.set(key, now);
+    return true;
+}
 
 function log(level: "info" | "debug" | "error", exchange: DevmmExchange, message: string): void {
-    const ts = new Date().toISOString();
-    if (level === "debug" && !DEBUG_DEVMM) return;
-    const line = `[devmmRunner] [${level}] ${ts} exchange=${exchange} ${message}`;
-    if (level === "error") {
-        console.error(line);
-        return;
-    }
-    console.log(line);
+    const strategyId = extractStrategyIdFromMessage(message);
+    const throttleKey = buildDevmmThrottleKey(exchange, message);
+    tradeLog({
+        scope: "devmmRunner",
+        level,
+        strategyId: strategyId ?? null,
+        exchange,
+        message,
+        throttleKey: throttleKey || undefined,
+        throttleSec: throttleKey ? DEVMM_LOG_THROTTLE_SEC : undefined,
+        // Keep backward compatibility for short-term deep debugging.
+        force: level === "debug" && DEBUG_DEVMM,
+    });
 }
 
 // Timezone helper for Asia/Taipei (UTC+8)
@@ -123,6 +166,11 @@ function ceilToTick(value: number, tick: number): number {
 function roundToStep(value: number, step: number): number {
     if (step <= 0 || !Number.isFinite(step)) return value;
     return Math.floor(value / step) * step;
+}
+
+function resolveOrderQuote(exchange: DevmmExchange, configuredOrderQuote: number): number {
+    if (exchange === "nestex") return NESTEX_TARGET_NOTIONAL_USDT;
+    return configuredOrderQuote;
 }
 
 function inferTickFromPrice(price: number, maxDecimals = 12): number | null {
@@ -426,6 +474,42 @@ function toNumber(value: any): number | null {
         return Number.isFinite(parsed) ? parsed : null;
     }
     return null;
+}
+
+function summarizeNonKycFinalOrder(data: any): {
+    status: string;
+    isCancelled: boolean;
+    filledQty: number;
+    fillPrice: number | null;
+} {
+    const status = String(data?.status ?? data?.order_status ?? data?.state ?? "").trim().toUpperCase();
+    const isCancelled =
+        status.includes("CANCEL") ||
+        status.includes("EXPIRE") ||
+        status.includes("REJECT") ||
+        status.includes("VOID");
+    const filledQtyRaw =
+        toNumber(data?.filled_quantity) ??
+        toNumber(data?.filledQty) ??
+        toNumber(data?.executedQty) ??
+        toNumber(data?.deal_stock) ??
+        toNumber(data?.dealStock) ??
+        toNumber(data?.executed_quantity) ??
+        0;
+    const avgPriceRaw =
+        toNumber(data?.avg_price) ??
+        toNumber(data?.avgPrice) ??
+        toNumber(data?.average_price) ??
+        toNumber(data?.price_avg);
+    const dealMoney = toNumber(data?.deal_money) ?? toNumber(data?.dealMoney) ?? toNumber(data?.executed_notional);
+    const fillPrice = avgPriceRaw ?? ((dealMoney !== null && filledQtyRaw > 0) ? (dealMoney / filledQtyRaw) : null);
+
+    return {
+        status,
+        isCancelled,
+        filledQty: filledQtyRaw > 0 ? filledQtyRaw : 0,
+        fillPrice,
+    };
 }
 
 function formatError(code: string, message?: string): string {
@@ -784,7 +868,14 @@ async function cancelOrder(
         }
         return false;
     } catch (err: any) {
-        console.warn(`[devmmRunner] cancelOrder exception for ${orderId}: ${err.message}`);
+        tradeLog({
+            scope: "devmmRunner",
+            level: "warn",
+            exchange,
+            message: `cancelOrder exception orderId=${orderId} err=${err.message}`,
+            throttleKey: `devmm:cancel-exception:${exchange}`,
+            throttleSec: 20,
+        });
         return false;
     }
 }
@@ -848,7 +939,12 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
     if (!isSupportedExchange(exchangeRaw)) {
         const requestedExchange = exchangeRaw || "unknown";
         const available = SUPPORTED_EXCHANGES.join(",");
-        console.error(`[devmmRunner] [error] ${new Date().toISOString()} exchange=${requestedExchange} INVALID_EXCHANGE available=${available}`);
+        tradeLog({
+            scope: "devmmRunner",
+            level: "error",
+            exchange: requestedExchange,
+            message: `INVALID_EXCHANGE available=${available}`,
+        });
         upsertDevmmState(requestedExchange as DevmmExchange, config.symbol, { status: "PAUSED", pause_reason: DevmmPauseReason.INVALID_EXCHANGE });
         updateDevmmError(requestedExchange as DevmmExchange, config.symbol, DevmmPauseReason.INVALID_EXCHANGE);
         return;
@@ -1222,9 +1318,18 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
         }
 
         // Calculate quantities
-        const orderQuote = config.order_quote_usdt;
-        let buyQty = roundToStep(orderQuote / buyPrice, rules.qtyStep);
-        let sellQty = roundToStep(orderQuote / sellPrice, rules.qtyStep);
+        const orderQuote = resolveOrderQuote(exchange, config.order_quote_usdt);
+        const rawBuyQty = orderQuote / buyPrice;
+        const rawSellQty = orderQuote / sellPrice;
+        let buyQty = roundToStep(rawBuyQty, rules.qtyStep);
+        let sellQty = roundToStep(rawSellQty, rules.qtyStep);
+
+        if (exchange === "nestex") {
+            const buyNotionalSized = buyPrice * buyQty;
+            const sellNotionalSized = sellPrice * sellQty;
+            log("info", exchange, `[NestEx sizing] side=BUY price=${buyPrice} targetNotional=1 calculatedQty=${rawBuyQty} finalQtyAfterPrecision=${buyQty} notional=${buyNotionalSized}`);
+            log("info", exchange, `[NestEx sizing] side=SELL price=${sellPrice} targetNotional=1 calculatedQty=${rawSellQty} finalQtyAfterPrecision=${sellQty} notional=${sellNotionalSized}`);
+        }
 
         // Verify minimum notional
         const buyNotional = buyPrice * buyQty;
@@ -1290,7 +1395,17 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             const surplus = sorted.slice(0, openOrders.length - MAX_TOTAL_ORDERS);
             for (const o of surplus) {
                 log("info", exchange, `Cancelling surplus ${o.side} order ${o.id}`);
-                await cancelOrder(exchange, accessKey, secretKey, rateLimitKey, o.id);
+                const cancelled = await cancelOrder(exchange, accessKey, secretKey, rateLimitKey, o.id);
+                insertTradeAudit({
+                    strategyId: config.id,
+                    strategyType: "DEVMM",
+                    exchange,
+                    pair: config.symbol,
+                    action: cancelled ? "cancel" : "error",
+                    side: o.side,
+                    orderId: o.id,
+                    reason: cancelled ? "CANCEL_SURPLUS" : "CANCEL_SURPLUS_FAILED",
+                });
                 removePendingOrders(exchange, o.id);
                 clearLocallyPlacedOrder(exchange, o.id);
             }
@@ -1312,6 +1427,16 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             if (o.id !== state.open_buy_order_id && o.id !== state.open_sell_order_id) {
                 log("info", exchange, `Cancelling stray ${o.side} order ${o.id}`);
                 const ok = await cancelOrder(exchange, accessKey, secretKey, rateLimitKey, o.id);
+                insertTradeAudit({
+                    strategyId: config.id,
+                    strategyType: "DEVMM",
+                    exchange,
+                    pair: config.symbol,
+                    action: ok ? "cancel" : "error",
+                    side: o.side,
+                    orderId: o.id,
+                    reason: ok ? "CANCEL_STRAY" : "CANCEL_STRAY_FAILED",
+                });
                 if (!ok) {
                     const failures = (cancelFailures.get(o.id) || 0) + 1;
                     cancelFailures.set(o.id, failures);
@@ -1331,7 +1456,7 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
         }
 
         // Check for fills (orders that were tracked but are no longer in openOrders)
-        const checkFill = (side: "BUY" | "SELL", trackedOrderId: string | null) => {
+        const checkFill = async (side: "BUY" | "SELL", trackedOrderId: string | null) => {
             if (!trackedOrderId) return;
             const pendingInvisible = pendingOrders.some(o => o.orderId === trackedOrderId);
             if (pendingInvisible) {
@@ -1371,7 +1496,6 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                         }
                         try {
                             const price = side === "BUY" ? state.last_bid || mid : state.last_ask || mid;
-                            const orderQuote = config.order_quote_usdt;
                             const qty = roundToStep(orderQuote / price, rules.qtyStep);
                             insertDevmmFill({
                                 exchange,
@@ -1384,6 +1508,18 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                                 tradeId: exchange === "nestex" ? "ASSUMED_OPPOSITE_SIDE_VISIBLE" : "ASSUMED_VISIBILITY_TIMEOUT",
                             });
                             incrementDevmmTurnover(exchange, config.symbol, orderQuote);
+                            insertTradeAudit({
+                                strategyId: config.id,
+                                strategyType: "DEVMM",
+                                exchange,
+                                pair: config.symbol,
+                                action: "fill",
+                                side,
+                                price,
+                                qty,
+                                orderId: trackedOrderId,
+                                reason: exchange === "nestex" ? "ASSUMED_OPPOSITE_SIDE_VISIBLE" : "ASSUMED_VISIBILITY_TIMEOUT",
+                            });
                         } catch (err: any) {
                             log("error", exchange, `Failed to record assumed fill: ${err.message}`);
                         }
@@ -1397,11 +1533,62 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                     clearTrackedSide();
                     return;
                 }
+                if (exchange === "nonkyc") {
+                    try {
+                        const orderInfo = await getNonKycOrderById(accessKey, secretKey, trackedOrderId);
+                        if (orderInfo.ok) {
+                            const summary = summarizeNonKycFinalOrder(orderInfo.data);
+                            if (summary.filledQty <= 0 && summary.isCancelled) {
+                                log("info", exchange, `ORDER_CLOSED_NO_FILL side=${side} order_id=${trackedOrderId} status=${summary.status || "UNKNOWN"}`);
+                                removePendingOrders(exchange, trackedOrderId);
+                                clearLocallyPlacedOrder(exchange, trackedOrderId);
+                                clearTrackedSide();
+                                return;
+                            }
+                            if (summary.filledQty > 0) {
+                                const qty = roundToStep(summary.filledQty, rules.qtyStep);
+                                if (qty > 0) {
+                                    const fallbackPrice = side === "BUY" ? state.last_bid || mid : state.last_ask || mid;
+                                    const price = summary.fillPrice && summary.fillPrice > 0 ? summary.fillPrice : fallbackPrice;
+                                    const quoteUsdt = qty * price;
+                                    insertDevmmFill({
+                                        exchange,
+                                        symbol: "PEPEW/USDT",
+                                        side,
+                                        price,
+                                        qtyPepew: qty,
+                                        quoteUsdt,
+                                        orderId: trackedOrderId,
+                                        tradeId: "NONKYC_ORDER_QUERY",
+                                    });
+                                    incrementDevmmTurnover(exchange, config.symbol, quoteUsdt);
+                                    insertTradeAudit({
+                                        strategyId: config.id,
+                                        strategyType: "DEVMM",
+                                        exchange,
+                                        pair: config.symbol,
+                                        action: "fill",
+                                        side,
+                                        price,
+                                        qty,
+                                        orderId: trackedOrderId,
+                                        reason: "FILL_DETECTED_VERIFIED_NONKYC",
+                                    });
+                                    removePendingOrders(exchange, trackedOrderId);
+                                    clearLocallyPlacedOrder(exchange, trackedOrderId);
+                                    clearTrackedSide();
+                                    return;
+                                }
+                            }
+                        }
+                    } catch (verifyErr: any) {
+                        log("error", exchange, `NonKYC fill verify failed for order ${trackedOrderId}: ${verifyErr?.message || verifyErr}`);
+                    }
+                }
                 log("info", exchange, `Detected FILL for ${side} order ${trackedOrderId}`);
                 // Record fill in DB
                 try {
                     const price = side === "BUY" ? state.last_bid || mid : state.last_ask || mid;
-                    const orderQuote = config.order_quote_usdt;
                     const qty = roundToStep(orderQuote / price, rules.qtyStep);
 
                     insertDevmmFill({
@@ -1414,6 +1601,18 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                         orderId: trackedOrderId,
                     });
                     incrementDevmmTurnover(exchange, config.symbol, orderQuote);
+                    insertTradeAudit({
+                        strategyId: config.id,
+                        strategyType: "DEVMM",
+                        exchange,
+                        pair: config.symbol,
+                        action: "fill",
+                        side,
+                        price,
+                        qty,
+                        orderId: trackedOrderId,
+                        reason: "FILL_DETECTED",
+                    });
                 } catch (err: any) {
                     log("error", exchange, `Failed to record fill: ${err.message}`);
                 }
@@ -1423,8 +1622,8 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             }
         };
 
-        checkFill("BUY", state.open_buy_order_id);
-        checkFill("SELL", state.open_sell_order_id);
+        await checkFill("BUY", state.open_buy_order_id);
+        await checkFill("SELL", state.open_sell_order_id);
         pendingOrders = pruneAndGetPendingOrders(exchange, now);
         const pendingCount = pendingOrders.length;
 
@@ -1658,6 +1857,18 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                     upsertDevmmState(exchange, config.symbol, { open_buy_order_id: result.orderId });
                     placedBuy = true;
                     newOrdersPlacedThisTick += 1;
+                    insertTradeAudit({
+                        strategyId: config.id,
+                        strategyType: "DEVMM",
+                        exchange,
+                        pair: config.symbol,
+                        action: "place",
+                        side: "BUY",
+                        price: currentBuyPrice,
+                        qty: buyQty,
+                        orderId: result.orderId,
+                        reason: `phase=${phase}`,
+                    });
 
                     // Verify order visibility with retries
                     let found = false;
@@ -1688,6 +1899,17 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                     break;
                 } else {
                     orderResults.push(`BUY:FAILED:${result.error || "UNKNOWN"}`);
+                    insertTradeAudit({
+                        strategyId: config.id,
+                        strategyType: "DEVMM",
+                        exchange,
+                        pair: config.symbol,
+                        action: "error",
+                        side: "BUY",
+                        price: currentBuyPrice,
+                        qty: buyQty,
+                        reason: result.error || "ORDER_FAILED",
+                    });
                     const errLower = (result.error || "").toLowerCase();
                     if (errLower.includes("post") || errLower.includes("maker") || errLower.includes("crossing")) {
                         currentBuyPrice = floorToTick(currentBuyPrice - priceTickUsed, priceTickUsed);
@@ -1752,6 +1974,18 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                     upsertDevmmState(exchange, config.symbol, { open_sell_order_id: result.orderId });
                     placedSell = true;
                     newOrdersPlacedThisTick += 1;
+                    insertTradeAudit({
+                        strategyId: config.id,
+                        strategyType: "DEVMM",
+                        exchange,
+                        pair: config.symbol,
+                        action: "place",
+                        side: "SELL",
+                        price: currentSellPrice,
+                        qty: sellQty,
+                        orderId: result.orderId,
+                        reason: `phase=${phase}`,
+                    });
 
                     // Verify order visibility with retries
                     let found = false;
@@ -1782,6 +2016,17 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
                     break;
                 } else {
                     orderResults.push(`SELL:FAILED:${result.error || "UNKNOWN"}`);
+                    insertTradeAudit({
+                        strategyId: config.id,
+                        strategyType: "DEVMM",
+                        exchange,
+                        pair: config.symbol,
+                        action: "error",
+                        side: "SELL",
+                        price: currentSellPrice,
+                        qty: sellQty,
+                        reason: result.error || "ORDER_FAILED",
+                    });
                     const errLower = (result.error || "").toLowerCase();
                     if (errLower.includes("post") || errLower.includes("maker") || errLower.includes("crossing")) {
                         currentSellPrice = ceilToTick(currentSellPrice + priceTickUsed, priceTickUsed);
@@ -1850,6 +2095,17 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             }
             updateDevmmAction(exchange, config.symbol, `skipped ${skips.join("+")} phase=${phase}`.trim() || `idle phase=${phase}`);
         }
+        if (actions.length === 0 && decision.includes("SKIP_TICK") && shouldRecordDevmmSkipAudit(exchange, decision, now)) {
+            insertTradeAudit({
+                ts: now,
+                strategyId: config.id,
+                strategyType: "DEVMM",
+                exchange,
+                pair: config.symbol,
+                action: "skip",
+                reason: decision,
+            });
+        }
         for (const reason of skipReasons) {
             const issueCode = mapSkipReasonToIssueCode(reason, { phase, zeroSpread: forceSpreadMode });
             if (issueCode) issueCodes.add(issueCode);
@@ -1881,6 +2137,14 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
 
     } catch (err: any) {
         log("error", exchange, `Tick error: ${err.message}`);
+        insertTradeAudit({
+            strategyId: config.id,
+            strategyType: "DEVMM",
+            exchange,
+            pair: config.symbol,
+            action: "error",
+            reason: err.message || "TICK_ERROR",
+        });
         updateDevmmError(exchange, config.symbol, err.message);
     } finally {
         runningExchanges.delete(exchange);
@@ -1897,14 +2161,27 @@ export const devmmRunner: StrategyRunner = {
     async tick(configId: number, now: number): Promise<void> {
         const config = getDevmmConfigById(configId);
         if (!config) {
-            console.warn(`[devmmRunner] config not found for id=${configId}`);
+            tradeLog({
+                scope: "devmmRunner",
+                level: "warn",
+                strategyId: configId,
+                message: `config not found id=${configId}`,
+                throttleKey: `devmm:missing-config:${configId}`,
+                throttleSec: 30,
+            });
             return;
         }
 
         const exchangeRaw = String(config.exchange || "");
         if (!isSupportedExchange(exchangeRaw)) {
             const available = SUPPORTED_EXCHANGES.join(",");
-            console.error(`[devmmRunner] [error] ${new Date().toISOString()} exchange=${exchangeRaw} INVALID_EXCHANGE available=${available}`);
+            tradeLog({
+                scope: "devmmRunner",
+                level: "error",
+                strategyId: configId,
+                exchange: exchangeRaw,
+                message: `INVALID_EXCHANGE available=${available}`,
+            });
             upsertDevmmState(exchangeRaw as DevmmExchange, config.symbol, { status: "PAUSED", pause_reason: DevmmPauseReason.INVALID_EXCHANGE });
             updateDevmmError(exchangeRaw as DevmmExchange, config.symbol, DevmmPauseReason.INVALID_EXCHANGE);
             return;

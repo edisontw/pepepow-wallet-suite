@@ -5,13 +5,13 @@ import { sendMainMenu } from "./mainMenu.js";
 const DONATE_ADDRESS =
     process.env.DONATE_ADDRESS ||
     process.env.TRADE_DONATE_ADDRESS ||
-    "PDep1ZNhCyqyRwjnQif8K6tPGsE7TvhyT6";
+    "PL8s5WjXUGhHVSo743dwEXGtsifV5YpdcD";
 
 export async function handleStart(ctx: Context): Promise<void> {
     const intro = [
         "PEPEPOW Trade Bot",
         "",
-        "Use the menu buttons below to manage strategy setup, status, reports, stop actions, and API keys.",
+        "Use the keyboard buttons below to view status, debug details, strategy menus, reports, stop actions, and API keys.",
     ].join("\n");
     await sendMainMenu(ctx, intro);
 }
@@ -24,6 +24,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
         "• /start - Open main menu",
         "• /strategy - Strategy menu",
         "• /status - Unified status (strategy + DevMM)",
+        "• /debug - Advanced DevMM diagnostics",
         "• /report - Period + exchange report",
         "• /stop - Stop strategies by exchange",
         "• /key - Key shortcuts (/keys, /keys_status, /keys_clear)",
@@ -45,7 +46,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
         "• Dex-Trade (PEPEW/USDT)",
         "• NestEx (PEPEW/USDT)",
         "",
-        `Donate Address: ${DONATE_ADDRESS}`,
+        `(PEPEW) Donate Address: ${DONATE_ADDRESS}`,
     ].join("\n");
 
     await safeSend(ctx, { step: "help", text: message });

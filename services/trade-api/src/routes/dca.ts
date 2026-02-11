@@ -26,7 +26,7 @@ const router = Router();
 const DONATE_ADDRESS =
     process.env.DONATE_ADDRESS ||
     process.env.TRADE_DONATE_ADDRESS ||
-    "PDep1ZNhCyqyRwjnQif8K6tPGsE7TvhyT6";
+    "PL8s5WjXUGhHVSo743dwEXGtsifV5YpdcD";
 
 // Mode to config mapping (for /dca_set legacy command)
 const MODE_CONFIG = {

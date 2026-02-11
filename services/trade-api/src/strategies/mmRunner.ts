@@ -4,6 +4,7 @@ import {
     getExchangeKey,
     getOpenStrategyOrders,
     getStrategyConfigById,
+    insertTradeAudit,
     insertStrategyEvent,
     insertStrategyFill,
     insertStrategyOrder,
@@ -25,6 +26,7 @@ import { StrategyRunner } from "./types.js";
 import { wrapStrategyTick } from "../lib/runner-wrapper.js";
 import { getExchangeNormalizedBalance } from "../lib/fundsCheck.js";
 import { logStrategyTickContract } from "./logContract.js";
+import { tradeLog } from "../lib/tradeLogger.js";
 
 // Per-strategy lock to avoid overlapping ticks
 const runningConfigs = new Set<number>();
@@ -40,6 +42,37 @@ const NESTEX_DEBUG =
 const NESTEX_ORDER_DEBUG =
     process.env.DEBUG_NESTEX_ORDER === "1" ||
     process.env.DEBUG_NESTEX_ORDER === "true";
+const NESTEX_TARGET_NOTIONAL_USDT = 1;
+const MM_THROTTLE_SEC = Math.max(5, Number(process.env.LOG_THROTTLE_SEC || 30));
+const MM_SKIP_AUDIT_THROTTLE_MS = Math.max(5_000, Number(process.env.MM_SKIP_AUDIT_THROTTLE_MS || 30_000));
+const mmSkipAuditAt = new Map<string, number>();
+
+function mmLog(params: {
+    level?: "debug" | "info" | "warn" | "error";
+    message: string;
+    configId?: number | null;
+    exchange?: string | null;
+    throttleKey?: string;
+    throttleSec?: number;
+}): void {
+    tradeLog({
+        scope: "mmRunner",
+        level: params.level || "info",
+        strategyId: params.configId ?? null,
+        exchange: params.exchange ?? null,
+        message: params.message,
+        throttleKey: params.throttleKey,
+        throttleSec: params.throttleSec ?? MM_THROTTLE_SEC,
+    });
+}
+
+function shouldRecordMmSkipAudit(configId: number, reason: string, now: number): boolean {
+    const key = `${configId}:${reason}`;
+    const prev = mmSkipAuditAt.get(key) || 0;
+    if (now - prev < MM_SKIP_AUDIT_THROTTLE_MS) return false;
+    mmSkipAuditAt.set(key, now);
+    return true;
+}
 
 /** MM operating mode */
 type MmMode = "TWO_SIDED" | "ONE_SIDED_BUY" | "ONE_SIDED_SELL";
@@ -145,6 +178,11 @@ function normalizeMmOrderSide(value: any): "buy" | "sell" | "unknown" {
     if (raw.includes("buy") || raw.includes("bid")) return "buy";
     if (raw.includes("sell") || raw.includes("ask")) return "sell";
     return "unknown";
+}
+
+function resolveQuotePerOrder(exchange: ExchangeName, configuredQuotePerOrder: number): number {
+    if (exchange === "nestex") return NESTEX_TARGET_NOTIONAL_USDT;
+    return configuredQuotePerOrder;
 }
 
 function isIdempotentCancelMessage(value: string | undefined | null): boolean {
@@ -501,7 +539,12 @@ async function cancelExchangeOrders(exchange: ExchangeName, accessKey: string, s
             const dexSymbol = pair ? pair.replace("/", "") : undefined;
             result = await cancelDexTradeOrder(accessKey, secretKey, orderId, dexSymbol);
         } else {
-            console.warn(`[mmRunner] cancel not supported for ${exchange}`);
+            mmLog({
+                level: "warn",
+                exchange,
+                message: `cancel not supported for ${exchange}`,
+                throttleKey: `mmRunner:cancel-not-supported:${exchange}`,
+            });
             failed += 1;
             continue;
         }
@@ -514,10 +557,21 @@ async function cancelExchangeOrders(exchange: ExchangeName, accessKey: string, s
                 (result.error && /not found|already.*closed|cancelled|canceled/i.test(result.error));
 
             if (isIdempotentError) {
-                console.log(`[mmRunner] cancel orderId=${orderId} idempotent (already closed / not found) on ${exchange}`);
+                mmLog({
+                    level: "debug",
+                    exchange,
+                    message: `cancel orderId=${orderId} idempotent (already closed / not found)`,
+                    throttleKey: `mmRunner:cancel-idempotent:${exchange}:${orderId}`,
+                    throttleSec: 10,
+                });
             } else {
                 failed += 1;
-                console.warn(`[mmRunner] cancel orderId=${orderId} failed on ${exchange}: ${result.error || result.reason || "unknown"}`);
+                mmLog({
+                    level: "warn",
+                    exchange,
+                    message: `cancel orderId=${orderId} failed: ${result.error || result.reason || "unknown"}`,
+                    throttleKey: `mmRunner:cancel-fail:${exchange}:${result.error || result.reason || "unknown"}`,
+                });
             }
         }
     }
@@ -530,12 +584,25 @@ export const mmRunner: StrategyRunner = {
         const config = getStrategyConfigById(configId);
         if (!config || config.strategy !== "MM") return;
         if (!config.enabled || config.disabled_reason === "STOPPING") {
-            console.log(`[mmRunner] skip config=${configId}: disabled`);
+            mmLog({
+                level: "debug",
+                configId,
+                exchange: config.exchange,
+                message: "skip: disabled",
+                throttleKey: `mmRunner:skip-disabled:${configId}`,
+            });
             return;
         }
 
         if (runningConfigs.has(configId)) {
-            console.log(`[mmRunner] skip config=${configId}: already running`);
+            mmLog({
+                level: "debug",
+                configId,
+                exchange: config.exchange,
+                message: "skip: already running",
+                throttleKey: `mmRunner:skip-running:${configId}`,
+                throttleSec: 10,
+            });
             return;
         }
         runningConfigs.add(configId);
@@ -551,14 +618,20 @@ export const mmRunner: StrategyRunner = {
                 const quoteCcy = getQuoteUnit(exchange, config.pair) || "USDT";
 
                 if (exchange === "nestex" && NESTEX_DEBUG) {
-                    console.log(`[nestex:debug] symbol mapping: pair=${config.pair} exchangeSymbol=${symbol}`);
+                    mmLog({
+                        level: "debug",
+                        configId: config.id,
+                        exchange,
+                        message: `nestex symbol mapping pair=${config.pair} exchangeSymbol=${symbol}`,
+                    });
                 }
 
                 const params = safeParse(config.params_json);
                 const rawSpreadPct = params.spread_pct ?? 0.01;
                 const spreadPct = normalizePercentRatio(rawSpreadPct, 0.01);
                 // Support both new quote_per_order and legacy order_quote
-                const quotePerOrder = params.quote_per_order ?? params.order_quote ?? 1;
+                const configuredQuotePerOrder = params.quote_per_order ?? params.order_quote ?? 1;
+                const quotePerOrder = resolveQuotePerOrder(exchange, configuredQuotePerOrder);
                 const ordersPerSide = params.orders_per_side ?? 1;
                 const refreshSec = params.refresh_sec ?? DEFAULT_REFRESH_SEC;
                 const requestedMidSource = params.mid_source === "aggregated" ? "aggregated" : "exchange";
@@ -592,9 +665,23 @@ export const mmRunner: StrategyRunner = {
                 };
 
                 // Log orders_per_side config
-                console.log(`[mmRunner] config=${config.id} orders_per_side=${ordersPerSide} quote_per_order=${quotePerOrder}`);
+                mmLog({
+                    level: "info",
+                    configId: config.id,
+                    exchange,
+                    message: `config orders_per_side=${ordersPerSide} quote_per_order=${quotePerOrder} configured_quote_per_order=${configuredQuotePerOrder}`,
+                    throttleKey: `mmRunner:config:${config.id}`,
+                    throttleSec: 60,
+                });
                 if (rawSpreadPct !== spreadPct) {
-                    console.warn(`[mmRunner] config=${config.id} normalized spread_pct from ${rawSpreadPct} to ${spreadPct}`);
+                    mmLog({
+                        level: "warn",
+                        configId: config.id,
+                        exchange,
+                        message: `normalized spread_pct from ${rawSpreadPct} to ${spreadPct}`,
+                        throttleKey: `mmRunner:spread-normalized:${config.id}`,
+                        throttleSec: 60,
+                    });
                 }
 
                 if (!Number.isFinite(spreadPct) || spreadPct <= 0 || !Number.isFinite(quotePerOrder) || quotePerOrder <= 0) {
@@ -642,7 +729,12 @@ export const mmRunner: StrategyRunner = {
                         return { success: false, error: { message: `Missing API keys for REAL mode (${config.exchange})`, code: "AUTH_FAILED" } };
                     }
                     if (keyRecord.exchange !== config.exchange) {
-                        console.error(`[mmRunner] MISROUTED_EXCHANGE: config.exchange=${config.exchange} key.exchange=${keyRecord.exchange}`);
+                        mmLog({
+                            level: "error",
+                            configId: config.id,
+                            exchange,
+                            message: `MISROUTED_EXCHANGE config.exchange=${config.exchange} key.exchange=${keyRecord.exchange}`,
+                        });
                         return { success: false, error: { message: "Exchange routing error", code: "MISROUTED_EXCHANGE" } };
                     }
                     try {
@@ -669,14 +761,32 @@ export const mmRunner: StrategyRunner = {
                             inventorySource = `${exchange.toUpperCase()}_API`;
                             balanceTs = balanceResult.metadata.fetchedAt;
                             balanceStalenessMs = balanceResult.metadata.cacheAgeMs;
-                            console.log(`[mmRunner] Inventory fetched for ${exchange}: Base=${inventoryBase} Quote=${inventoryQuote}`);
+                            mmLog({
+                                level: "debug",
+                                configId: config.id,
+                                exchange,
+                                message: `inventory fetched base=${inventoryBase} quote=${inventoryQuote}`,
+                                throttleKey: `mmRunner:inventory:${config.id}`,
+                            });
                         } else {
-                            console.warn(`[mmRunner] REAL mode but balance fetch failed for ${exchange}. Skipping tick (Fail-Closed).`);
+                            mmLog({
+                                level: "warn",
+                                configId: config.id,
+                                exchange,
+                                message: "REAL mode but balance fetch failed. Skipping tick (Fail-Closed).",
+                                throttleKey: `mmRunner:balance-unavailable:${config.id}`,
+                            });
                             return { success: false, error: { message: "SKIP: BALANCE_UNAVAILABLE", code: "FETCH_FAILED" } };
                         }
                     } catch (err: any) {
                         const errMsg = err?.message || "Unknown error";
-                        console.warn(`[mmRunner] balance fetch error (${exchange}): ${errMsg}`);
+                        mmLog({
+                            level: "warn",
+                            configId: config.id,
+                            exchange,
+                            message: `balance fetch error: ${errMsg}`,
+                            throttleKey: `mmRunner:balance-error:${config.id}:${errMsg}`,
+                        });
                         return { success: false, error: { message: `SKIP: BALANCE_UNAVAILABLE (${errMsg})`, code: "FETCH_FAILED" } };
                     }
                 }
@@ -730,7 +840,14 @@ export const mmRunner: StrategyRunner = {
                             }
                         }
                     } catch (err) {
-                        console.warn(`[mmRunner] config=${config.id} open orders fetch failed:`, err);
+                        mmLog({
+                            level: "warn",
+                            configId: config.id,
+                            exchange,
+                            message: `open orders fetch failed: ${(err as any)?.message || String(err)}`,
+                            throttleKey: `mmRunner:open-orders-error:${config.id}`,
+                            throttleSec: 20,
+                        });
                         openOrdersSource = "exception";
                     }
                 } else {
@@ -759,9 +876,14 @@ export const mmRunner: StrategyRunner = {
                     );
                     if (closedMissing > 0) {
                         localOpenRegistry = getOpenStrategyOrdersRegistry(String(config.id));
-                        console.log(
-                            `[mmRunner] reconciled local registry config=${config.id} exchange=${exchange} pair=${config.pair} closedMissing=${closedMissing} live=${liveOrderIds.length}`
-                        );
+                        mmLog({
+                            level: "info",
+                            configId: config.id,
+                            exchange,
+                            message: `reconciled local registry pair=${config.pair} closedMissing=${closedMissing} live=${liveOrderIds.length}`,
+                            throttleKey: `mmRunner:reconcile:${config.id}`,
+                            throttleSec: 20,
+                        });
                     }
                 }
 
@@ -775,9 +897,14 @@ export const mmRunner: StrategyRunner = {
                 const managedOpenBuys = managedOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "buy");
                 const managedOpenSells = managedOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "sell");
                 const managedOpenUnknown = managedOpenOrders.filter(o => normalizeMmOrderSide(o.side) === "unknown");
-                console.log(
-                    `[mmRunner] openOrders config=${config.id} source=${openOrdersSource} total=${exchangeOpenOrders.length} buy=${openBuys.length} sell=${openSells.length} unknown=${openUnknown.length} managedTotal=${managedOpenOrders.length} managedBuy=${managedOpenBuys.length} managedSell=${managedOpenSells.length} managedUnknown=${managedOpenUnknown.length} registryOpen=${localOpenRegistry.length}`
-                );
+                mmLog({
+                    level: "info",
+                    configId: config.id,
+                    exchange,
+                    message: `openOrders source=${openOrdersSource} total=${exchangeOpenOrders.length} buy=${openBuys.length} sell=${openSells.length} unknown=${openUnknown.length} managedTotal=${managedOpenOrders.length} managedBuy=${managedOpenBuys.length} managedSell=${managedOpenSells.length} managedUnknown=${managedOpenUnknown.length} registryOpen=${localOpenRegistry.length}`,
+                    throttleKey: `mmRunner:openOrders:${config.id}`,
+                    throttleSec: 30,
+                });
 
                 // --- 2. CANCEL EXCESS/STALE ORDERS ---
                 let totalCancelled = 0;
@@ -810,7 +937,14 @@ export const mmRunner: StrategyRunner = {
                             const isPriceInRange = mid ? (Math.abs(orderPrice - mid) / mid < spreadPct * 1.5) : false;
 
                             if (isAfterStart && isSizingClose && isPriceInRange) {
-                                console.log(`[mmRunner] OWN_ONLY fallback match for Dex-Trade: id=${orderId} price=${o.price} qty=${o.quantity}`);
+                                mmLog({
+                                    level: "debug",
+                                    configId: config.id,
+                                    exchange,
+                                    message: `OWN_ONLY fallback match dextrade id=${orderId} price=${o.price} qty=${o.quantity}`,
+                                    throttleKey: `mmRunner:own-only:${config.id}`,
+                                    throttleSec: 20,
+                                });
                                 return true;
                             }
                         }
@@ -818,14 +952,28 @@ export const mmRunner: StrategyRunner = {
                     });
 
                     if (myOrders.length === 0 && orders.length > 0) {
-                        console.log(`[mmRunner] Skipping ${orders.length} orders as they don't belong to this strategy (OWN_ONLY scope)`);
+                        mmLog({
+                            level: "info",
+                            configId: config.id,
+                            exchange,
+                            message: `Skipping ${orders.length} orders (OWN_ONLY scope)`,
+                            throttleKey: `mmRunner:own-only-skip:${config.id}`,
+                            throttleSec: 30,
+                        });
                         return;
                     }
 
                     for (const o of myOrders) {
                         const orderId = String(o.order_id || "");
                         if (exchange === "nestex" && !/^\d+$/.test(orderId)) {
-                            console.warn(`[mmRunner] Skipping non-numeric NestEx order_id=${orderId}`);
+                            mmLog({
+                                level: "warn",
+                                configId: config.id,
+                                exchange,
+                                message: `Skipping non-numeric NestEx order_id=${orderId}`,
+                                throttleKey: `mmRunner:nonnumeric-order:${config.id}`,
+                                throttleSec: 30,
+                            });
                             continue;
                         }
                         let res: { ok: boolean; status?: number; error?: string; alreadyClosed?: boolean } = { ok: false };
@@ -848,7 +996,13 @@ export const mmRunner: StrategyRunner = {
                             updateStrategyOrderStatusRegistry(exchange, orderId, "CLOSED");
                         } else {
                             totalCancelFailed++;
-                            console.warn(`[mmRunner] cancel failed exchange=${exchange} orderId=${orderId} error=${res.error || "unknown"}`);
+                            mmLog({
+                                level: "warn",
+                                configId: config.id,
+                                exchange,
+                                message: `cancel failed orderId=${orderId} error=${res.error || "unknown"}`,
+                                throttleKey: `mmRunner:cancel-failed:${config.id}:${res.error || "unknown"}`,
+                            });
                         }
                     }
                 };
@@ -935,9 +1089,14 @@ export const mmRunner: StrategyRunner = {
                     if (deviation > clampThreshold) {
                         quoteMid = bookMid;
                         midAnchor = "book_clamped";
-                        console.log(
-                            `[mmRunner] mid-clamp config=${config.id} exchange=${exchange} sourceMid=${mid} bookMid=${bookMid} deviationPct=${(deviation * 100).toFixed(2)} thresholdPct=${(clampThreshold * 100).toFixed(2)}`
-                        );
+                        mmLog({
+                            level: "warn",
+                            configId: config.id,
+                            exchange,
+                            message: `mid-clamp sourceMid=${mid} bookMid=${bookMid} deviationPct=${(deviation * 100).toFixed(2)} thresholdPct=${(clampThreshold * 100).toFixed(2)}`,
+                            throttleKey: `mmRunner:mid-clamp:${config.id}`,
+                            throttleSec: 20,
+                        });
                     }
                 }
                 if (exchange === "dextrade" && Number.isFinite(mid) && mid > 0 && quoteMid > mid) {
@@ -954,16 +1113,21 @@ export const mmRunner: StrategyRunner = {
                     quoteCcy: quoteCcy as "USDT" | "BNB",
                     k: 1.0,
                 });
-                const buyQuotePerOrder = bias.buyQuote;
-                const sellQuotePerOrder = bias.sellQuote;
+                const buyQuotePerOrder = exchange === "nestex" ? NESTEX_TARGET_NOTIONAL_USDT : bias.buyQuote;
+                const sellQuotePerOrder = exchange === "nestex" ? NESTEX_TARGET_NOTIONAL_USDT : bias.sellQuote;
 
                 let biasLogAt = Number(params.last_bias_log_at) || 0;
                 if (!biasLogAt || now - biasLogAt >= BIAS_LOG_INTERVAL_MS) {
                     const ratioStr = bias.baseRatio !== null ? bias.baseRatio.toFixed(4) : "n/a";
                     const deltaStr = bias.delta !== null ? bias.delta.toFixed(4) : "n/a";
-                    console.log(
-                        `[mmRunner] bias config=${config.id} baseRatio=${ratioStr} delta=${deltaStr} buyQuote=${buyQuotePerOrder} sellQuote=${sellQuotePerOrder}`
-                    );
+                    mmLog({
+                        level: "info",
+                        configId: config.id,
+                        exchange,
+                        message: `bias baseRatio=${ratioStr} delta=${deltaStr} buyQuote=${buyQuotePerOrder} sellQuote=${sellQuotePerOrder}`,
+                        throttleKey: `mmRunner:bias:${config.id}`,
+                        throttleSec: 600,
+                    });
                     biasLogAt = now;
                 }
 
@@ -1077,7 +1241,14 @@ export const mmRunner: StrategyRunner = {
                         }
                     }
 
-                    console.log(`[mmRunner] placing ${side} ${symbol} qty=${workingQty} price=${price}`);
+                    mmLog({
+                        level: "info",
+                        configId: config.id,
+                        exchange,
+                        message: `placing side=${side} symbol=${symbol} qty=${workingQty} price=${price}`,
+                        throttleKey: `mmRunner:placing:${config.id}:${side}`,
+                        throttleSec: 10,
+                    });
 
                     if (exchange === "nonkyc") {
                         const orderResult = await createNonKycOrder({
@@ -1229,12 +1400,26 @@ export const mmRunner: StrategyRunner = {
                                     status: "OPEN",
                                 });
                             } else {
-                                console.warn(`[mmRunner] nestex order placed but no exchangeOrderId: config=${config.id} clientOrderId=${clientOrderId}`);
+                                mmLog({
+                                    level: "warn",
+                                    configId: config.id,
+                                    exchange,
+                                    message: `nestex order placed but no exchangeOrderId clientOrderId=${clientOrderId}`,
+                                    throttleKey: `mmRunner:nestex-no-orderid:${config.id}`,
+                                    throttleSec: 30,
+                                });
                             }
 
                             actions.push(`${side}`);
                             orderTrace.push({ side, price, qty: workingQty, notional: workingNotional, status: "PLACED", reason: note });
-                            console.log(`[mmRunner] nestex placed exchangeOrderId=${exchangeOrderId ?? "n/a"} clientOrderId=${clientOrderId}`);
+                            mmLog({
+                                level: "info",
+                                configId: config.id,
+                                exchange,
+                                message: `nestex placed exchangeOrderId=${exchangeOrderId ?? "n/a"} clientOrderId=${clientOrderId}`,
+                                throttleKey: `mmRunner:nestex-placed:${config.id}:${side}`,
+                                throttleSec: 20,
+                            });
                         } else {
                             const errorCode = orderResult.error || "ORDER_FAILED";
                             recordSkip(`${side}: ${errorCode}`);
@@ -1293,13 +1478,25 @@ export const mmRunner: StrategyRunner = {
                 if (exchange === "nestex" && NESTEX_ORDER_DEBUG) {
                     const buyReason = allowBuy ? "OK" : (skipReasons[0] || "SKIP");
                     const sellReason = allowSell ? "OK" : (skipReasons[0] || "SKIP");
-                    console.log(`[nestex:order] decision: allowBuy=${allowBuy} allowSell=${allowSell} buyReason=${buyReason} sellReason=${sellReason}`);
+                    mmLog({
+                        level: "debug",
+                        configId: config.id,
+                        exchange,
+                        message: `nestex order decision allowBuy=${allowBuy} allowSell=${allowSell} buyReason=${buyReason} sellReason=${sellReason}`,
+                        throttleKey: `mmRunner:nestex-order-decision:${config.id}`,
+                        throttleSec: 20,
+                    });
                 }
                 const buySlots = allowBuy ? Math.max(0, ordersPerSide - managedOpenBuys.length) : 0;
                 const sellSlots = allowSell ? Math.max(0, ordersPerSide - managedOpenSells.length) : 0;
-                console.log(
-                    `[mmRunner] decision config=${config.id} exchange=${exchange} mode=${mmMode} allowBuy=${allowBuy} allowSell=${allowSell} buySlots=${buySlots} sellSlots=${sellSlots} skipReasons=${skipReasons.join(" | ") || "NONE"}`
-                );
+                mmLog({
+                    level: "info",
+                    configId: config.id,
+                    exchange,
+                    message: `decision mode=${mmMode} allowBuy=${allowBuy} allowSell=${allowSell} buySlots=${buySlots} sellSlots=${sellSlots} skipReasons=${skipReasons.join(" | ") || "NONE"}`,
+                    throttleKey: `mmRunner:decision:${config.id}`,
+                    throttleSec: 20,
+                });
 
                 const rawBidSample = floorToTick(normalizePrice(quoteMid * (1 - sideSpread)), rules.priceTick);
                 const rawAskSample = ceilToTick(normalizePrice(quoteMid * (1 + sideSpread)), rules.priceTick);
@@ -1330,7 +1527,14 @@ export const mmRunner: StrategyRunner = {
                 if (exchange === "nestex" && NESTEX_ORDER_DEBUG) {
                     const bb = Number.isFinite(bestBid as number) ? Number(bestBid) : null;
                     const ba = Number.isFinite(bestAsk as number) ? Number(bestAsk) : null;
-                    console.log(`[nestex:order] quotes: mid=${mid} bestBid=${bb} bestAsk=${ba} bidCalc=${rawBidSample} askCalc=${rawAskSample} spreadPct=${spreadPct}`);
+                    mmLog({
+                        level: "debug",
+                        configId: config.id,
+                        exchange,
+                        message: `nestex quotes mid=${mid} bestBid=${bb} bestAsk=${ba} bidCalc=${rawBidSample} askCalc=${rawAskSample} spreadPct=${spreadPct}`,
+                        throttleKey: `mmRunner:nestex-quotes:${config.id}`,
+                        throttleSec: 20,
+                    });
                 }
 
                 // BUY LADDER
@@ -1376,9 +1580,19 @@ export const mmRunner: StrategyRunner = {
                             continue;
                         }
                         buyFinalLadder.push(price);
-                        const qty = roundToStep(buyQuotePerOrder / price, rules.qtyStep);
+                        const targetNotional = exchange === "nestex" ? NESTEX_TARGET_NOTIONAL_USDT : buyQuotePerOrder;
+                        const calculatedQty = targetNotional / price;
+                        const qty = roundToStep(calculatedQty, rules.qtyStep);
                         const notional = qty * price;
-                        await placeOrder("BUY", price, qty, notional, buyQuotePerOrder, guard.adjustedBuy ? "ADJUSTED" : undefined);
+                        if (exchange === "nestex") {
+                            mmLog({
+                                level: "info",
+                                configId: config.id,
+                                exchange,
+                                message: `[NestEx sizing] side=BUY price=${price} targetNotional=1 calculatedQty=${calculatedQty} finalQtyAfterPrecision=${qty} notional=${notional}`,
+                            });
+                        }
+                        await placeOrder("BUY", price, qty, notional, targetNotional, guard.adjustedBuy ? "ADJUSTED" : undefined);
                     }
                 }
 
@@ -1425,26 +1639,46 @@ export const mmRunner: StrategyRunner = {
                             continue;
                         }
                         sellFinalLadder.push(price);
-                        const qty = roundToStep(sellQuotePerOrder / price, rules.qtyStep);
+                        const targetNotional = exchange === "nestex" ? NESTEX_TARGET_NOTIONAL_USDT : sellQuotePerOrder;
+                        const calculatedQty = targetNotional / price;
+                        const qty = roundToStep(calculatedQty, rules.qtyStep);
                         const notional = qty * price;
-                        await placeOrder("SELL", price, qty, notional, sellQuotePerOrder, guard.adjustedSell ? "ADJUSTED" : undefined);
+                        if (exchange === "nestex") {
+                            mmLog({
+                                level: "info",
+                                configId: config.id,
+                                exchange,
+                                message: `[NestEx sizing] side=SELL price=${price} targetNotional=1 calculatedQty=${calculatedQty} finalQtyAfterPrecision=${qty} notional=${notional}`,
+                            });
+                        }
+                        await placeOrder("SELL", price, qty, notional, targetNotional, guard.adjustedSell ? "ADJUSTED" : undefined);
                     }
                 }
 
                 if (buyRawLadder.length > 0 || sellRawLadder.length > 0) {
                     const fmt = (values: number[]) => values.map((v) => formatPriceByTick(v, tick)).join(",");
-                    console.log(
-                        `[mmRunner] ladder config=${config.id} exchange=${exchange} tick=${tick} buyRaw=[${fmt(buyRawLadder)}] buyRounded=[${fmt(buyRoundedLadder)}] buyFinal=[${fmt(buyFinalLadder)}] sellRaw=[${fmt(sellRawLadder)}] sellRounded=[${fmt(sellRoundedLadder)}] sellFinal=[${fmt(sellFinalLadder)}]`
-                    );
+                    mmLog({
+                        level: "debug",
+                        configId: config.id,
+                        exchange,
+                        message: `ladder tick=${tick} buyRaw=[${fmt(buyRawLadder)}] buyRounded=[${fmt(buyRoundedLadder)}] buyFinal=[${fmt(buyFinalLadder)}] sellRaw=[${fmt(sellRawLadder)}] sellRounded=[${fmt(sellRoundedLadder)}] sellFinal=[${fmt(sellFinalLadder)}]`,
+                        throttleKey: `mmRunner:ladder:${config.id}`,
+                        throttleSec: 20,
+                    });
                 }
 
                 if (exchange === "dextrade" && orderTrace.length === 0) {
                     const skipReason = skipReasons[0] || dextradeTopReason || "UNKNOWN";
                     const bb = Number.isFinite(bestBid as number) ? String(bestBid) : "n/a";
                     const ba = Number.isFinite(bestAsk as number) ? String(bestAsk) : "n/a";
-                    console.log(
-                        `[mmRunner] dextrade-skip exchange=dextrade pair=${config.pair} bestBid=${bb} bestAsk=${ba} mid=${mid} rawBid=${rawBidSample} rawAsk=${rawAskSample} tick=${rules.priceTick} skipReason=${skipReason}`
-                    );
+                    mmLog({
+                        level: "warn",
+                        configId: config.id,
+                        exchange,
+                        message: `dextrade-skip pair=${config.pair} bestBid=${bb} bestAsk=${ba} mid=${mid} rawBid=${rawBidSample} rawAsk=${rawAskSample} tick=${rules.priceTick} skipReason=${skipReason}`,
+                        throttleKey: `mmRunner:dextrade-skip:${config.id}:${skipReason}`,
+                        throttleSec: 20,
+                    });
                 }
 
                 const trace = {
@@ -1465,8 +1699,22 @@ export const mmRunner: StrategyRunner = {
                     alreadyClosedCount: totalAlreadyClosed,
                     cancelFailedCount: totalCancelFailed,
                 };
-                console.log(`[mmRunner] trace ${JSON.stringify(trace)}`);
-                console.log(`[mmRunner] summary: config=${config.id} buyPlaced=${placedBuy} sellPlaced=${placedSell} orders_per_side=${ordersPerSide}`);
+                mmLog({
+                    level: "debug",
+                    configId: config.id,
+                    exchange,
+                    message: `trace ${JSON.stringify(trace)}`,
+                    throttleKey: `mmRunner:trace:${config.id}`,
+                    throttleSec: 20,
+                });
+                mmLog({
+                    level: "info",
+                    configId: config.id,
+                    exchange,
+                    message: `summary buyPlaced=${placedBuy} sellPlaced=${placedSell} orders_per_side=${ordersPerSide}`,
+                    throttleKey: `mmRunner:summary:${config.id}`,
+                    throttleSec: 20,
+                });
 
                 // Persist status tracking fields
                 const estimatedOpenAfterTick = Math.max(
@@ -1515,19 +1763,45 @@ export const mmRunner: StrategyRunner = {
                         .filter((value): value is string => Boolean(value));
                     const preferred = ["NO_INVENTORY", "MIN_NOTIONAL", "MIN_QTY", "PRECISION", "OPEN_ORDERS", "MAX_POSITION"];
                     const resolvedCode = preferred.find((code) => errorCodes.includes(code)) || "UNKNOWN";
-                    console.warn(`[mmRunner] SKIP config=${config.id} exchange=${exchange} reason=${skipReasons[0] || errors[0] || "unknown"}`);
+                    const skipReason = skipReasons[0] || errors[0] || "unknown";
+                    mmLog({
+                        level: "warn",
+                        configId: config.id,
+                        exchange,
+                        message: `SKIP reason=${skipReason}`,
+                        throttleKey: `mmRunner:skip:${config.id}:${skipReason}`,
+                        throttleSec: 20,
+                    });
+                    if (shouldRecordMmSkipAudit(config.id, skipReason, now)) {
+                        insertTradeAudit({
+                            ts: now,
+                            strategyId: config.id,
+                            strategyType: "MM",
+                            exchange: config.exchange,
+                            pair: config.pair,
+                            action: "skip",
+                            reason: skipReason,
+                        });
+                    }
                     insertStrategyEvent({
                         configId: config.id,
                         level: "WARN",
-                        message: `MM SKIP: ${skipReasons[0] || errors[0] || "unknown"}`,
+                        message: `MM SKIP: ${skipReason}`,
                     });
                     return {
                         success: false,
-                        error: { message: `MM SKIP: ${skipReasons[0] || errors[0] || "unknown"}`, code: resolvedCode }
+                        error: { message: `MM SKIP: ${skipReason}`, code: resolvedCode }
                     };
                 }
 
-                console.log(`[mmRunner] refreshed config=${config.id} exchange=${config.exchange} pair=${config.pair}`);
+                mmLog({
+                    level: "debug",
+                    configId: config.id,
+                    exchange,
+                    message: `refreshed exchange=${config.exchange} pair=${config.pair}`,
+                    throttleKey: `mmRunner:refreshed:${config.id}`,
+                    throttleSec: 20,
+                });
                 return { success: true };
 
             }, now);

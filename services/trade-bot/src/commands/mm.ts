@@ -1,5 +1,6 @@
 import { Context, InlineKeyboard } from "grammy";
 import { ApiError, enableStrategyConfig, disableStrategyConfig, getStrategyStatus, upsertStrategyConfig, getKeysStatus, checkStrategyFunds, cancelStrategyOrders } from "../api.js";
+import { renderMenu } from "../utils/menu.js";
 import { logTelegramError, safeSend } from "../utils/telegram.js";
 import { ExchangeName, formatPairDisplay, formatPairLabel, getAllowedPairs } from "../lib/markets.js";
 import { getRegistryPromptHelpers } from "../lib/registryPrompt.js";
@@ -214,7 +215,11 @@ export async function handleMm(ctx: Context): Promise<void> {
         .text("Dex-Trade", buildCallbackData("exchange", "dextrade"))
         .text("NestEx", buildCallbackData("exchange", "nestex"));
 
-    await safeSend(ctx, { step: "mm.exchange", text: "⚙️ Select exchange for MM:", replyMarkup: keyboard });
+    await safeSend(ctx, {
+        step: "mm.exchange",
+        text: renderMenu("🏦 Select Exchange", "MM setup\nNonKYC / Dex-Trade / NestEx"),
+        replyMarkup: keyboard,
+    });
 }
 
 export async function handleMmStart(ctx: Context): Promise<void> {
@@ -410,7 +415,11 @@ export async function handleMmCallback(ctx: Context): Promise<boolean> {
             keyboard.text(label, buildCallbackData("pair", pair.symbol)).row();
         });
 
-        await safeSend(ctx, { step: "mm.pair", text: "Select pair for MM:", replyMarkup: keyboard });
+        await safeSend(ctx, {
+            step: "mm.pair",
+            text: renderMenu("🧩 Select Pair", "MM pair selection"),
+            replyMarkup: keyboard,
+        });
         await safeAnswerCallbackQuery(ctx, "mm.cb.exchange");
         return true;
     }

@@ -17,6 +17,14 @@ import {
   getPaymentRequest
 } from "./db.js";
 
+declare global {
+  namespace Express {
+    interface Request {
+      requestId?: string;
+    }
+  }
+}
+
 const app = express();
 // Behind nginx, trust a single proxy hop so req.ip uses X-Forwarded-For.
 app.set("trust proxy", 1);
@@ -42,15 +50,43 @@ const corsOrigins = (CORS_ORIGINS || "").split(",").map(s => s.trim()).filter(Bo
 const telegramInitToken = TELEGRAM_BOT_TOKEN || BOT_TOKEN || "";
 const jwtSecret = JWT_SECRET || "changeme";
 
+function sanitizeRequestId(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const sanitized = trimmed.replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128);
+  return sanitized;
+}
+
+function getRequestId(req: express.Request) {
+  return req.requestId || "n/a";
+}
+
 app.use((req, res, next) => {
   const origin = req.headers.origin as string | undefined;
   if (origin && corsOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-Id");
+    res.setHeader("Access-Control-Expose-Headers", "X-Request-Id");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.use((req, res, next) => {
+  const incoming = req.headers["x-request-id"];
+  const rawIncoming = Array.isArray(incoming) ? incoming[0] : incoming;
+  const requestId = sanitizeRequestId(typeof rawIncoming === "string" ? rawIncoming : "");
+  req.requestId = requestId || crypto.randomUUID();
+  res.setHeader("x-request-id", req.requestId);
+  const startedAt = Date.now();
+  const path = req.originalUrl || req.url;
+  console.info(`[http] start rid=${req.requestId} method=${req.method} path=${path}`);
+  res.on("finish", () => {
+    const elapsed = Date.now() - startedAt;
+    console.info(`[http] end rid=${req.requestId} method=${req.method} path=${path} status=${res.statusCode} timing=${elapsed}ms`);
+  });
   next();
 });
 
@@ -266,16 +302,129 @@ function getCoreRpcHostLabel() {
   return hostPort || "unknown";
 }
 
-async function fetchJson<T = any>(url: string, options: any = {}, timeoutMs = 3000) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    const data = await res.json().catch(() => null);
-    return { res, data: data as T | null };
-  } finally {
-    clearTimeout(timeout);
+function isTransientFetchError(err: any) {
+  const code = typeof err?.code === "string" ? err.code : "";
+  if (err?.name === "AbortError") return true;
+  return ["ECONNRESET", "EPIPE", "ETIMEDOUT", "ESOCKETTIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"].includes(code);
+}
+
+function hasHeader(headers: Record<string, string>, name: string) {
+  const target = name.toLowerCase();
+  return Object.keys(headers).some((k) => k.toLowerCase() === target);
+}
+
+function mergeHeaders(input: any, requestId?: string) {
+  const out: Record<string, string> = {};
+  if (input && typeof input.forEach === "function") {
+    input.forEach((value: any, key: string) => {
+      out[key] = String(value);
+    });
+  } else if (input && typeof input === "object") {
+    Object.assign(out, input);
   }
+  if (requestId && !hasHeader(out, "x-request-id")) {
+    out["x-request-id"] = requestId;
+  }
+  return out;
+}
+
+function isTimeoutErrorMessage(message: string) {
+  return /\btimeout\b/i.test(message);
+}
+
+type FetchRetryPolicy = {
+  maxRetries?: number;
+  backoffMs?: number[];
+  retryOnStatuses?: number[];
+};
+
+type FetchTelemetry = {
+  requestId?: string;
+  label?: string;
+  retry?: FetchRetryPolicy;
+};
+
+async function sleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJson<T = any>(url: string, options: any = {}, timeoutMs = 3000, telemetry: FetchTelemetry = {}) {
+  const rid = telemetry.requestId || "n/a";
+  const label = telemetry.label || "upstream";
+  const shouldLog = Boolean(telemetry.requestId || telemetry.label);
+  const maxRetries = Math.max(0, Number(telemetry.retry?.maxRetries ?? 0));
+  const retryOnStatuses = telemetry.retry?.retryOnStatuses || [];
+  const backoffMs = telemetry.retry?.backoffMs?.length ? telemetry.retry.backoffMs : [200, 500];
+  const maxAttempts = maxRetries + 1;
+  let attempt = 0;
+
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
+    try {
+      const mergedHeaders = mergeHeaders(options?.headers, telemetry.requestId);
+      const requestOptions = {
+        ...options,
+        headers: mergedHeaders,
+        signal: controller.signal,
+      };
+      const res = await fetch(url, requestOptions);
+      const data = await res.json().catch(() => null);
+      const elapsed = Date.now() - startedAt;
+      if (shouldLog) {
+        console.info(`[upstream] rid=${rid} label=${label} attempt=${attempt}/${maxAttempts} status=${res.status} timing=${elapsed}ms`);
+      }
+
+      const shouldRetryStatus = retryOnStatuses.includes(res.status);
+      if (shouldRetryStatus && attempt < maxAttempts) {
+        const waitMs = backoffMs[Math.min(attempt - 1, backoffMs.length - 1)];
+        if (shouldLog) {
+          console.warn(`[upstream] rid=${rid} label=${label} attempt=${attempt}/${maxAttempts} retry=1 reason=http_${res.status} backoff=${waitMs}ms`);
+        }
+        await sleep(waitMs);
+        continue;
+      }
+
+      return { res, data: data as T | null, attempt, timingMs: elapsed };
+    } catch (err: any) {
+      const elapsed = Date.now() - startedAt;
+      const detail = classifyFetchError(err, url);
+      if (shouldLog) {
+        console.warn(`[upstream] rid=${rid} label=${label} attempt=${attempt}/${maxAttempts} timing=${elapsed}ms err=${detail}`);
+      }
+      if (isTransientFetchError(err) && attempt < maxAttempts) {
+        const waitMs = backoffMs[Math.min(attempt - 1, backoffMs.length - 1)];
+        if (shouldLog) {
+          console.warn(`[upstream] rid=${rid} label=${label} attempt=${attempt}/${maxAttempts} retry=1 reason=transient_network backoff=${waitMs}ms`);
+        }
+        await sleep(waitMs);
+        continue;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error("fetch retries exhausted");
+}
+
+function errorWithRequestId(
+  req: express.Request,
+  res: express.Response,
+  status: number,
+  code: string,
+  error: string,
+  extras: Record<string, any> = {}
+) {
+  return res.status(status).json({
+    code,
+    error,
+    requestId: getRequestId(req),
+    ...extras,
+  });
 }
 
 async function checkPepewApi() {
@@ -595,7 +744,7 @@ app.get("/wallet/healthz", async (_req, res) => {
   return res.json(buildHealthzPayload());
 });
 
-async function handleRpcHealthz(_req: express.Request, res: express.Response) {
+async function handleRpcHealthz(req: express.Request, res: express.Response) {
   const { url, headers } = getCoreRpcRequestConfig();
   const startedAt = Date.now();
   const rpcTimeoutMs = parseEnvNumber(process.env.CORE_RPC_TIMEOUT_MS || process.env.CORE_RPC_TIMEOUT, 4000);
@@ -613,21 +762,30 @@ async function handleRpcHealthz(_req: express.Request, res: express.Response) {
           params: [],
         }),
       },
-      rpcTimeoutMs
+      rpcTimeoutMs,
+      {
+        requestId: getRequestId(req),
+        label: "rpc.healthz.getblockcount",
+        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
+      }
     );
     const latencyMs = Date.now() - startedAt;
     if (!rpcRes.ok || data?.error) {
       const detail = data?.error?.message || data?.error || `RPC HTTP ${rpcRes.status}`;
-      return res.status(503).json({ ok: false, error: detail, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
+      return errorWithRequestId(req, res, 503, "RPC_UNAVAILABLE", String(detail), { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
     }
     const height = data?.result;
     if (!Number.isFinite(height)) {
-      return res.status(503).json({ ok: false, error: "invalid block height", latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
+      return errorWithRequestId(req, res, 503, "RPC_INVALID_DATA", "invalid block height", { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
     }
-    return res.json({ ok: true, height, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
+    return res.json({ ok: true, height, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs, requestId: getRequestId(req) });
   } catch (err: any) {
     const latencyMs = Date.now() - startedAt;
-    return res.status(503).json({ ok: false, error: classifyFetchError(err, url), latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
+    const detail = classifyFetchError(err, url);
+    if (isTimeoutErrorMessage(detail)) {
+      return errorWithRequestId(req, res, 504, "RPC_TIMEOUT", detail, { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
+    }
+    return errorWithRequestId(req, res, 503, "RPC_UNAVAILABLE", detail, { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
   }
 }
 
@@ -845,38 +1003,59 @@ app.get("/v1/requests/:id", ...readLimiters, requireAuth, (req, res) => {
 });
 
 app.get("/wallet/balance", ...readLimiters, async (req, res) => {
+  const startedAt = Date.now();
+  console.info(`[wallet.balance] start rid=${getRequestId(req)} address=${String(req.query.address || "")}`);
   const address = req.query.address as string;
-  try { addrSchema.parse(address); } catch (e: any) { return res.status(400).json({ error: "address invalid" }); }
+  try { addrSchema.parse(address); } catch (e: any) { return errorWithRequestId(req, res, 400, "VALIDATION_ERROR", "address invalid"); }
   const base = getPepewApiBaseV1();
-  if (!base) return res.status(503).json({ error: "PEPEW_API_BASE not set" });
+  if (!base) return errorWithRequestId(req, res, 503, "CONFIG_ERROR", "PEPEW_API_BASE not set");
   const url = `${base}/addr/${address}/balance`;
   try {
-    const { res: r, data } = await fetchJson(url, { method: "GET" }, 8000);
+    const { res: r, data } = await fetchJson(
+      url,
+      { method: "GET" },
+      8000,
+      { requestId: getRequestId(req), label: "wallet.balance.pepew-api" }
+    );
     if (!r.ok) {
-      return res.status(502).json({ error: data?.error || `upstream ${r.status}` });
+      return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", data?.error || `upstream ${r.status}`);
     }
-    if (!data) return res.status(502).json({ error: "upstream parse error" });
+    if (!data) return errorWithRequestId(req, res, 502, "UPSTREAM_PARSE_ERROR", "upstream parse error");
     return res.json(data);
   } catch (err: any) {
-    return res.status(502).json({ error: classifyFetchError(err, url) });
+    const detail = classifyFetchError(err, url);
+    if (isTimeoutErrorMessage(detail)) {
+      return errorWithRequestId(req, res, 504, "UPSTREAM_TIMEOUT", detail);
+    }
+    return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", detail);
+  } finally {
+    console.info(`[wallet.balance] end rid=${getRequestId(req)} address=${address} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
   }
 });
 
 app.get("/wallet/utxos", ...readLimiters, async (req, res) => {
+  const startedAt = Date.now();
+  console.info(`[wallet.utxos] start rid=${getRequestId(req)} address=${String(req.query.address || "")}`);
   const address = req.query.address as string;
-  try { addrSchema.parse(address); } catch (e: any) { return res.status(400).json({ error: "address invalid" }); }
+  try { addrSchema.parse(address); } catch (e: any) { return errorWithRequestId(req, res, 400, "VALIDATION_ERROR", "address invalid"); }
   const base = getPepewApiBaseV1();
-  if (!base) return res.status(503).json({ error: "PEPEW_API_BASE not set" });
+  if (!base) return errorWithRequestId(req, res, 503, "CONFIG_ERROR", "PEPEW_API_BASE not set");
   const url = `${base}/addr/${address}/utxos`;
   try {
-    const { res: r, data } = await fetchJson(url, { method: "GET" }, 8000);
+    const { res: r, data } = await fetchJson(
+      url,
+      { method: "GET" },
+      8000,
+      { requestId: getRequestId(req), label: "wallet.utxos.pepew-api" }
+    );
     if (!r.ok) {
-      return res.status(502).json({ error: data?.error || `upstream ${r.status}` });
+      return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", data?.error || `upstream ${r.status}`);
     }
-    if (!data) return res.status(502).json({ error: "upstream parse error" });
+    if (!data) return errorWithRequestId(req, res, 502, "UPSTREAM_PARSE_ERROR", "upstream parse error");
 
     // Enrich with scriptPubKey if missing (for P2PKH)
     const utxos = Array.isArray(data) ? data : (data.utxos || []);
+    console.info(`[utxo] address=${address} count=${utxos.length} rid=${getRequestId(req)} timing=${Date.now() - startedAt}ms`);
     const enriched = utxos.map((u: any) => {
       if (u.scriptPubKey) return u;
       try {
@@ -890,7 +1069,13 @@ app.get("/wallet/utxos", ...readLimiters, async (req, res) => {
 
     return res.json(enriched);
   } catch (err: any) {
-    return res.status(502).json({ error: classifyFetchError(err, url) });
+    const detail = classifyFetchError(err, url);
+    if (isTimeoutErrorMessage(detail)) {
+      return errorWithRequestId(req, res, 504, "UPSTREAM_TIMEOUT", detail);
+    }
+    return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", detail);
+  } finally {
+    console.info(`[wallet.utxos] end rid=${getRequestId(req)} address=${address} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
   }
 });
 
@@ -962,7 +1147,7 @@ function validFeeRate(rate: any) {
   return typeof rate === "number" && isFinite(rate) && rate > 0;
 }
 
-app.get("/wallet/fee/estimate", ...readLimiters, async (_req, res) => {
+app.get("/wallet/fee/estimate", ...readLimiters, async (req, res) => {
   const target = Number(process.env.FEE_ESTIMATE_TARGET || "6");
   const fallback = Number(process.env.FEE_ESTIMATE_FALLBACK || "0.0001");
   const { url, headers } = getCoreRpcRequestConfig();
@@ -979,18 +1164,24 @@ app.get("/wallet/fee/estimate", ...readLimiters, async (_req, res) => {
           params: [Number.isFinite(target) ? target : 6],
         }),
       },
-      5000
+      5000,
+      {
+        requestId: getRequestId(req),
+        label: "rpc.estimatesmartfee",
+        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
+      }
     );
     if (!rpcRes.ok || data?.error) {
-      return res.json({ feerate: fallback, source: "fallback" });
+      return res.json({ feerate: fallback, source: "fallback", requestId: getRequestId(req) });
     }
     const rate = data?.result?.feerate ?? data?.result?.feeRate;
     return res.json({
       feerate: validFeeRate(rate) ? rate : fallback,
       source: validFeeRate(rate) ? "estimatesmartfee" : "fallback",
+      requestId: getRequestId(req),
     });
   } catch {
-    return res.json({ feerate: fallback, source: "fallback" });
+    return res.json({ feerate: fallback, source: "fallback", requestId: getRequestId(req) });
   }
 });
 
@@ -1015,7 +1206,7 @@ function computeTxidFromRawTx(rawTx: string) {
   }
 }
 
-async function debugDecodeRawTx(rawTx: string, url: string, headers: Record<string, string>) {
+async function debugDecodeRawTx(req: express.Request, rawTx: string, url: string, headers: Record<string, string>) {
   const tmpPath = "/tmp/rawtx.hex";
   const allowDebugFile = process.env.WALLET_API_DEBUG_RAWTX_FILE === "1";
   if (allowDebugFile) {
@@ -1043,14 +1234,19 @@ async function debugDecodeRawTx(rawTx: string, url: string, headers: Record<stri
           params: [rawTx],
         }),
       },
-      Number.isFinite(timeoutMs) ? timeoutMs : 10000
+      Number.isFinite(timeoutMs) ? timeoutMs : 10000,
+      {
+        requestId: getRequestId(req),
+        label: "rpc.decoderawtransaction",
+        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
+      }
     );
     if (!data) {
-      console.warn(`[broadcast] decoderawtransaction parse failed (status=${rpcRes.status})`);
+      console.warn(`[broadcast] decoderawtransaction parse failed (status=${rpcRes.status}) rid=${getRequestId(req)}`);
       return;
     }
     if (!rpcRes.ok) {
-      console.warn(`[broadcast] decoderawtransaction HTTP ${rpcRes.status}`);
+      console.warn(`[broadcast] decoderawtransaction HTTP ${rpcRes.status} rid=${getRequestId(req)}`);
     }
     if (data?.error) {
       const code = typeof data.error.code === "number" ? data.error.code : undefined;
@@ -1059,7 +1255,7 @@ async function debugDecodeRawTx(rawTx: string, url: string, headers: Record<stri
         : typeof data.error === "string"
           ? data.error
           : JSON.stringify(data.error);
-      console.warn(`[broadcast] decoderawtransaction error ${code ?? "unknown"}: ${message}`);
+      console.warn(`[broadcast] decoderawtransaction error ${code ?? "unknown"}: ${message} rid=${getRequestId(req)}`);
       return;
     }
     const result = data?.result || {};
@@ -1071,10 +1267,10 @@ async function debugDecodeRawTx(rawTx: string, url: string, headers: Record<stri
         : "n/a";
     const vinCount = Array.isArray(result.vin) ? result.vin.length : 0;
     const voutCount = Array.isArray(result.vout) ? result.vout.length : 0;
-    console.info(`[broadcast] decoderawtransaction ok txid=${txid} vsize=${vsize} vin=${vinCount} vout=${voutCount}`);
+    console.info(`[broadcast] decoderawtransaction ok txid=${txid} vsize=${vsize} vin=${vinCount} vout=${voutCount} rid=${getRequestId(req)}`);
   } catch (err: any) {
     const detail = classifyFetchError(err, url);
-    console.warn(`[broadcast] decoderawtransaction request failed: ${detail}`);
+    console.warn(`[broadcast] decoderawtransaction request failed: ${detail} rid=${getRequestId(req)}`);
   } finally {
     if (allowDebugFile) {
       try {
@@ -1087,6 +1283,15 @@ async function debugDecodeRawTx(rawTx: string, url: string, headers: Record<stri
 }
 
 async function handleBroadcast(req: express.Request, res: express.Response) {
+  const startedAt = Date.now();
+  const fromAddress = typeof req.body?.fromAddress === "string" ? req.body.fromAddress : "unknown";
+  const amount = typeof req.body?.amount === "number" || typeof req.body?.amount === "string"
+    ? String(req.body.amount)
+    : "unknown";
+  const utxos = Array.isArray(req.body?.utxos) ? req.body.utxos : [];
+  console.info(`[wallet.broadcast] start rid=${getRequestId(req)} address=${fromAddress}`);
+  console.info(`[tx-build] address=${fromAddress} utxoCount=${utxos.length} amount=${amount} rid=${getRequestId(req)}`);
+
   const rawTx = extractRawTx(req.body);
   const minHexLen = 10;
   const rawTxLen = rawTx.length;
@@ -1098,14 +1303,14 @@ async function handleBroadcast(req: express.Request, res: express.Response) {
     ? crypto.createHash("sha256").update(rawTx, "hex").digest("hex").slice(0, 16)
     : "n/a";
   console.info(
-    `[broadcast] RPC request method=sendrawtransaction params=[string] rawTxLen=${rawTxLen} rawTxHex=${rawTxHex} rawTxEvenLen=${rawTxEvenLen} rawTxStartsWith0x=${rawTxStartsWith0x} rawTxHasNewline=${rawTxHasNewline} rawTxHash16=${rawTxHash16}`
+    `[broadcast] RPC request method=sendrawtransaction params=[string] rawTxLen=${rawTxLen} rawTxHex=${rawTxHex} rawTxEvenLen=${rawTxEvenLen} rawTxStartsWith0x=${rawTxStartsWith0x} rawTxHasNewline=${rawTxHasNewline} rawTxHash16=${rawTxHash16} rid=${getRequestId(req)}`
   );
   if (!rawTx || !rawTxHex || !rawTxEvenLen || rawTxLen < minHexLen) {
-    return res.status(400).json({ error: "invalid rawTx" });
+    return errorWithRequestId(req, res, 400, "VALIDATION_ERROR", "invalid rawTx");
   }
   const { url, headers } = getCoreRpcRequestConfig();
   if (isDebugRawTxEnabled()) {
-    await debugDecodeRawTx(rawTx, url, headers);
+    await debugDecodeRawTx(req, rawTx, url, headers);
   }
   try {
     const timeoutMs = Number(process.env.CORE_RPC_TIMEOUT_MS || process.env.CORE_RPC_TIMEOUT || "10000");
@@ -1121,11 +1326,16 @@ async function handleBroadcast(req: express.Request, res: express.Response) {
           params: [rawTx],
         }),
       },
-      Number.isFinite(timeoutMs) ? timeoutMs : 10000
+      Number.isFinite(timeoutMs) ? timeoutMs : 10000,
+      {
+        requestId: getRequestId(req),
+        label: "rpc.sendrawtransaction",
+        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
+      }
     );
     if (!data) {
-      console.error(`[broadcast] RPC response parse failed (status=${rpcRes.status})`);
-      return res.status(502).json({ error: "rpc unavailable" });
+      console.error(`[broadcast] RPC response parse failed (status=${rpcRes.status}) rid=${getRequestId(req)}`);
+      return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
     }
     if (data?.error) {
       const code = typeof data.error.code === "number" ? data.error.code : undefined;
@@ -1134,38 +1344,45 @@ async function handleBroadcast(req: express.Request, res: express.Response) {
         : typeof data.error === "string"
           ? data.error
           : JSON.stringify(data.error);
-      console.warn(`[broadcast] RPC error ${code ?? "unknown"}: ${message}`);
+      console.warn(`[broadcast] RPC error ${code ?? "unknown"}: ${message} rid=${getRequestId(req)}`);
       if (code === -22) {
-        return res.status(400).json({ error: "invalid rawTx", code, message });
+        return errorWithRequestId(req, res, 400, "INVALID_RAW_TX", "invalid rawTx", { code, message });
       }
       if (code === -26) {
         if (message.toLowerCase().includes("txn-mempool-conflict")) {
           const txid = computeTxidFromRawTx(rawTx);
           if (txid) {
-            console.info(`[broadcast] mempool-conflict treated as ok txid=${txid}`);
-            return res.json({ ok: true, txid, note: "already in mempool" });
+            console.info(`[broadcast] mempool-conflict treated as ok txid=${txid} rid=${getRequestId(req)}`);
+            console.info(`[broadcast] address=${fromAddress} txid=${txid} rid=${getRequestId(req)}`);
+            return res.json({ ok: true, txid, note: "already in mempool", requestId: getRequestId(req) });
           }
-          console.warn("[broadcast] mempool-conflict but txid compute failed");
-          return res.json({ ok: true, note: "already in mempool" });
+          console.warn(`[broadcast] mempool-conflict but txid compute failed rid=${getRequestId(req)}`);
+          return res.json({ ok: true, note: "already in mempool", requestId: getRequestId(req) });
         }
-        return res.status(422).json({ error: "tx rejected", code, message });
+        return errorWithRequestId(req, res, 422, "TX_REJECTED", "tx rejected", { code, message });
       }
-      return res.status(502).json({ error: "rpc error", code, message });
+      return errorWithRequestId(req, res, 502, "RPC_ERROR", "rpc error", { code, message });
     }
     if (!rpcRes.ok) {
-      console.error(`[broadcast] RPC HTTP ${rpcRes.status}`);
-      return res.status(502).json({ error: "rpc unavailable" });
+      console.error(`[broadcast] RPC HTTP ${rpcRes.status} rid=${getRequestId(req)}`);
+      return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
     }
     const txid = data?.result;
     if (!txid) {
-      console.error("[broadcast] RPC missing txid");
-      return res.status(502).json({ error: "rpc unavailable" });
+      console.error(`[broadcast] RPC missing txid rid=${getRequestId(req)}`);
+      return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
     }
-    return res.json({ ok: true, txid });
+    console.info(`[broadcast] address=${fromAddress} txid=${txid} rid=${getRequestId(req)}`);
+    return res.json({ ok: true, txid, requestId: getRequestId(req) });
   } catch (err: any) {
     const detail = classifyFetchError(err, url);
-    console.error(`[broadcast] RPC request failed: ${detail}`);
-    return res.status(502).json({ error: "rpc unavailable" });
+    console.error(`[broadcast] RPC request failed: ${detail} rid=${getRequestId(req)}`);
+    if (isTimeoutErrorMessage(detail)) {
+      return errorWithRequestId(req, res, 504, "RPC_TIMEOUT", detail);
+    }
+    return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
+  } finally {
+    console.info(`[wallet.broadcast] end rid=${getRequestId(req)} address=${fromAddress} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
   }
 }
 
@@ -1860,20 +2077,90 @@ function wantsJson(req: express.Request) {
   return accept.includes("application/json");
 }
 
-async function handleRawTx(req: express.Request, res: express.Response) {
-  const txid = String(req.query.txid || req.params.txid || "");
-  if (!isValidTxid(txid)) return res.status(400).json({ error: "txid invalid" });
+type RawTxCacheEntry = {
+  rawTx: string;
+  expiresAt: number;
+};
 
+type RawTxFetchSuccess = {
+  ok: true;
+  txid: string;
+  rawTx: string;
+  source: "cache" | "indexer" | "rpc";
+};
+
+type RawTxFetchFailure = {
+  ok: false;
+  txid: string;
+  status: number;
+  code: string;
+  error: string;
+  hint?: string;
+};
+
+type RawTxFetchResult = RawTxFetchSuccess | RawTxFetchFailure;
+
+const rawTxCacheTtlMs = Math.max(1000, parseEnvNumber(process.env.RAW_TX_CACHE_TTL_MS, 20000));
+const rawTxCacheMax = Math.max(100, parseEnvNumber(process.env.RAW_TX_CACHE_MAX, 2000));
+const rawTxBatchMax = Math.min(50, Math.max(1, parseEnvNumber(process.env.RAW_TX_BATCH_MAX, 50)));
+const rawTxBatchConcurrency = Math.max(1, Math.min(10, parseEnvNumber(process.env.RAW_TX_BATCH_CONCURRENCY, 6)));
+const rawTxCache = new Map<string, RawTxCacheEntry>();
+
+function isRawTxFetchSuccess(result: RawTxFetchResult): result is RawTxFetchSuccess {
+  return result.ok;
+}
+
+function normalizeTxid(txid: string) {
+  return txid.trim().toLowerCase();
+}
+
+function evictRawTxCacheIfNeeded() {
+  const now = Date.now();
+  for (const [key, entry] of rawTxCache.entries()) {
+    if (entry.expiresAt <= now) rawTxCache.delete(key);
+  }
+  while (rawTxCache.size > rawTxCacheMax) {
+    const oldestKey = rawTxCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    rawTxCache.delete(oldestKey);
+  }
+}
+
+function getRawTxFromCache(txid: string) {
+  const entry = rawTxCache.get(txid);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    rawTxCache.delete(txid);
+    return null;
+  }
+  return entry.rawTx;
+}
+
+function setRawTxCache(txid: string, rawTx: string) {
+  rawTxCache.delete(txid);
+  rawTxCache.set(txid, {
+    rawTx,
+    expiresAt: Date.now() + rawTxCacheTtlMs,
+  });
+  evictRawTxCacheIfNeeded();
+}
+
+async function fetchRawTxUpstream(txid: string, requestId: string): Promise<RawTxFetchResult> {
   const base = getPepewApiBaseV1();
   const url = base ? `${base}/tx/${txid}` : "";
   let lastError = "";
-  const startAt = Date.now();
+  const indexerStartAt = Date.now();
 
-  // 1) Try upstream pepew-api
+  // 1) Try upstream pepew-api indexer
   if (url) {
     try {
-      const { res: apiRes, data } = await fetchJson(url, { method: "GET" }, 15000);
-      const elapsed = Date.now() - startAt;
+      const { res: apiRes, data } = await fetchJson(
+        url,
+        { method: "GET" },
+        15000,
+        { requestId, label: "rawtx.indexer" }
+      );
+      const elapsed = Date.now() - indexerStartAt;
       if (apiRes.ok && data) {
         const hex = typeof data?.hex === "string"
           ? data.hex
@@ -1881,9 +2168,8 @@ async function handleRawTx(req: express.Request, res: express.Response) {
             ? data.result.hex
             : null;
         if (hex) {
-          console.info(`[rawtx] indexer ok timing=${elapsed}ms txid=${txid}`);
-          if (wantsJson(req)) return res.json({ txid, hex });
-          return res.type("text/plain").send(hex);
+          console.info(`[rawtx] indexer ok timing=${elapsed}ms txid=${txid} rid=${requestId}`);
+          return { ok: true, txid, rawTx: hex, source: "indexer" };
         }
       }
       if (apiRes.status !== 404) {
@@ -1891,7 +2177,7 @@ async function handleRawTx(req: express.Request, res: express.Response) {
       }
     } catch (err: any) {
       lastError = classifyFetchError(err, url);
-      console.warn(`[rawtx] indexer failed timing=${Date.now() - startAt}ms txid=${txid} err=${lastError}`);
+      console.warn(`[rawtx] indexer failed timing=${Date.now() - indexerStartAt}ms txid=${txid} err=${lastError} rid=${requestId}`);
     }
   }
 
@@ -1911,21 +2197,25 @@ async function handleRawTx(req: express.Request, res: express.Response) {
           params: [txid, 0], // use integer 0 instead of boolean false
         }),
       },
-      15000
+      15000,
+      {
+        requestId,
+        label: "rpc.getrawtransaction",
+        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
+      }
     );
 
     const elapsed = Date.now() - rpcStartAt;
     if (rpcRes.ok && data?.result) {
       const hex = data.result;
-      console.info(`[rawtx] rpc ok timing=${elapsed}ms txid=${txid}`);
-      if (wantsJson(req)) return res.json({ txid, hex });
-      return res.type("text/plain").send(hex);
+      console.info(`[rawtx] rpc ok timing=${elapsed}ms txid=${txid} rid=${requestId}`);
+      return { ok: true, txid, rawTx: hex, source: "rpc" };
     }
 
     if (data?.error) {
       const detail = data.error.message || JSON.stringify(data.error);
       if (rpcRes.status === 404 || /not found/i.test(detail)) {
-        return res.status(404).json({ error: "tx not found" });
+        return { ok: false, txid, status: 404, code: "TX_NOT_FOUND", error: "tx not found" };
       }
       lastError = lastError ? `${lastError}; RPC: ${detail}` : `RPC: ${detail}`;
     } else if (!rpcRes.ok) {
@@ -1934,17 +2224,165 @@ async function handleRawTx(req: express.Request, res: express.Response) {
   } catch (err: any) {
     const rpcErr = classifyFetchError(err, "rpc");
     const elapsed = Date.now() - rpcStartAt;
-    console.warn(`[rawtx] rpc failed timing=${elapsed}ms txid=${txid} err=${rpcErr}`);
-    if (err.name === "AbortError" || rpcErr.includes("timeout")) {
-      return res.status(504).json({ error: "rpc_timeout", txid, hint: "Node RPC is busy, please try later." });
+    console.warn(`[rawtx] rpc failed timing=${elapsed}ms txid=${txid} err=${rpcErr} rid=${requestId}`);
+    if (err.name === "AbortError" || isTimeoutErrorMessage(rpcErr)) {
+      return {
+        ok: false,
+        txid,
+        status: 504,
+        code: "RPC_TIMEOUT",
+        error: "Node RPC is busy, please try later.",
+        hint: "Node RPC is busy, please try later."
+      };
     }
     lastError = lastError ? `${lastError}; RPC: ${rpcErr}` : rpcErr;
   }
 
-  return res.status(502).json({ error: lastError || "failed to fetch raw tx" });
+  if (isTimeoutErrorMessage(lastError)) {
+    return { ok: false, txid, status: 504, code: "UPSTREAM_TIMEOUT", error: lastError };
+  }
+  return { ok: false, txid, status: 502, code: "UPSTREAM_ERROR", error: lastError || "failed to fetch raw tx" };
+}
+
+async function fetchRawTxWithCache(txid: string, requestId: string): Promise<RawTxFetchResult> {
+  const normalized = normalizeTxid(txid);
+  const cached = getRawTxFromCache(normalized);
+  if (cached) {
+    console.info(`[rawtx-cache] hit txid=${normalized} rid=${requestId}`);
+    return { ok: true, txid: normalized, rawTx: cached, source: "cache" };
+  }
+
+  const upstream = await fetchRawTxUpstream(normalized, requestId);
+  if (upstream.ok) {
+    setRawTxCache(normalized, upstream.rawTx);
+  }
+  return upstream;
+}
+
+type RawTxBatchItemOk = {
+  txid: string;
+  ok: true;
+  rawTx: string;
+};
+
+type RawTxBatchItemErr = {
+  txid: string;
+  ok: false;
+  code: string;
+  error: string;
+  requestId: string;
+};
+
+async function handleRawTxBatch(req: express.Request, res: express.Response) {
+  const startedAt = Date.now();
+  const rid = getRequestId(req);
+  const body = req.body as { txids?: unknown };
+  const txidsRaw = body?.txids;
+  if (!Array.isArray(txidsRaw)) {
+    return errorWithRequestId(req, res, 400, "BAD_REQUEST", "txids must be an array");
+  }
+  if (txidsRaw.length < 1) {
+    return errorWithRequestId(req, res, 400, "BAD_REQUEST", "txids array must not be empty");
+  }
+  if (txidsRaw.length > rawTxBatchMax) {
+    return errorWithRequestId(req, res, 400, "BAD_REQUEST", `txids exceeds max batch size ${rawTxBatchMax}`);
+  }
+
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const item of txidsRaw) {
+    if (typeof item !== "string") {
+      return errorWithRequestId(req, res, 400, "BAD_REQUEST", "each txid must be a string");
+    }
+    const txid = normalizeTxid(item);
+    if (!isValidTxid(txid)) {
+      return errorWithRequestId(req, res, 400, "BAD_REQUEST", `invalid txid: ${item}`);
+    }
+    if (!seen.has(txid)) {
+      seen.add(txid);
+      normalized.push(txid);
+    }
+  }
+  if (!normalized.length) {
+    return errorWithRequestId(req, res, 400, "BAD_REQUEST", "txids array must contain at least one valid txid");
+  }
+
+  const results: Array<RawTxBatchItemOk | RawTxBatchItemErr> = new Array(normalized.length);
+  let nextIndex = 0;
+  let cacheHit = 0;
+  let cacheMiss = 0;
+  const workerCount = Math.min(rawTxBatchConcurrency, normalized.length);
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < normalized.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const txid = normalized[index];
+      const fetched = await fetchRawTxWithCache(txid, rid);
+      if (isRawTxFetchSuccess(fetched)) {
+        if (fetched.source === "cache") cacheHit += 1;
+        else cacheMiss += 1;
+        results[index] = { txid, ok: true, rawTx: fetched.rawTx };
+      } else {
+        cacheMiss += 1;
+        console.warn(`[rawtx-batch] txid=${txid} ok=false code=${fetched.code} status=${fetched.status} rid=${rid} err=${fetched.error}`);
+        results[index] = {
+          txid,
+          ok: false,
+          code: fetched.code,
+          error: fetched.error,
+          requestId: rid,
+        };
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  const okCount = results.filter((item) => item.ok).length;
+  const failedCount = results.length - okCount;
+  const timingMs = Date.now() - startedAt;
+
+  console.info(`[rawtx-batch] total=${results.length} ok=${okCount} failed=${failedCount} cacheHit=${cacheHit} cacheMiss=${cacheMiss} timing=${timingMs}ms rid=${rid}`);
+  return res.json({
+    requestId: rid,
+    results,
+    summary: {
+      total: results.length,
+      ok: okCount,
+      failed: failedCount,
+      cacheHit,
+      cacheMiss,
+      timingMs,
+    },
+  });
+}
+
+async function handleRawTx(req: express.Request, res: express.Response) {
+  const startedAt = Date.now();
+  const rid = getRequestId(req);
+  const txid = String(req.query.txid || req.params.txid || "");
+  let source = "none";
+  console.info(`[wallet.rawtx] start rid=${rid} txid=${txid}`);
+  try {
+    if (!isValidTxid(txid)) return errorWithRequestId(req, res, 400, "VALIDATION_ERROR", "txid invalid");
+    const fetched = await fetchRawTxWithCache(txid, rid);
+    if (isRawTxFetchSuccess(fetched)) {
+      source = fetched.source;
+      if (wantsJson(req)) return res.json({ txid: fetched.txid, hex: fetched.rawTx, source: fetched.source, requestId: rid });
+      return res.type("text/plain").send(fetched.rawTx);
+    }
+    return errorWithRequestId(req, res, fetched.status, fetched.code, fetched.error, {
+      txid: fetched.txid,
+      ...(fetched.hint ? { hint: fetched.hint } : {}),
+    });
+  } finally {
+    console.info(`[wallet.rawtx] end rid=${rid} txid=${txid} source=${source} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
+  }
 }
 
 app.get("/wallet/tx/raw", ...readLimiters, handleRawTx);
 app.get("/api/tx/raw", ...readLimiters, handleRawTx);
 app.get("/v1/tx/:txid", ...readLimiters, handleRawTx);
 app.get("/wallet/tx/:txid", ...readLimiters, handleRawTx);
+app.post("/wallet/tx/raw/batch", ...readLimiters, handleRawTxBatch);
+app.post("/api/tx/raw/batch", ...readLimiters, handleRawTxBatch);

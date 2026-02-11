@@ -1,65 +1,225 @@
 import { Context, InlineKeyboard } from "grammy";
-import { ApiError, devmmStatus, DevmmStatusEntry, getStrategyStatus, StrategyConfig, StrategyFill } from "../api.js";
+import { ApiError, devmmStatus, DevmmStatusEntry, getStrategyStatus, StrategyConfig } from "../api.js";
 import { safeSend } from "../utils/telegram.js";
-import { safeText, truncateText } from "../utils/strings.js";
+import { renderMenu } from "../utils/menu.js";
+import { truncateText } from "../utils/strings.js";
 import { ExchangeName } from "../lib/markets.js";
 import { handleDca } from "./dca.js";
 import { handleGrid } from "./grid.js";
 import { handleMm } from "./mm.js";
 import { handleDevmm } from "./devmm.js";
-import { sendMainMenu } from "./mainMenu.js";
+import { sendMainMenu, withMenuNav } from "./mainMenu.js";
 
-function exchangeLabel(exchange: ExchangeName): string {
+const STRATEGY_CALLBACK_PREFIX = "strategy:";
+const STRATEGY_CALLBACK_MAX_BYTES = 64;
+const EXCHANGE_ORDER: ExchangeName[] = ["nonkyc", "dextrade", "nestex"];
+
+type NumericFormatOptions = {
+    maxDecimals?: number;
+    minDecimals?: number;
+    group?: boolean;
+};
+
+function exchangeLabel(exchange: string): string {
     if (exchange === "nonkyc") return "NonKYC";
     if (exchange === "dextrade") return "Dex-Trade";
-    return "NestEX";
+    if (exchange === "nestex") return "NestEX";
+    return exchange;
 }
 
-function formatDateTime(ts: number | null | undefined): string {
+function normalizeExchange(value: string | null | undefined): ExchangeName | null {
+    if (!value) return null;
+    const normalized = value.toLowerCase();
+    if (normalized === "nonkyc" || normalized === "dextrade" || normalized === "nestex") {
+        return normalized;
+    }
+    return null;
+}
+
+function formatTimeHHmm(ts: number | null | undefined): string {
     if (!ts || !Number.isFinite(ts)) return "-";
-    return new Date(ts).toISOString().replace("T", " ").slice(0, 16);
+    return new Date(ts).toISOString().slice(11, 16);
 }
 
-function trimNumberString(value: string): string {
-    return value.replace(/(?:\.0+|(\.\\d+?)0+)$/, "$1");
+function addThousandsSeparators(value: string): string {
+    const [intPart, fracPart] = value.split(".");
+    const sign = intPart.startsWith("-") ? "-" : "";
+    const digits = sign ? intPart.slice(1) : intPart;
+    const grouped = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return fracPart ? `${sign}${grouped}.${fracPart}` : `${sign}${grouped}`;
 }
 
-function formatQuantity(value: number | null | undefined): string {
+function formatNumber(value: number | null | undefined, options: NumericFormatOptions = {}): string {
     if (typeof value !== "number" || !Number.isFinite(value)) return "-";
-    const abs = Math.abs(value);
-    if (abs < 1e-8) return value.toExponential(6);
-    return trimNumberString(value.toPrecision(10));
+    const maxDecimals = options.maxDecimals ?? 4;
+    const minDecimals = Math.max(0, Math.min(options.minDecimals ?? 0, maxDecimals));
+    const group = options.group ?? false;
+    const fixed = value.toFixed(maxDecimals);
+    const [intPart, fracPart = ""] = fixed.split(".");
+    let trimmedFrac = fracPart;
+    while (trimmedFrac.length > minDecimals && trimmedFrac.endsWith("0")) {
+        trimmedFrac = trimmedFrac.slice(0, -1);
+    }
+    const raw = trimmedFrac.length > 0 ? `${intPart}.${trimmedFrac}` : intPart;
+    const normalized = raw === "-0" ? "0" : raw;
+    return group ? addThousandsSeparators(normalized) : normalized;
 }
 
 function formatPrice(value: number | null | undefined): string {
-    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "-";
-    const abs = Math.abs(value);
-    if (abs < 1e-8) return value.toExponential(6);
-    return trimNumberString(value.toPrecision(12));
+    return formatNumber(value, { maxDecimals: 12, minDecimals: 0, group: false });
 }
 
-/**
- * Format interval in human-readable form: 10m, 1h 30m, etc.
- */
 function formatInterval(sec: number | null | undefined): string {
     if (!sec || !Number.isFinite(sec) || sec <= 0) return "-";
-    if (sec < 60) return `${sec}s`;
+    if (sec < 60) return `${Math.floor(sec)}s`;
     if (sec < 3600) return `${Math.floor(sec / 60)}m`;
     const hours = Math.floor(sec / 3600);
     const mins = Math.floor((sec % 3600) / 60);
     return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
 }
 
-function formatTimeAgo(ts: number): string {
-    const sec = Math.floor((Date.now() - ts) / 1000);
-    if (sec < 60) return `${sec}s ago`;
-    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
-    const hours = Math.floor(sec / 3600);
-    return `${hours}h ago`;
+function getQuoteFromPair(pair: string): string {
+    const parts = pair.split("/");
+    return parts.length > 1 ? parts[1] : "";
 }
 
-const STRATEGY_CALLBACK_PREFIX = "strategy:";
-const STRATEGY_CALLBACK_MAX_BYTES = 64;
+function toFiniteNumber(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim().length > 0) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+}
+
+function formatConfigNumber(value: unknown, maxDecimals = 2, group = false): string {
+    const num = toFiniteNumber(value);
+    if (num === null) return "?";
+    return formatNumber(num, { maxDecimals, group });
+}
+
+function sanitizeReason(value: unknown, maxLen = 60): string {
+    if (!value) return "";
+    const text = String(value).replace(/\s+/g, " ").trim();
+    if (!text) return "";
+    return truncateText(text, maxLen);
+}
+
+function formatPepewBalance(value: number | null | undefined): string {
+    const numeric = toFiniteNumber(value);
+    if (numeric === null) return "-";
+    const abs = Math.abs(numeric);
+    if (abs >= 1) return formatNumber(numeric, { maxDecimals: 0, group: true });
+    return formatNumber(numeric, { maxDecimals: 4, minDecimals: 0, group: false });
+}
+
+function formatStrategyParams(config: StrategyConfig): string {
+    const params = (config.params || {}) as Record<string, any>;
+    const quote = getQuoteFromPair(config.pair);
+
+    if (config.strategy === "DCA") {
+        const budget = formatConfigNumber(params.budget, 2, false);
+        const intervalSec = toFiniteNumber(params.intervalSec) ?? toFiniteNumber(params.interval_sec) ?? 600;
+        return `budget ${budget} ${quote} · every ${formatInterval(intervalSec)}`;
+    }
+
+    if (config.strategy === "GRID") {
+        const levels = params.grid_levels ?? "?";
+        const stepPct = toFiniteNumber(params.grid_step_pct);
+        const step = stepPct === null ? "?" : `${formatNumber(stepPct * 100, { maxDecimals: 2 })}%`;
+        const budget = formatConfigNumber(params.total_quote_budget, 2, false);
+        return `levels ${levels} · step ${step} · budget ${budget} ${quote}`;
+    }
+
+    if (config.strategy === "MM") {
+        const spreadPct = toFiniteNumber(params.spread_pct);
+        const spread = spreadPct === null ? "?" : `${formatNumber(spreadPct * 100, { maxDecimals: 2 })}%`;
+        const ordersPerSide = params.orders_per_side ?? 1;
+        const refresh = toFiniteNumber(params.refresh_sec) ?? 15;
+        return `spread ${spread} · orders ${ordersPerSide} · refresh ${formatInterval(refresh)}`;
+    }
+
+    return "configured";
+}
+
+function getStrategyRuntimeStatus(config: StrategyConfig): { icon: string; text: string } {
+    if (config.disabledReason) {
+        return { icon: "⛔", text: `AUTO-STOPPED (${sanitizeReason(config.disabledReason, 32)})` };
+    }
+    if (config.backoff && config.backoff.remainingSec > 0) {
+        return { icon: "⏳", text: `BACKOFF ${formatInterval(config.backoff.remainingSec)}` };
+    }
+    return config.enabled ? { icon: "✅", text: "ACTIVE" } : { icon: "⏸️", text: "STOPPED" };
+}
+
+function countOpenOrders(entry: DevmmStatusEntry): number {
+    return (entry.orders?.buyOrderId ? 1 : 0) + (entry.orders?.sellOrderId ? 1 : 0);
+}
+
+function getDevmmStatusIcon(status: DevmmStatusEntry["status"] | string): string {
+    if (status === "ACTIVE") return "✅";
+    if (status === "DEGRADED") return "⚠️";
+    if (status === "PAUSED") return "⏸️";
+    return "⏹️";
+}
+
+function getDevmmFlags(entry: DevmmStatusEntry): string[] {
+    const flags: string[] = [];
+    if (entry.market && typeof entry.market.spread === "number" && entry.market.spread <= 0) {
+        flags.push("ZERO_SPREAD_LOOP");
+    }
+    if (entry.pauseReason) flags.push(sanitizeReason(entry.pauseReason, 40));
+    if (entry.lastErrorCode) flags.push(sanitizeReason(entry.lastErrorCode, 40));
+    if (entry.lastError && !entry.lastErrorCode) flags.push(sanitizeReason(entry.lastError, 40));
+    return flags.filter((v, idx) => v.length > 0 && flags.indexOf(v) === idx);
+}
+
+function formatDevmmSummaryLine(entry: DevmmStatusEntry | null, exchange: ExchangeName): string {
+    const label = exchangeLabel(exchange).padEnd(9, " ");
+    if (!entry) {
+        return `• ${label} ⏹️ STOPPED`;
+    }
+    const status = entry.status || "STOPPED";
+    const icon = getDevmmStatusIcon(status);
+    const detailParts: string[] = [];
+    const openOrders = countOpenOrders(entry);
+    if (openOrders > 0) detailParts.push(`open ${openOrders}`);
+    const flags = getDevmmFlags(entry);
+    if (flags.length > 0) detailParts.push(flags[0]);
+    const details = detailParts.length > 0 ? `  (${detailParts.join(" · ")})` : "";
+    return `• ${label} ${icon} ${status}${details}`;
+}
+
+function formatDebugSection(entry: DevmmStatusEntry | null, exchange: ExchangeName): string[] {
+    const label = exchangeLabel(exchange);
+    if (!entry) {
+        return [label, "• status           STOPPED (no data)"];
+    }
+
+    const flags = getDevmmFlags(entry);
+    const decision = sanitizeReason(entry.lastDecision || entry.lastAction || "N/A", 100);
+    const reason = flags.length > 0 ? flags.join(" | ") : "-";
+    const inventoryUsdt = entry.inventory && !("status" in entry.inventory)
+        ? formatNumber(entry.inventory.usdtBalance, { maxDecimals: 4, group: false })
+        : entry.inventory && "status" in entry.inventory
+            ? `unavailable (${sanitizeReason(entry.inventory.reason || "unknown", 30)})`
+            : "-";
+
+    const turnover = entry.turnover
+        ? `${formatNumber(entry.turnover.hourUsdt, { maxDecimals: 4 })} / ${formatNumber(entry.turnover.capHourUsdt, { maxDecimals: 4 })}`
+        : "-";
+
+    return [
+        label,
+        `• status           ${entry.status || "STOPPED"}`,
+        `• mid price        ${formatPrice(entry.market?.mid)}`,
+        `• hourly turnover  ${turnover}`,
+        `• inventory (USDT) ${inventoryUsdt}`,
+        `• open orders      ${countOpenOrders(entry)}`,
+        `• decision         ${decision}`,
+        `• reason / flags   ${reason}`,
+    ];
+}
 
 function buildStrategyCallback(action: string, value: string): string {
     const data = `${STRATEGY_CALLBACK_PREFIX}${action}:${value}`;
@@ -77,211 +237,6 @@ async function safeAnswerCallbackQuery(ctx: Context, step: string): Promise<void
     }
 }
 
-/**
- * Get quote unit from pair string (e.g., "PEPEW/BNB" -> "BNB")
- */
-function getQuoteFromPair(pair: string): string {
-    const parts = pair.split("/");
-    return parts.length > 1 ? parts[1] : "";
-}
-
-/**
- * Format compact params line for each strategy type
- * Output: "spread 5% | order 4 USDT/side | refresh 15s | last 2026-01-27 13:31"
- */
-function formatCompactParams(config: StrategyConfig, sharedBalance?: { freeUSDT: number; freePEPEW: number } | null): string {
-    const params = (config.params || {}) as Record<string, any>;
-    const lastRun = formatDateTime(config.lastRunAt);
-    const quote = getQuoteFromPair(config.pair);
-
-    if (config.strategy === "DCA") {
-        const budget = params.budget ?? "?";
-        const intervalSec = params.intervalSec ?? params.interval_sec ?? 600;
-        const interval = formatInterval(intervalSec);
-        const lastFilled = params.lastFilledQuote ? ` | lastFilled ${params.lastFilledQuote.toFixed(4)} ${quote}` : "";
-        const openBuy = params.openBuy !== undefined ? ` | openBuy ${params.openBuy}` : "";
-        return `budget ${budget} ${quote} | every ${interval}${lastFilled}${openBuy} | last ${lastRun}`;
-    }
-
-    if (config.strategy === "GRID") {
-        const levels = params.grid_levels ?? "?";
-        const step = params.grid_step_pct !== undefined
-            ? `${formatQuantity(params.grid_step_pct * 100)}%`
-            : "?";
-        const budget = params.total_quote_budget ?? "?";
-        const openOrders = params.open_orders_count ?? 0;
-        const placedBuy = params.placed_buy ?? 0;
-        const placedSell = params.placed_sell ?? 0;
-        const lastAction = params.last_action ?? "";
-
-        // Show status for GRID
-        let statusLine = `levels ${levels} | step ${step} | budget ${budget} ${quote} | last ${lastRun}`;
-
-        if (lastAction && (lastAction.startsWith("GRID tick ok:") || lastAction.startsWith("GRID:"))) {
-            // Recognize both old and new format
-            const cleanAction = lastAction.replace(/^GRID( tick ok)?: /, "");
-            statusLine += `\n   ✓ ${cleanAction}`;
-        } else if (openOrders > 0) {
-            statusLine += `\n   ✓ trackedOrders=${openOrders} (buy=${placedBuy}, sell=${placedSell})`;
-        }
-
-        // Show skip reasons if any
-        const skipReasons = params.skip_reasons || [];
-        if (skipReasons.length > 0) {
-            statusLine += `\n   skip: ${skipReasons[0]}`;
-        }
-
-        return statusLine;
-    }
-
-    if (config.strategy === "MM") {
-        const spread = params.spread_pct !== undefined
-            ? `${formatQuantity(params.spread_pct * 100)}%`
-            : "?";
-        const quotePerOrder = params.quote_per_order ?? params.order_quote ?? 2;
-        const ordersPerSide = params.orders_per_side ?? 1;
-        const totalPerSide = quotePerOrder * ordersPerSide;
-        const refresh = params.refresh_sec ?? 15;
-        const mode = params.mode ?? "TWO_SIDED";
-        const openOrders = params.open_orders_count ?? 0;
-        const placedBuy = params.placed_buy ?? 0;
-        const placedSell = params.placed_sell ?? 0;
-        const lastAction = params.last_action ?? "";
-
-        let statusLine = `spread ${spread} | quote/order ${quotePerOrder} ${quote} | orders/side ${ordersPerSide} | total/side ${totalPerSide} ${quote}\n   refresh ${formatInterval(refresh)} | mode ${mode} | last ${lastRun}`;
-
-        // Show placement info
-        if (lastAction && lastAction.startsWith("PLACED")) {
-            statusLine += `\n   ✓ placed buy=${placedBuy} sell=${placedSell}`;
-        } else if (openOrders > 0) {
-            statusLine += `\n   openOrders=${openOrders}`;
-        }
-
-        // Show skip reasons if any
-        let skipReasons = (params.skip_reasons || []) as string[];
-
-        // Final override: if shared balance or config-specific balance says we HAVE enough, don't show "have 0"
-        if (skipReasons.length > 0 && skipReasons[0].includes("NO_INVENTORY")) {
-            const isBuy = skipReasons[0].includes("BUY");
-            const isSell = skipReasons[0].includes("SELL");
-
-            // Use config-specific inventory if available, otherwise fallback to shared
-            const inv = config.currentInventory || (sharedBalance ? {
-                USDT: sharedBalance.freeUSDT,
-                PEPEW: sharedBalance.freePEPEW
-            } : null);
-
-            if (inv) {
-                if (isBuy && inv.USDT > 0) {
-                    skipReasons[0] = skipReasons[0].replace(/have 0(\.0+)?/, `have ${inv.USDT.toFixed(2)}`);
-                }
-                if (isSell && inv.PEPEW > 0) {
-                    skipReasons[0] = skipReasons[0].replace(/have 0(\.0+)?/, `have ${inv.PEPEW.toExponential(2)}`);
-                }
-            }
-        }
-
-        if (skipReasons.length > 0) {
-            // Include details like (have X, need Y)
-            statusLine += `\n   skip: ${skipReasons.slice(0, 2).join(" | ")}`;
-        }
-
-        return statusLine;
-    }
-
-    return `last ${lastRun}`;
-}
-
-/**
- * Aggregated fill for deduplication display
- */
-interface AggregatedFill {
-    strategy: string;
-    exchange: string;
-    pair: string;
-    side: string;
-    quoteQty: number;
-    price: number;
-    count: number;
-}
-
-function aggregateFills(fills: StrategyFill[]): AggregatedFill[] {
-    if (!fills || fills.length === 0) return [];
-
-    const aggregated: AggregatedFill[] = [];
-
-    for (const fill of fills) {
-        // Group by strategy, exchange, pair, side, qty (rounded), and price (rounded)
-        const matched = aggregated.find(a =>
-            a.strategy === fill.strategy &&
-            a.exchange === fill.exchange &&
-            a.pair === fill.pair &&
-            a.side === fill.side &&
-            Math.abs(a.quoteQty - (fill.quoteQty ?? 0)) < 0.0001 &&
-            Math.abs(a.price - (fill.price ?? 0)) / (a.price || 1) < 0.0001
-        );
-
-        if (matched) {
-            matched.count++;
-        } else {
-            aggregated.push({
-                strategy: fill.strategy,
-                exchange: fill.exchange,
-                pair: fill.pair,
-                side: fill.side,
-                quoteQty: fill.quoteQty ?? 0,
-                price: fill.price ?? 0,
-                count: 1,
-            });
-        }
-    }
-
-    return aggregated;
-}
-
-/**
- * Format aggregated fill with optional count
- * Output: "- MM NonKYC PEPEW/USDT: BUY 4 @ 4.56e-7 (x3)"
- */
-function formatAggregatedFill(fill: AggregatedFill): string {
-    const exchange =
-        fill.exchange === "nonkyc" || fill.exchange === "dextrade" || fill.exchange === "nestex"
-            ? exchangeLabel(fill.exchange as ExchangeName)
-            : fill.exchange;
-
-    const qtyStr = formatQuantity(fill.quoteQty);
-    const priceStr = formatPrice(fill.price);
-    const countSuffix = fill.count > 1 ? ` (x${fill.count})` : "";
-
-    return `- ${fill.strategy} ${exchange} ${fill.pair}: ${fill.side} ${qtyStr} @ ${priceStr}${countSuffix}`;
-}
-
-function formatDevmmCompact(entry: DevmmStatusEntry): string {
-    const status = entry.status || "STOPPED";
-    const turnover = entry.turnover?.todayUsdt ?? 0;
-    const fee = entry.turnover?.capDayUsdt ?? 0;
-    const openOrders = (entry.orders?.buyOrderId ? 1 : 0) + (entry.orders?.sellOrderId ? 1 : 0);
-    const reason = entry.pauseReason || entry.lastErrorCode || entry.lastError || "-";
-    return `${exchangeLabel(entry.exchange as ExchangeName)}: ${status} | open=${openOrders} | turnover=${formatQuantity(turnover)} | cap=${formatQuantity(fee)} | reason=${truncateText(reason, 80)}`;
-}
-
-function formatDevmmDetail(entry: DevmmStatusEntry): string {
-    const lines: string[] = [];
-    if (entry.market?.mid) {
-        lines.push(`mid=${formatPrice(entry.market.mid)}`);
-    }
-    if (entry.turnover) {
-        lines.push(`hour=${formatQuantity(entry.turnover.hourUsdt)}/${formatQuantity(entry.turnover.capHourUsdt)}`);
-    }
-    if (entry.inventory && !("status" in entry.inventory)) {
-        lines.push(`inventoryUSDT=${formatQuantity(entry.inventory.usdtBalance)}`);
-    }
-    if (entry.lastDecision) {
-        lines.push(`decision=${truncateText(entry.lastDecision, 80)}`);
-    }
-    return lines.join(" | ");
-}
-
 export async function handleStatus(ctx: Context): Promise<void> {
     const rawTgUserId = ctx.from?.id;
     if (!rawTgUserId) {
@@ -293,107 +248,93 @@ export async function handleStatus(ctx: Context): Promise<void> {
 
     try {
         const data = await getStrategyStatus(tgUserId);
-        let devmmEntries: DevmmStatusEntry[] = [];
-        try {
-            const devmm = await devmmStatus();
-            if (devmm.ok && devmm.exchanges) {
-                devmmEntries = devmm.exchanges;
-            }
-        } catch (devmmErr: any) {
-            console.warn(`[status] failed to fetch devmm status: ${devmmErr?.message || devmmErr}`);
-        }
-
         if (!data.ok) {
             await safeSend(ctx, { step: "status.api_error", text: "❌ Failed to fetch status. Please try again." });
             await sendMainMenu(ctx);
             return;
         }
 
+        let devmmEntries: DevmmStatusEntry[] = [];
+        try {
+            const devmm = await devmmStatus();
+            if (devmm.ok && devmm.exchanges) devmmEntries = devmm.exchanges;
+        } catch (devmmErr: any) {
+            console.warn(`[status] failed to fetch devmm status: ${devmmErr?.message || devmmErr}`);
+        }
+
+        const devmmMap = new Map<ExchangeName, DevmmStatusEntry>();
+        for (const entry of devmmEntries) {
+            const normalized = normalizeExchange(entry.exchange);
+            if (normalized) devmmMap.set(normalized, entry);
+        }
+
+        const tsCandidates: number[] = [];
+        const lines: string[] = [
+            "📊 Trade Status — PEPEPOW",
+            "────────────────────",
+            "",
+            "🏦 Balances",
+        ];
+
+        const balancesMap = new Map<string, any>();
+        for (const bal of data.balances || []) {
+            balancesMap.set(bal.exchange, bal);
+        }
+
+        for (const exchange of EXCHANGE_ORDER) {
+            const label = exchangeLabel(exchange).padEnd(9, " ");
+            const bal = balancesMap.get(exchange);
+            if (!bal) {
+                lines.push(`• ${label} ⚪ no data`);
+                continue;
+            }
+            if (bal.ok) {
+                const snap = bal.snapshot;
+                const usdtFree = snap?.assets?.USDT?.free ?? bal.assets?.USDT ?? 0;
+                const bnbFree = snap?.assets?.BNB?.free ?? bal.assets?.BNB ?? 0;
+                const pepewFree = snap?.assets?.PEPEW?.free ?? bal.assets?.PEPEW ?? 0;
+                const updatedTs = snap?.ts || bal.lastOkTs;
+                if (updatedTs) tsCandidates.push(updatedTs);
+
+                const parts = [
+                    `USDT ${formatNumber(usdtFree, { maxDecimals: 2, minDecimals: 2 })}`,
+                ];
+                if (exchange === "nonkyc") {
+                    parts.push(`BNB ${formatNumber(bnbFree, { maxDecimals: 4, minDecimals: 4 })}`);
+                }
+                parts.push(`PEPEW ${formatPepewBalance(pepewFree)}`);
+                lines.push(`• ${label} ${parts.join(" | ")}`);
+            } else {
+                const reason = sanitizeReason(bal.errCode || bal.reason || "BALANCE_FETCH_FAILED", 42);
+                if (bal.lastOkTs) tsCandidates.push(bal.lastOkTs);
+                lines.push(`• ${label} ⚠️ unavailable (${reason})`);
+            }
+        }
+
+        lines.push("", "⚙️ Active Strategies");
         const realConfigs = (data.configs || []).filter(c => c.tradeMode === "REAL" && c.enabled);
-
         if (realConfigs.length === 0) {
-            const lines = ["No active strategy config found. Use /dca, /grid, or /mm to start one."];
-            if (devmmEntries.length > 0) {
-                lines.push("", "DevMM summary:");
-                for (const entry of devmmEntries) {
-                    lines.push(`- ${formatDevmmCompact(entry)}`);
-                }
-            }
-            await safeSend(ctx, { step: "status.none", text: lines.join("\n") });
-            await sendMainMenu(ctx);
-            return;
-        }
-
-        const balanceLines: string[] = [];
-        if (data.balances && data.balances.length > 0) {
-            for (const bal of data.balances) {
-                const label = exchangeLabel(bal.exchange as ExchangeName);
-                if (bal.ok) {
-                    const snap = bal.snapshot;
-                    const usdt = snap?.assets?.USDT || { free: bal.assets.USDT, total: bal.assets.USDT };
-                    const bnb = snap?.assets?.BNB || { free: bal.assets.BNB, total: bal.assets.BNB };
-                    const pepew = snap?.assets?.PEPEW || { free: bal.assets.PEPEW, total: bal.assets.PEPEW };
-                    const updatedTs = snap?.ts || bal.lastOkTs || null;
-                    const parts: string[] = [];
-                    parts.push(`USDT ${usdt.free.toFixed(4)}/${usdt.total.toFixed(4)}`);
-                    if (bal.exchange === "nonkyc") {
-                        parts.push(`BNB ${bnb.free.toFixed(4)}/${bnb.total.toFixed(4)}`);
-                    }
-                    parts.push(`PEPEW ${pepew.free.toExponential(2)}/${pepew.total.toExponential(2)}`);
-                    balanceLines.push(`${label} balance: ${parts.join(" | ")} | ${formatDateTime(updatedTs)}`);
-                } else {
-                    const reason = bal.errCode || bal.reason || "BALANCE_FETCH_FAILED";
-                    const lastOk = bal.lastOkTs ? formatDateTime(bal.lastOkTs) : "-";
-                    balanceLines.push(`${label} balance: unavailable (${reason}, lastOk ${lastOk})`);
-                }
-            }
-        } else if (data.debug) {
-            // Fallback to debug balance if balances array missing
-            const usdtStr = data.debug.freeQuote.toFixed(4);
-            const pepewStr = data.debug.freePEPEW.toExponential(2);
-            balanceLines.push(`NonKYC balance: USDT ${usdtStr} | PEPEW ${pepewStr}`);
-        }
-
-        // Compact status display
-        const lines: string[] = [];
-        if (balanceLines.length > 0) {
-            lines.push(...balanceLines);
-            lines.push("");
-        }
-        lines.push("Strategies:");
-        realConfigs.forEach((cfg, index) => {
-            const exchangeDisplay =
-                cfg.exchange === "nonkyc" || cfg.exchange === "dextrade" || cfg.exchange === "nestex"
-                    ? exchangeLabel(cfg.exchange as ExchangeName)
-                    : cfg.exchange;
-            let status = cfg.enabled ? "ACTIVE" : "STOPPED";
-            if (cfg.disabledReason) {
-                status = `AUTO-STOPPED (${cfg.disabledReason})`;
-            } else if (cfg.backoff && cfg.backoff.remainingSec > 0) {
-                status = `BACKOFF ${formatInterval(cfg.backoff.remainingSec)}`;
-            }
-
-            lines.push(
-                `${index + 1}. ${cfg.strategy} ${exchangeDisplay} ${cfg.pair} ${status}`
-            );
-            const sharedBal = data.debug ? { freeUSDT: data.debug.freeQuote, freePEPEW: data.debug.freePEPEW } : null;
-            lines.push(`   ${formatCompactParams(cfg, sharedBal)}`);
-            lines.push("");
-        });
-
-        if (devmmEntries.length > 0) {
-            lines.push("");
-            lines.push("DevMM summary:");
-            for (const entry of devmmEntries) {
-                lines.push(`- ${formatDevmmCompact(entry)}`);
-            }
-            lines.push("");
-            lines.push("DevMM details:");
-            for (const entry of devmmEntries) {
-                const detail = formatDevmmDetail(entry);
-                lines.push(`- ${exchangeLabel(entry.exchange as ExchangeName)}: ${detail || "-"}`);
+            lines.push("• None active");
+        } else {
+            for (const cfg of realConfigs) {
+                const exchangeDisplay = exchangeLabel(cfg.exchange || "");
+                const strategyState = getStrategyRuntimeStatus(cfg);
+                lines.push(`• ${cfg.strategy}  ${exchangeDisplay}  ${cfg.pair}   ${strategyState.icon} ${strategyState.text}`);
+                lines.push(`  ${formatStrategyParams(cfg)}`);
+                if (cfg.lastRunAt) tsCandidates.push(cfg.lastRunAt);
             }
         }
+
+        lines.push("", "🤖 DevMM Summary");
+        for (const exchange of EXCHANGE_ORDER) {
+            const entry = devmmMap.get(exchange) || null;
+            lines.push(formatDevmmSummaryLine(entry, exchange));
+            if (entry?.updatedAt) tsCandidates.push(entry.updatedAt);
+            if (entry?.lastActionAt) tsCandidates.push(entry.lastActionAt);
+        }
+
+        const lastUpdateTs = tsCandidates.length > 0 ? Math.max(...tsCandidates) : Date.now();
+        lines.push("", `⏱ Last update: ${formatTimeHHmm(lastUpdateTs)}`);
 
         await safeSend(ctx, { step: "status.success", text: lines.join("\n") });
         await sendMainMenu(ctx);
@@ -410,16 +351,77 @@ export async function handleStatus(ctx: Context): Promise<void> {
     }
 }
 
+export async function handleDebug(ctx: Context): Promise<void> {
+    const rawTgUserId = ctx.from?.id;
+    if (!rawTgUserId) {
+        await safeSend(ctx, { step: "debug.no_user", text: "❌ Could not identify user (missing Telegram ID)." });
+        await sendMainMenu(ctx);
+        return;
+    }
+    const tgUserId = String(rawTgUserId);
+
+    try {
+        const statusData = await getStrategyStatus(tgUserId);
+        if (!statusData.ok) {
+            await safeSend(ctx, { step: "debug.status_error", text: "❌ Failed to fetch debug data." });
+            await sendMainMenu(ctx);
+            return;
+        }
+
+        const devmm = await devmmStatus();
+        if (!devmm.ok) {
+            await safeSend(ctx, { step: "debug.devmm_error", text: "❌ Failed to fetch DevMM debug data." });
+            await sendMainMenu(ctx);
+            return;
+        }
+
+        const devmmMap = new Map<ExchangeName, DevmmStatusEntry>();
+        for (const entry of devmm.exchanges || []) {
+            const normalized = normalizeExchange(entry.exchange);
+            if (normalized) devmmMap.set(normalized, entry);
+        }
+
+        const lines: string[] = [
+            "🛠 Debug — DevMM Details",
+            "────────────────────",
+        ];
+
+        if (statusData.debug) {
+            lines.push(
+                "",
+                `balance source: ${statusData.debug.balance_source || "-"}`,
+                `cache age ms: ${formatNumber(statusData.debug.cacheAgeMs, { maxDecimals: 0, group: true })}`
+            );
+        }
+
+        for (const exchange of EXCHANGE_ORDER) {
+            lines.push("");
+            lines.push(...formatDebugSection(devmmMap.get(exchange) || null, exchange));
+        }
+
+        await safeSend(ctx, { step: "debug.success", text: lines.join("\n") });
+        await sendMainMenu(ctx);
+    } catch (err: any) {
+        if (err instanceof ApiError) {
+            console.error(`[debug] API ${err.path} status=${err.status ?? "n/a"} message=${err.message}`);
+        } else {
+            console.error(`[debug] Error: ${err?.message || err}`);
+        }
+        await safeSend(ctx, { step: "debug.error", text: "❌ Failed to fetch debug data. Please try again." });
+        await sendMainMenu(ctx);
+    }
+}
+
 export async function handleStrategyMenu(ctx: Context): Promise<void> {
-    const keyboard = new InlineKeyboard()
+    const keyboard = withMenuNav(new InlineKeyboard()
         .text("DCA", buildStrategyCallback("open", "dca"))
         .text("GRID", buildStrategyCallback("open", "grid")).row()
         .text("MM", buildStrategyCallback("open", "mm"))
-        .text("DEVMM", buildStrategyCallback("open", "devmm"));
+        .text("DEVMM", buildStrategyCallback("open", "devmm")));
 
     await safeSend(ctx, {
         step: "strategy.menu",
-        text: "Select strategy:",
+        text: renderMenu("⚙ Strategy Control", "Choose what to manage:"),
         replyMarkup: keyboard,
     });
 }

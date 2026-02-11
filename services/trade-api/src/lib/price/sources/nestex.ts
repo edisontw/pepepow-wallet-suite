@@ -1,6 +1,7 @@
 import fetch from "node-fetch";
 import { NormalizedTicker } from "../types.js";
 import { fetchWithTimeout, parseNumber, truncateRaw } from "../utils.js";
+import { tradeLog } from "../../tradeLogger.js";
 
 const NESTEX_TICKER_URL =
     process.env.NESTEX_TICKER_URL || "https://trade.nestex.one/api/cg/tickers/PEPEW_USDT";
@@ -17,7 +18,12 @@ let orderbookDisableLogged = false;
 
 function debugLog(label: string, data: any): void {
     if (!NESTEX_DEBUG) return;
-    console.log(`[nestex:debug] ${label}:`, typeof data === "object" ? JSON.stringify(data, null, 2) : data);
+    tradeLog({
+        scope: "nestex",
+        level: "debug",
+        exchange: "nestex",
+        message: `${label}: ${typeof data === "object" ? JSON.stringify(data) : data}`,
+    });
 }
 
 function extractSymbolFromUrl(url: string): string | null {
@@ -67,7 +73,14 @@ export async function fetchNestExOrderbookTop(): Promise<{
     bookSource: "orderbook" | "ticker_fallback" | "ticker_primary";
 }> {
     if (!NESTEX_ORDERBOOK_URL) {
-        console.error(`[nestex] book.fail errCode=NO_BOOK url=n/a statusCode=n/a reason=ORDERBOOK_URL_EMPTY`);
+        tradeLog({
+            scope: "nestex",
+            level: "error",
+            exchange: "nestex",
+            message: "book.fail errCode=NO_BOOK url=n/a statusCode=n/a reason=ORDERBOOK_URL_EMPTY",
+            throttleKey: "nestex:book:no-url",
+            throttleSec: 60,
+        });
         return { bestBid: null, bestAsk: null, status: "EMPTY", raw: JSON.stringify({ error: "NestEx orderbook not configured" }), bookSource: "orderbook" };
     }
 
@@ -89,15 +102,36 @@ export async function fetchNestExOrderbookTop(): Promise<{
             const status = bestAsk <= bestBid ? "INVALID" : "OK";
             if (source === "ticker_primary") {
                 if (!orderbookDisableLogged || orderbookDisableReason !== reason) {
-                    console.log(`[nestex] book.primary source=ticker bid=${bestBid} ask=${bestAsk} reason=${reason}`);
+                    tradeLog({
+                        scope: "nestex",
+                        level: "info",
+                        exchange: "nestex",
+                        message: `book.primary source=ticker bid=${bestBid} ask=${bestAsk} reason=${reason}`,
+                        throttleKey: "nestex:book:primary",
+                        throttleSec: 30,
+                    });
                     orderbookDisableLogged = true;
                 }
             } else {
-                console.log(`[nestex] book.fallback reason=${reason} bestBid=${bestBid} bestAsk=${bestAsk} source=ticker`);
+                tradeLog({
+                    scope: "nestex",
+                    level: "warn",
+                    exchange: "nestex",
+                    message: `book.fallback reason=${reason} bestBid=${bestBid} bestAsk=${bestAsk} source=ticker`,
+                    throttleKey: `nestex:book:fallback:${reason}`,
+                    throttleSec: 30,
+                });
             }
             return { bestBid, bestAsk, status, raw, bookSource: source };
         }
-        console.error(`[nestex] book.fail errCode=NO_BOOK url=${NESTEX_ORDERBOOK_URL} statusCode=n/a reason=${reason}`);
+        tradeLog({
+            scope: "nestex",
+            level: "error",
+            exchange: "nestex",
+            message: `book.fail errCode=NO_BOOK url=${NESTEX_ORDERBOOK_URL} statusCode=n/a reason=${reason}`,
+            throttleKey: `nestex:book:fail:${reason}`,
+            throttleSec: 60,
+        });
         return { bestBid: null, bestAsk: null, status: "EMPTY", raw, bookSource: source };
     };
 
@@ -171,10 +205,25 @@ export async function fetchNestExOrderbookTop(): Promise<{
             });
             return fallbackToTicker("INVALID_BOOK", truncateRaw(data));
         }
-        console.log(`[nestex] book.ok bidsCount=${bidPrices.length} asksCount=${askPrices.length} bestBid=${bestBid} bestAsk=${bestAsk} source=orderbook`);
+        const spread = bestBid !== null && bestAsk !== null && mid && mid > 0 ? ((bestAsk - bestBid) / mid) : null;
+        tradeLog({
+            scope: "nestex",
+            level: "info",
+            exchange: "nestex",
+            message: `book.ok bestBid=${bestBid} bestAsk=${bestAsk} mid=${mid ?? "n/a"} spread=${spread ?? "n/a"} source=orderbook`,
+            throttleKey: "nestex:book:ok",
+            throttleSec: 30,
+        });
         return { bestBid, bestAsk, status, raw: truncateRaw(data), bookSource: "orderbook" };
     } catch (err: any) {
-        console.error(`[nestex] book.fail errCode=NO_BOOK url=${NESTEX_ORDERBOOK_URL} statusCode=n/a reason=${err.message}`);
+        tradeLog({
+            scope: "nestex",
+            level: "error",
+            exchange: "nestex",
+            message: `book.fail errCode=NO_BOOK url=${NESTEX_ORDERBOOK_URL} statusCode=n/a reason=${err.message}`,
+            throttleKey: "nestex:book:fetch-error",
+            throttleSec: 60,
+        });
         return fallbackToTicker("ORDERBOOK_FETCH_ERROR", JSON.stringify({ error: err.message }));
     }
 }
@@ -194,7 +243,14 @@ export async function fetchNestExTicker(): Promise<{
     volumeProvided: boolean;
 }> {
     if (!NESTEX_TICKER_URL) {
-        console.error(`[price] NestEx ticker not configured (NESTEX_TICKER_URL is empty)`);
+        tradeLog({
+            scope: "price",
+            level: "error",
+            exchange: "nestex",
+            message: "NestEx ticker not configured (NESTEX_TICKER_URL is empty)",
+            throttleKey: "nestex:ticker:not-configured",
+            throttleSec: 60,
+        });
         return {
             ticker: { exchange: "nestex", symbol: "PEPEW_USDT", last: null, bid: null, ask: null, volumeQuote: null, ts: null },
             raw: JSON.stringify({ error: "NestEx ticker not configured" }),
@@ -233,7 +289,14 @@ export async function fetchNestExTicker(): Promise<{
         });
         return { ticker, raw: truncateRaw(data), volumeProvided: volumeField !== undefined };
     } catch (err: any) {
-        console.error(`[price] NestEx fetch error: ${err.message}`);
+        tradeLog({
+            scope: "price",
+            level: "error",
+            exchange: "nestex",
+            message: `NestEx fetch error: ${err.message}`,
+            throttleKey: "nestex:ticker:fetch-error",
+            throttleSec: 60,
+        });
         return {
             ticker: { exchange: "nestex", symbol: "PEPEW_USDT", last: null, bid: null, ask: null, volumeQuote: null, ts: null },
             raw: JSON.stringify({ error: err.message }),

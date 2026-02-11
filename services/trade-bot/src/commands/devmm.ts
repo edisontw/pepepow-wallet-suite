@@ -7,8 +7,9 @@
 
 import { Context, InlineKeyboard } from "grammy";
 import { ApiError, devmmStart, devmmStop, devmmStatus, devmmReport, DevmmStatusEntry, DevmmReportEntry } from "../api.js";
+import { renderMenu } from "../utils/menu.js";
 import { safeSend, sendLongText } from "../utils/telegram.js";
-import { sendMainMenu } from "./mainMenu.js";
+import { sendMainMenu, withMenuNav } from "./mainMenu.js";
 
 type ExchangeName = "nonkyc" | "dextrade" | "nestex";
 
@@ -101,15 +102,15 @@ function parseCallbackData(data: string): { action: string; value: string } | nu
 
 // /devmm - Show menu
 export async function handleDevmm(ctx: Context): Promise<void> {
-    const keyboard = new InlineKeyboard()
+    const keyboard = withMenuNav(new InlineKeyboard()
         .text("Start", "devmm:start").row()
         .text("Start All", buildCallbackData("start", "all")).row()
         .text("Stop", "devmm:stop").row()
-        .text("Stop All", buildCallbackData("stop", "all"));
+        .text("Stop All", buildCallbackData("stop", "all")));
 
     await safeSend(ctx, {
         step: "devmm_menu",
-        text: "DevMM - Dev Fee Market Making\n\nSelect an action:",
+        text: renderMenu("🤖 DevMM Control", "Choose what to manage:"),
         replyMarkup: keyboard,
     });
 }
@@ -130,14 +131,14 @@ export async function handleDevmmStart(ctx: Context): Promise<void> {
     const tgUserId = getTgUserId(ctx);
     pendingDevmm.set(tgUserId, { step: "exchange", updatedAt: Date.now() });
 
-    const keyboard = new InlineKeyboard()
+    const keyboard = withMenuNav(new InlineKeyboard()
         .text("NonKYC", buildCallbackData("start", "nonkyc")).row()
         .text("Dex-Trade", buildCallbackData("start", "dextrade")).row()
-        .text("NestEx", buildCallbackData("start", "nestex"));
+        .text("NestEx", buildCallbackData("start", "nestex")));
 
     await safeSend(ctx, {
         step: "devmm_start_select",
-        text: "Select exchange for DevMM:",
+        text: renderMenu("🏦 Select Exchange", "DevMM start target\nNonKYC / Dex-Trade / NestEx"),
         replyMarkup: keyboard,
     });
 }
@@ -198,15 +199,15 @@ export async function handleDevmmStop(ctx: Context): Promise<void> {
     }
 
     // Show exchange selection
-    const keyboard = new InlineKeyboard()
+    const keyboard = withMenuNav(new InlineKeyboard()
         .text("NonKYC", buildCallbackData("stop", "nonkyc")).row()
         .text("Dex-Trade", buildCallbackData("stop", "dextrade")).row()
         .text("NestEx", buildCallbackData("stop", "nestex")).row()
-        .text("Stop All", buildCallbackData("stop", "all"));
+        .text("Stop All", buildCallbackData("stop", "all")));
 
     await safeSend(ctx, {
         step: "devmm_stop_select",
-        text: "Select exchange to stop DevMM:",
+        text: renderMenu("🏦 Select Exchange", "DevMM stop target\nNonKYC / Dex-Trade / NestEx"),
         replyMarkup: keyboard,
     });
 }
@@ -649,27 +650,27 @@ async function handleMenuCallback(ctx: Context, value: string): Promise<boolean>
     switch (value) {
         case "start":
             // Show exchange selection
-            const keyboard = new InlineKeyboard()
+            const keyboard = withMenuNav(new InlineKeyboard()
                 .text("NonKYC", buildCallbackData("start", "nonkyc")).row()
                 .text("Dex-Trade", buildCallbackData("start", "dextrade")).row()
-                .text("NestEx", buildCallbackData("start", "nestex"));
+                .text("NestEx", buildCallbackData("start", "nestex")));
             await safeSend(ctx, {
                 step: "devmm_menu_start",
-                text: "Select exchange for DevMM:",
+                text: renderMenu("🏦 Select Exchange", "DevMM start target\nNonKYC / Dex-Trade / NestEx"),
                 replyMarkup: keyboard,
             });
             return true;
 
         case "stop":
             // Show exchange selection for stop
-            const stopKeyboard = new InlineKeyboard()
+            const stopKeyboard = withMenuNav(new InlineKeyboard()
                 .text("NonKYC", buildCallbackData("stop", "nonkyc")).row()
                 .text("Dex-Trade", buildCallbackData("stop", "dextrade")).row()
                 .text("NestEx", buildCallbackData("stop", "nestex")).row()
-                .text("Stop All", buildCallbackData("stop", "all"));
+                .text("Stop All", buildCallbackData("stop", "all")));
             await safeSend(ctx, {
                 step: "devmm_menu_stop",
-                text: "Select exchange to stop DevMM:",
+                text: renderMenu("🏦 Select Exchange", "DevMM stop target\nNonKYC / Dex-Trade / NestEx"),
                 replyMarkup: stopKeyboard,
             });
             return true;

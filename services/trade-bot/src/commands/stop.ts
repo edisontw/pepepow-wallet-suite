@@ -9,7 +9,8 @@ import {
     stopDca,
 } from "../api.js";
 import { safeSend } from "../utils/telegram.js";
-import { sendMainMenu } from "./mainMenu.js";
+import { renderMenu } from "../utils/menu.js";
+import { sendMainMenu, withMenuNav } from "./mainMenu.js";
 
 type ExchangeName = "nonkyc" | "dextrade" | "nestex";
 type StopTarget = ExchangeName | "all";
@@ -37,12 +38,12 @@ function exchangeLabel(exchange: ExchangeName): string {
 }
 
 function buildStopKeyboard(): InlineKeyboard {
-    return new InlineKeyboard()
+    return withMenuNav(new InlineKeyboard()
         .text("NonKYC", "stop:exchange:nonkyc")
         .text("Dex-Trade", "stop:exchange:dextrade")
         .text("NestEx", "stop:exchange:nestex")
         .row()
-        .text("Stop All", "stop:exchange:all");
+        .text("Stop All", "stop:exchange:all"));
 }
 
 async function queueCancelWithRetry(configId: number, tgUserId: string): Promise<{ ok: boolean; retry: boolean; error?: string }> {
@@ -176,7 +177,7 @@ function renderStopSummary(items: StopSummary[]): string {
 export async function handleStop(ctx: Context): Promise<void> {
     await safeSend(ctx, {
         step: "stop.menu",
-        text: "Select exchange to stop strategies:",
+        text: renderMenu("🏦 Select Exchange", "Choose scope to stop strategies:"),
         replyMarkup: buildStopKeyboard(),
     });
 }

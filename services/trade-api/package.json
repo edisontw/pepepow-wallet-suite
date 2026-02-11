@@ -6,7 +6,8 @@
     "scripts": {
         "dev": "tsx watch src/server.ts",
         "start": "node dist/server.js",
-        "build": "tsc"
+        "build": "tsc",
+        "audit:retention": "tsx src/scripts/trade-audit-retention.ts"
     },
     "dependencies": {
         "better-sqlite3": "^12.6.0",

@@ -66,13 +66,22 @@
 | POST | `/wallet/tx/send` | Alias of `/wallet/tx/broadcast` | No |
 | POST | `/api/tx/send` | Legacy alias of `/wallet/tx/broadcast` | No |
 | GET | `/wallet/tx/raw` | Raw tx lookup (proxy + RPC fallback) | No |
+| POST | `/wallet/tx/raw/batch` | Batch raw tx lookup (cache + proxy/RPC fallback) | No |
 | GET | `/api/tx/raw` | Alias of `/wallet/tx/raw` | No |
+| POST | `/api/tx/raw/batch` | Alias of `/wallet/tx/raw/batch` | No |
 | GET | `/wallet/tx/:txid` | Alias of `/v1/tx/:txid` | No |
 | GET | `/wallet/price` | Alias of `/v1/price` | No |
 | GET | `/api/price` | Alias of `/v1/price` | No |
 | POST | `/api/paylink/create` | Create JWT-signed payment link | No |
 | GET | `/api/paylink/verify` | Verify payment link token | No |
 | POST | `/tg/webhook` | Telegram bot webhook | No (verified by secret token header) |
+
+### RawTx Hot Cache and Batch Controls
+
+- `RAW_TX_CACHE_TTL_MS` (default `20000`)
+- `RAW_TX_CACHE_MAX` (default `2000`)
+- `RAW_TX_BATCH_MAX` (default `50`, hard-capped at `50`)
+- `RAW_TX_BATCH_CONCURRENCY` (default `6`, clamped to `1..10`)
 
 ## pepew-api vs wallet-api (Quick Comparison)
 

@@ -1,4 +1,4 @@
-import { Context, InlineKeyboard } from "grammy";
+import { Context, InlineKeyboard, Keyboard } from "grammy";
 import { safeLower, safeText } from "./strings.js";
 
 type TelegramErrorInfo = {
@@ -10,7 +10,7 @@ type TelegramErrorInfo = {
 export type SafeSendOptions = {
     step: string;
     text: string;
-    replyMarkup?: InlineKeyboard;
+    replyMarkup?: InlineKeyboard | Keyboard;
 };
 
 function extractTelegramError(err: any): TelegramErrorInfo {
@@ -87,7 +87,7 @@ export async function safeSend(ctx: Context, options: SafeSendOptions): Promise<
 export async function sendLongText(
     ctx: Context,
     text: string,
-    options: { maxLen?: number; step?: string; replyMarkup?: InlineKeyboard } = {}
+    options: { maxLen?: number; step?: string; replyMarkup?: InlineKeyboard | Keyboard } = {}
 ): Promise<void> {
     const maxLen = options.maxLen || 3000;
     const step = options.step || "send_long_text";

@@ -4,6 +4,7 @@ import { DevmmIssueCode, DEVMM_SCHEDULER_REASON_DEVMM_OWNS_PAIR } from "./strate
 import { getStrategyRunner } from "./strategies/runner.js";
 import { normalizeExchangeId } from "./registry/exchanges.js";
 import { toCanonicalPair } from "./registry/pairs.js";
+import { tradeLog } from "./lib/tradeLogger.js";
 
 const SCHEDULER_INTERVAL_MS = 10_000; // 10 seconds
 
@@ -41,7 +42,13 @@ async function runSchedulerTick(): Promise<void> {
         }
 
         const configs = getEnabledStrategyConfigs();
-        console.log(`[scheduler] tick: ${configs.length} enabled config(s)`);
+        tradeLog({
+            scope: "scheduler",
+            level: "info",
+            message: `tick enabled=${configs.length}`,
+            throttleKey: "scheduler:tick",
+            throttleSec: 30,
+        });
 
         for (const config of configs) {
             const strategyName = String(config.strategy || "").toUpperCase();
@@ -51,35 +58,77 @@ async function runSchedulerTick(): Promise<void> {
                 if (normalizedExchange && canonicalPair) {
                     const occupiedGlobal = devmmGlobalOccupancy.has(buildOccupancyKey("*", normalizedExchange, canonicalPair));
                     if (occupiedGlobal) {
-                        console.log(
-                            `[scheduler] skip strategy=MM config=${config.id} reason=${DEVMM_SCHEDULER_REASON_DEVMM_OWNS_PAIR} issueCode=${DevmmIssueCode.F04_MM_DEVMM_COLLISION} exchange=${normalizedExchange} pair=${canonicalPair}`
-                        );
+                        tradeLog({
+                            scope: "scheduler",
+                            level: "warn",
+                            message: `skip strategy=MM config=${config.id} reason=${DEVMM_SCHEDULER_REASON_DEVMM_OWNS_PAIR} issueCode=${DevmmIssueCode.F04_MM_DEVMM_COLLISION} exchange=${normalizedExchange} pair=${canonicalPair}`,
+                            throttleKey: `scheduler:mm-collision:${config.id}`,
+                            throttleSec: 30,
+                        });
                         continue;
                     }
                 }
             }
             const runner = getStrategyRunner(config.strategy);
             if (!runner) {
-                console.warn(`[scheduler] No runner for strategy=${config.strategy} config=${config.id}`);
+                tradeLog({
+                    scope: "scheduler",
+                    level: "warn",
+                    message: `No runner for strategy=${config.strategy} config=${config.id}`,
+                });
                 continue;
             }
-            console.log(`[scheduler] dispatch strategy=${config.strategy} config=${config.id}`);
+            tradeLog({
+                scope: "scheduler",
+                level: "debug",
+                strategyId: config.id,
+                exchange: config.exchange,
+                message: `dispatch strategy=${config.strategy} config=${config.id}`,
+                throttleKey: `scheduler:dispatch:${config.id}`,
+                throttleSec: 20,
+            });
             await runner.tick(config.id, now);
         }
     } catch (err: any) {
-        console.error(`[scheduler] Tick error: ${err.message}`);
+        tradeLog({
+            scope: "scheduler",
+            level: "error",
+            message: `Tick error: ${err.message}`,
+            throttleKey: "scheduler:error",
+            throttleSec: 20,
+        });
     }
 
     try {
         const devmmConfigs = getEnabledDevmmConfigs();
-        console.log(`[devmmScheduler] tick enabled=${devmmConfigs.length}`);
+        tradeLog({
+            scope: "devmmScheduler",
+            level: "info",
+            message: `tick enabled=${devmmConfigs.length}`,
+            throttleKey: "devmmScheduler:tick",
+            throttleSec: 20,
+        });
 
         for (const config of devmmConfigs) {
-            console.log(`[devmmScheduler] dispatch DEVMM id=${config.id} exchange=${config.exchange}`);
+            tradeLog({
+                scope: "devmmScheduler",
+                level: "debug",
+                strategyId: config.id,
+                exchange: config.exchange,
+                message: `dispatch DEVMM id=${config.id}`,
+                throttleKey: `devmmScheduler:dispatch:${config.id}`,
+                throttleSec: 20,
+            });
             await devmmRunner.tick(config.id, now);
         }
     } catch (err: any) {
-        console.error(`[devmmScheduler] Tick error: ${err.message}`);
+        tradeLog({
+            scope: "devmmScheduler",
+            level: "error",
+            message: `Tick error: ${err.message}`,
+            throttleKey: "devmmScheduler:error",
+            throttleSec: 20,
+        });
     }
 }
 
@@ -87,11 +136,15 @@ let schedulerInterval: NodeJS.Timeout | null = null;
 
 export function startScheduler(): void {
     if (schedulerInterval) {
-        console.warn("[scheduler] Already running");
+        tradeLog({ scope: "scheduler", level: "warn", message: "Already running" });
         return;
     }
 
-    console.log(`[scheduler] Starting strategy scheduler (interval: ${SCHEDULER_INTERVAL_MS}ms)`);
+    tradeLog({
+        scope: "scheduler",
+        level: "info",
+        message: `Starting strategy scheduler intervalMs=${SCHEDULER_INTERVAL_MS}`,
+    });
 
     // Run immediately once
     runSchedulerTick();
@@ -104,6 +157,6 @@ export function stopScheduler(): void {
     if (schedulerInterval) {
         clearInterval(schedulerInterval);
         schedulerInterval = null;
-        console.log("[scheduler] Stopped");
+        tradeLog({ scope: "scheduler", level: "info", message: "Stopped" });
     }
 }

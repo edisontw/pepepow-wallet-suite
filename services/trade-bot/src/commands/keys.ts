@@ -3,7 +3,7 @@ import { ApiError, setExchangeKeys, clearExchangeKeys, getKeysStatus } from "../
 import { safeSend } from "../utils/telegram.js";
 import { safeText, truncateText } from "../utils/strings.js";
 import { ExchangeName } from "../lib/markets.js";
-import { sendMainMenu } from "./mainMenu.js";
+import { sendMainMenu, withMenuNav } from "./mainMenu.js";
 
 const KEY_STATE_TTL_MS = 15 * 60 * 1000;
 
@@ -40,10 +40,10 @@ export async function handleKeys(ctx: Context): Promise<void> {
 
     pendingKeys.set(tgUserId, { step: "exchange", updatedAt: Date.now() });
 
-    const keyboard = new InlineKeyboard()
+    const keyboard = withMenuNav(new InlineKeyboard()
         .text("NonKYC", "keys:exchange:nonkyc")
         .text("Dex-Trade", "keys:exchange:dextrade")
-        .text("NestEx", "keys:exchange:nestex");
+        .text("NestEx", "keys:exchange:nestex"));
 
     await safeSend(ctx, {
         step: "keys.exchange",
@@ -122,10 +122,10 @@ export async function handleKeysClear(ctx: Context): Promise<void> {
         return;
     }
 
-    const keyboard = new InlineKeyboard()
+    const keyboard = withMenuNav(new InlineKeyboard()
         .text("NonKYC", "keys:clear:nonkyc")
         .text("Dex-Trade", "keys:clear:dextrade")
-        .text("NestEx", "keys:clear:nestex");
+        .text("NestEx", "keys:clear:nestex"));
 
     await safeSend(ctx, {
         step: "keys_clear.exchange",
