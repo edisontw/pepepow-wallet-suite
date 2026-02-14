@@ -11,12 +11,19 @@ export async function handleDonate(ctx: Context): Promise<void> {
     const message = [
         "💖 Donation",
         "──────────",
-        "Donation Address:",
-        `(PEPEW) ${DONATE_ADDRESS}`,
+        `Donation (PEPEW):`,
+        DONATE_ADDRESS,
         "",
         "⚠️ Only send PEPEW to this address",
     ].join("\n");
 
-    await safeSend(ctx, { step: "donate", text: message });
+    const copyKeyboard = {
+        inline_keyboard: [[{
+            text: "📋 Copy address",
+            copy_text: { text: DONATE_ADDRESS },
+        }]],
+    } as any;
+
+    await safeSend(ctx, { step: "donate", text: message, replyMarkup: copyKeyboard });
     await sendMainMenu(ctx);
 }

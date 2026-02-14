@@ -7,6 +7,37 @@ type ErrorLikePayload = {
   requestId?: string;
 };
 
+type RawTxBatchSuccessItem = {
+  txid: string;
+  ok: true;
+  rawTx: string;
+  source?: "cache" | "upstream";
+};
+
+type RawTxBatchFailedItem = {
+  txid: string;
+  ok: false;
+  code?: string;
+  error?: string;
+  requestId?: string;
+  source?: "upstream";
+};
+
+export type RawTxBatchItem = RawTxBatchSuccessItem | RawTxBatchFailedItem;
+
+export type RawTxBatchResponse = {
+  requestId?: string;
+  results: RawTxBatchItem[];
+  summary?: {
+    total?: number;
+    ok?: number;
+    failed?: number;
+    cacheHit?: number;
+    cacheMiss?: number;
+    timingMs?: number;
+  };
+};
+
 export class TxApiError extends Error {
   status: number;
   detail?: string;
@@ -56,6 +87,29 @@ export async function fetchRawTx(txid: string): Promise<string> {
     throw new TxApiError(`fetchRawTx failed: ${r.status}`, r.status, detail, { requestId, code, txid });
   }
   return text;
+}
+
+export async function fetchRawTxBatchApi(txids: string[]): Promise<RawTxBatchResponse> {
+  const r = await apiFetch(API_ENDPOINTS.wallet.txRawBatch, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ txids }),
+  });
+  const payload = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const detail = typeof payload?.error === "string" ? payload.error : `HTTP ${r.status}`;
+    const code = typeof payload?.code === "string" ? payload.code : undefined;
+    const requestId = r.headers.get("x-request-id")
+      || (typeof payload?.requestId === "string" ? payload.requestId : undefined);
+    throw new TxApiError(`fetchRawTxBatchApi failed: ${r.status}`, r.status, detail, { code, requestId });
+  }
+
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  return {
+    requestId: typeof payload?.requestId === "string" ? payload.requestId : (r.headers.get("x-request-id") || undefined),
+    results,
+    summary: payload?.summary,
+  };
 }
 
 export async function fetchTxInfo(txid: string): Promise<any> {

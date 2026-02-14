@@ -1370,13 +1370,36 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
 
         // List current open orders
         let rawOpenOrders = await listOpenOrders(exchange, accessKey, secretKey, rateLimitKey);
+        const hasDevmmClientPrefix = (clientOrderId?: string): boolean => {
+            return typeof clientOrderId === "string" && clientOrderId.startsWith("PPW-DEVMM-");
+        };
+
+        // Try adopting open orders by clientOrderId when tracked ids are missing (common after restart).
+        const adoptUpdates: { open_buy_order_id?: string | null; open_sell_order_id?: string | null } = {};
+        if (!state.open_buy_order_id) {
+            const adoptBuy = rawOpenOrders.find((o) => o.side === "BUY" && hasDevmmClientPrefix(o.clientOrderId));
+            if (adoptBuy?.id) adoptUpdates.open_buy_order_id = adoptBuy.id;
+        }
+        if (!state.open_sell_order_id) {
+            const adoptSell = rawOpenOrders.find((o) => o.side === "SELL" && hasDevmmClientPrefix(o.clientOrderId));
+            if (adoptSell?.id) adoptUpdates.open_sell_order_id = adoptSell.id;
+        }
+        if (Object.keys(adoptUpdates).length > 0) {
+            state = upsertDevmmState(exchange, config.symbol, adoptUpdates);
+            log(
+                "info",
+                exchange,
+                `RECONCILE_ADOPT trackedBuy=${state.open_buy_order_id || "none"} trackedSell=${state.open_sell_order_id || "none"} source=clientOrderId`
+            );
+        }
+
+        const isManagedOrder = (order: { id: string; clientOrderId?: string }): boolean => {
+            const isTracked = order.id === state.open_buy_order_id || order.id === state.open_sell_order_id;
+            return isTracked || hasDevmmClientPrefix(order.clientOrderId);
+        };
 
         // Managed DevMM orders: tracked IDs or explicit DevMM clientOrderId prefix.
-        let openOrders = rawOpenOrders.filter(o => {
-            const isTracked = o.id === state.open_buy_order_id || o.id === state.open_sell_order_id;
-            const hasPrefix = o.clientOrderId?.startsWith("PPW-DEVMM-");
-            return isTracked || hasPrefix;
-        });
+        let openOrders = rawOpenOrders.filter(isManagedOrder);
         let rawOpenSummary = summarizeOpenOrdersBySide(rawOpenOrders);
         let managedOpenSummary = summarizeOpenOrdersBySide(openOrders);
         log(
@@ -1384,6 +1407,21 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             exchange,
             `openOrders raw=${rawOpenOrders.length} managed=${openOrders.length} rawBuy=${rawOpenSummary.buy} rawSell=${rawOpenSummary.sell} rawUnknown=${rawOpenSummary.unknown} managedBuy=${managedOpenSummary.buy} managedSell=${managedOpenSummary.sell} trackedBuy=${state.open_buy_order_id || "none"} trackedSell=${state.open_sell_order_id || "none"}`
         );
+        const noTrackedOrders = !state.open_buy_order_id && !state.open_sell_order_id;
+        if (rawOpenOrders.length > 0 && openOrders.length === 0 && noTrackedOrders) {
+            issueCodes.add(DevmmIssueCode.F08_UNKNOWN_ORDERS_PRESENT);
+            skipBuy = true;
+            skipSell = true;
+            const unknownReason = "UNKNOWN_ORDERS_PRESENT";
+            if (!degradedReasons.includes(unknownReason)) {
+                degradedReasons.push(unknownReason);
+            }
+            log(
+                "info",
+                exchange,
+                `OPEN_ORDERS_UNMANAGED raw=${rawOpenOrders.length} managed=${openOrders.length} action=PAUSE_NEW_QUOTES issueCode=${DevmmIssueCode.F08_UNKNOWN_ORDERS_PRESENT}`
+            );
+        }
         let pendingOrders = reconcilePendingWithVisibleOrders(exchange, now, rawOpenOrders);
 
         // Hard Guard: Max open orders per exchange
@@ -1412,11 +1450,7 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             // Re-fetch open orders after cleanup
             const refreshed = await listOpenOrders(exchange, accessKey, secretKey, rateLimitKey);
             rawOpenOrders = refreshed;
-            const filtered = refreshed.filter(o => {
-                const isTracked = o.id === state.open_buy_order_id || o.id === state.open_sell_order_id;
-                const hasPrefix = o.clientOrderId?.startsWith("PPW-DEVMM-");
-                return isTracked || hasPrefix;
-            });
+            const filtered = refreshed.filter(isManagedOrder);
             openOrders = filtered;
             pendingOrders = reconcilePendingWithVisibleOrders(exchange, now, refreshed);
         }

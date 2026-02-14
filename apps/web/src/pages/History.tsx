@@ -1,10 +1,9 @@
-// (Pending check of wallet.ts)
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { Buffer } from "buffer";
 import { deriveFromMnemonic, PEPEPOW, pubkeyToP2PKH } from "@pepepow/wallet-core";
-import { apiFetch, API_BASE, API_ENDPOINTS, getApiUrl, withAddress } from "../lib/api";
+import { apiFetch, API_BASE, API_ENDPOINTS, getApiUrl, withAddress, withQuery } from "../lib/api";
 import { fmtPEPEWFromSats } from "../lib/format";
 import { REFRESH_EVENT, readRefreshPayload } from "../lib/refresh";
 import AppLayout from "../components/layout/AppLayout";
@@ -26,9 +25,29 @@ type FetchDebug = {
   errorMessage: string | null;
 };
 
+const UTXO_ADV_PAGE_SIZE = 50;
+const UTXO_SUMMARY_CONCURRENCY = 6;
+const UTXO_ADV_CONCURRENCY = 4;
+
 function shortTxid(txid: string) {
   if (!txid) return "";
   return `${txid.slice(0, 8)}...${txid.slice(-6)}`;
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>
+) {
+  let idx = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length || 1)) }, async () => {
+    while (idx < items.length) {
+      const current = idx;
+      idx += 1;
+      await worker(items[current]);
+    }
+  });
+  await Promise.all(workers);
 }
 
 export default function History() {
@@ -41,7 +60,11 @@ export default function History() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [utxos, setUtxos] = useState<Utxo[]>([]);
   const [utxoError, setUtxoError] = useState<string | null>(null);
+  const [utxoCount, setUtxoCount] = useState<number | null>(null);
+  const [showAdvancedUtxos, setShowAdvancedUtxos] = useState(false);
+  const [visibleUtxoCount, setVisibleUtxoCount] = useState(UTXO_ADV_PAGE_SIZE);
   const [copiedTxid, setCopiedTxid] = useState<string | null>(null);
+
   const makeEmptyDebug = (): FetchDebug => ({
     lastRequestPath: null,
     lastRequestUrl: null,
@@ -72,21 +95,22 @@ export default function History() {
     return () => window.removeEventListener(REFRESH_EVENT, handleRefresh);
   }, []);
 
-  // Derive addresses (memoized or inside effect)
+  useEffect(() => {
+    if (showAdvancedUtxos) {
+      setVisibleUtxoCount(UTXO_ADV_PAGE_SIZE);
+    }
+  }, [showAdvancedUtxos, refreshKey]);
+
   useEffect(() => {
     let active = true;
     const run = async () => {
-      // If we have a mnemonic, derive first 20 external + 20 internal
-      // If only address (watch only), use just that.
       const addresses: string[] = [];
       if (mnemonic) {
         try {
-          // External (Receive) 0-19
           for (let i = 0; i < 20; i++) {
             const node = await deriveFromMnemonic(mnemonic, `m/44'/5'/0'/0/${i}`);
             addresses.push(pubkeyToP2PKH(Buffer.from(node.publicKey!), PEPEPOW));
           }
-          // Internal (Change) 0-19
           for (let i = 0; i < 20; i++) {
             const node = await deriveFromMnemonic(mnemonic, `m/44'/5'/0'/1/${i}`);
             addresses.push(pubkeyToP2PKH(Buffer.from(node.publicKey!), PEPEPOW));
@@ -96,15 +120,18 @@ export default function History() {
         }
       }
 
-      // Fallback or addition: always include the current saved address if not already in list
       if (currentAddress && !addresses.includes(currentAddress)) {
         addresses.push(currentAddress);
       }
-
       if (!addresses.length) return;
 
       setErr(null);
+      setUtxoError(null);
       setData(null);
+      setUtxoCount(null);
+      if (!showAdvancedUtxos) {
+        setUtxos([]);
+      }
       setLoading(true);
 
       const parseHistoryPayload = (payload: any) => {
@@ -133,18 +160,14 @@ export default function History() {
         return { text, json };
       };
 
-      // Fetch History
       try {
         const path = API_ENDPOINTS.v1.history;
         const url = getApiUrl(path);
-        setHistoryDebug({
-          ...makeEmptyDebug(),
-          lastRequestPath: path,
-          lastRequestUrl: url,
-        });
+        setHistoryDebug({ ...makeEmptyDebug(), lastRequestPath: path, lastRequestUrl: url });
         historyAbortRef.current?.abort();
         const controller = new AbortController();
         historyAbortRef.current = controller;
+
         const r = await apiFetch(path, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -153,15 +176,10 @@ export default function History() {
         });
         const { text, json } = await readResponse(r);
         if (!active) return;
-        setHistoryDebug((prev) => ({
-          ...prev,
-          status: r.status,
-          responseText200: text ? text.slice(0, 200) : "",
-        }));
+
+        setHistoryDebug((prev) => ({ ...prev, status: r.status, responseText200: text ? text.slice(0, 200) : "" }));
         if (!r.ok) {
-          const detail = r.status === 404
-            ? t("errors.apiNotFound")
-            : json?.error || json?.message || `HTTP ${r.status}`;
+          const detail = r.status === 404 ? t("errors.apiNotFound") : json?.error || json?.message || `HTTP ${r.status}`;
           setHistoryDebug((prev) => ({
             ...prev,
             errorName: r.status === 404 ? "NotFoundError" : "HttpError",
@@ -169,13 +187,8 @@ export default function History() {
           }));
           setErr(detail || t("history.readFailed"));
         } else {
-          setHistoryDebug((prev) => ({
-            ...prev,
-            errorName: null,
-            errorMessage: null,
-          }));
-          const payload = parseHistoryPayload(json);
-          setData(payload);
+          setHistoryDebug((prev) => ({ ...prev, errorName: null, errorMessage: null }));
+          setData(parseHistoryPayload(json));
         }
       } catch (e: any) {
         if (active) {
@@ -190,100 +203,158 @@ export default function History() {
         if (active) setLoading(false);
       }
 
-      // Fetch UTXOs
-      setUtxoError(null);
-      try {
-        const utxoRequests = addresses.map((addr) => ({
-          addr,
-          path: withAddress(API_ENDPOINTS.wallet.utxos, addr),
-          url: getApiUrl(withAddress(API_ENDPOINTS.wallet.utxos, addr))
-        }));
-        if (utxoRequests.length) {
-          const last = utxoRequests[utxoRequests.length - 1];
-          setUtxosDebug({
-            ...makeEmptyDebug(),
-            lastRequestPath: last.path,
-            lastRequestUrl: last.url,
-          });
-        }
-        utxoAbortRef.current?.abort();
-        const utxoController = new AbortController();
-        utxoAbortRef.current = utxoController;
-        const utxoResponses = await Promise.all(utxoRequests.map(async (req) => {
-          const r = await apiFetch(req.path, { signal: utxoController.signal });
-          const { text, json } = await readResponse(r);
-          return { ...req, r, text, json };
-        }));
-        if (!active) return;
+      const summaryRequests = addresses.map((addr) => {
+        const summaryPath = withQuery(withAddress(API_ENDPOINTS.wallet.utxos, addr), { summary: 1 });
+        return {
+          address: addr,
+          summaryPath,
+          summaryUrl: getApiUrl(summaryPath),
+          fullPath: withAddress(API_ENDPOINTS.wallet.utxos, addr),
+        };
+      });
 
-        const failed = utxoResponses.find((res) => !res.r.ok);
-        if (failed) {
-          setUtxosDebug((prev) => ({
-            ...prev,
-            lastRequestUrl: failed.url,
-            lastRequestPath: failed.path,
-            status: failed.r.status,
-            responseText200: failed.text ? failed.text.slice(0, 200) : "",
-            errorName: failed.r.status === 404 ? "NotFoundError" : "HttpError",
-            errorMessage: failed.json?.error || failed.json?.message || `HTTP ${failed.r.status}`,
-          }));
-          const detail = failed.r.status === 404
-            ? t("errors.apiNotFound")
-            : failed.json?.error || failed.json?.message || `HTTP ${failed.r.status}`;
-          setUtxoError(detail);
-          setUtxos([]);
-          return;
-        }
+      utxoAbortRef.current?.abort();
+      const utxoController = new AbortController();
+      utxoAbortRef.current = utxoController;
 
-        const last = utxoResponses[utxoResponses.length - 1];
-        if (last) {
-          setUtxosDebug((prev) => ({
-            ...prev,
-            status: last.r.status,
-            responseText200: last.text ? last.text.slice(0, 200) : "",
-            errorName: null,
-            errorMessage: null,
-          }));
-        }
+      let countTotal = 0;
+      let countFailed: string | null = null;
+      await runWithConcurrency(summaryRequests, UTXO_SUMMARY_CONCURRENCY, async (req) => {
+        if (countFailed) return;
+        try {
+          setUtxosDebug((prev) => ({ ...prev, lastRequestPath: req.summaryPath, lastRequestUrl: req.summaryUrl }));
+          const summaryRes = await apiFetch(req.summaryPath, { signal: utxoController.signal });
+          const summaryPayload = await summaryRes.json().catch(() => ({}));
+          if (!summaryRes.ok) {
+            const fallbackPath = req.fullPath;
+            const fallbackRes = await apiFetch(fallbackPath, { signal: utxoController.signal });
+            const fallbackPayload = await fallbackRes.json().catch(() => ({}));
+            if (!fallbackRes.ok) {
+              countFailed = summaryPayload?.error || fallbackPayload?.error || `HTTP ${summaryRes.status}`;
+              setUtxosDebug((prev) => ({
+                ...prev,
+                status: fallbackRes.status,
+                errorName: "HttpError",
+                errorMessage: countFailed,
+              }));
+              return;
+            }
+            const arr = Array.isArray(fallbackPayload) ? fallbackPayload : Array.isArray(fallbackPayload?.utxos) ? fallbackPayload.utxos : [];
+            countTotal += arr.length;
+            return;
+          }
 
-        const allUtxos = utxoResponses.flatMap((res) =>
-          Array.isArray(res.json) ? res.json : Array.isArray(res.json?.utxos) ? res.json.utxos : []
-        );
-        const mapped = allUtxos.map((u: any) => ({
-          txid: u.txid || u.txId || u.tx,
-          // Handle 'satoshis' (from getaddressutxos) or 'amount' (coins)
-          amount: u.satoshis ?? (u.amount ? Math.round(Number(u.amount) * 1e8) : 0),
-          confirmations: typeof u.confirmations === "number" ? u.confirmations : null,
-          vout: Number.isFinite(Number(u.vout ?? u.n ?? u.outputIndex ?? u.output_index))
-            ? Number(u.vout ?? u.n ?? u.outputIndex ?? u.output_index)
-            : null,
-        })).filter((u: any) => u.txid && Number.isFinite(u.amount));
-        const byOutpoint = new Map<string, Utxo>();
-        mapped.forEach((u) => {
-          const key = `${u.txid}:${u.vout ?? "n/a"}`;
-          if (!byOutpoint.has(key)) byOutpoint.set(key, u);
-        });
-        setUtxos(Array.from(byOutpoint.values()));
-      } catch (e: any) {
-        if (active) {
-          setUtxos([]);
-          setUtxoError(t("errors.apiUnreachable"));
+          const count = Number(summaryPayload?.count);
+          if (!Number.isFinite(count) || count < 0) {
+            const fallbackPath = req.fullPath;
+            const fallbackRes = await apiFetch(fallbackPath, { signal: utxoController.signal });
+            const fallbackPayload = await fallbackRes.json().catch(() => ({}));
+            if (!fallbackRes.ok) {
+              countFailed = fallbackPayload?.error || `HTTP ${fallbackRes.status}`;
+              return;
+            }
+            const arr = Array.isArray(fallbackPayload) ? fallbackPayload : Array.isArray(fallbackPayload?.utxos) ? fallbackPayload.utxos : [];
+            countTotal += arr.length;
+            return;
+          }
+          countTotal += count;
+          setUtxosDebug((prev) => ({ ...prev, status: summaryRes.status, errorName: null, errorMessage: null }));
+        } catch (e: any) {
+          if (e?.name === "AbortError") return;
+          countFailed = e?.message || String(e);
           setUtxosDebug((prev) => ({
             ...prev,
             errorName: e?.name || "Error",
-            errorMessage: e?.message || String(e),
+            errorMessage: countFailed,
           }));
         }
+      });
+
+      if (!active) return;
+      if (countFailed) {
+        setUtxoError(countFailed);
+        setUtxoCount(null);
+      } else {
+        setUtxoCount(countTotal);
       }
+
+      if (!showAdvancedUtxos) {
+        setUtxos([]);
+        return;
+      }
+
+      const fullRequests = addresses.map((addr) => {
+        const path = withAddress(API_ENDPOINTS.wallet.utxos, addr);
+        return { path, url: getApiUrl(path) };
+      });
+
+      const utxoResponses: Array<{ path: string; url: string; ok: boolean; status: number; text: string; json: any }> = [];
+      await runWithConcurrency(fullRequests, UTXO_ADV_CONCURRENCY, async (req) => {
+        const r = await apiFetch(req.path, { signal: utxoController.signal });
+        const text = await r.text().catch(() => "");
+        let json: any = {};
+        if (text) {
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = {};
+          }
+        }
+        utxoResponses.push({ ...req, ok: r.ok, status: r.status, text, json });
+      });
+      if (!active) return;
+
+      const failed = utxoResponses.find((res) => !res.ok);
+      if (failed) {
+        const detail = failed.status === 404 ? t("errors.apiNotFound") : failed.json?.error || failed.json?.message || `HTTP ${failed.status}`;
+        setUtxoError(detail);
+        setUtxos([]);
+        setUtxosDebug((prev) => ({
+          ...prev,
+          lastRequestPath: failed.path,
+          lastRequestUrl: failed.url,
+          status: failed.status,
+          responseText200: failed.text ? failed.text.slice(0, 200) : "",
+          errorName: failed.status === 404 ? "NotFoundError" : "HttpError",
+          errorMessage: detail,
+        }));
+        return;
+      }
+
+      const allUtxos = utxoResponses.flatMap((res) =>
+        Array.isArray(res.json) ? res.json : Array.isArray(res.json?.utxos) ? res.json.utxos : []
+      );
+      const mapped = allUtxos.map((u: any) => ({
+        txid: u.txid || u.txId || u.tx,
+        amount: u.satoshis ?? (u.amount ? Math.round(Number(u.amount) * 1e8) : 0),
+        confirmations: typeof u.confirmations === "number" ? u.confirmations : null,
+        vout: Number.isFinite(Number(u.vout ?? u.n ?? u.outputIndex ?? u.output_index))
+          ? Number(u.vout ?? u.n ?? u.outputIndex ?? u.output_index)
+          : null,
+      })).filter((u: any) => u.txid && Number.isFinite(u.amount));
+
+      const byOutpoint = new Map<string, Utxo>();
+      mapped.forEach((u) => {
+        const key = `${u.txid}:${u.vout ?? "n/a"}`;
+        if (!byOutpoint.has(key)) byOutpoint.set(key, u);
+      });
+      setUtxos(Array.from(byOutpoint.values()));
+      setUtxosDebug((prev) => ({
+        ...prev,
+        status: 200,
+        errorName: null,
+        errorMessage: null,
+      }));
     };
 
     void run();
     return () => {
       active = false;
     };
-  }, [currentAddress, mnemonic, refreshKey, t]);
+  }, [currentAddress, mnemonic, refreshKey, showAdvancedUtxos, t]);
 
   const txs = Array.isArray(data?.txs) ? data.txs.slice(0, 5) : null;
+  const visibleUtxos = utxos.slice(0, visibleUtxoCount);
 
   const copyTxid = async (txid: string) => {
     if (!txid) return;
@@ -332,12 +403,12 @@ export default function History() {
                         <code>{shortTxid(tx.txid)}</code>
                         <span className="muted">{t("history.confirmations")}: {tx.confirmations ?? "--"}</span>
                       </div>
-                      <div className="tx-amount" style={{ fontWeight: 'bold' }}>
+                      <div className="tx-amount" style={{ fontWeight: "bold" }}>
                         {tx.netAmount !== undefined && tx.netAmount !== null ? (
-                          <span style={{ color: tx.netAmount > 0 ? '#4caf50' : tx.netAmount < 0 ? '#f44336' : 'inherit' }}>
-                            {tx.netAmount > 0 ? '+' : tx.netAmount < 0 ? '-' : ''}{fmtPEPEWFromSats(Math.abs(tx.netAmount))}
+                          <span style={{ color: tx.netAmount > 0 ? "#4caf50" : tx.netAmount < 0 ? "#f44336" : "inherit" }}>
+                            {tx.netAmount > 0 ? "+" : tx.netAmount < 0 ? "-" : ""}{fmtPEPEWFromSats(Math.abs(tx.netAmount))}
                           </span>
-                        ) : '--'}
+                        ) : "--"}
                       </div>
                       <div className="tx-actions">
                         <button className="btn ghost small" onClick={() => copyTxid(tx.txid)}>
@@ -368,37 +439,69 @@ export default function History() {
         )}
 
         {currentAddress && (
-          <details className="details">
+          <div className="card" style={{ marginTop: 12 }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div className="muted">{t("history.utxoCountLabel")}</div>
+                <div className="summary-value">
+                  {utxoCount === null ? "--" : utxoCount}
+                </div>
+              </div>
+              <button
+                className="btn secondary"
+                onClick={() => setShowAdvancedUtxos((v) => !v)}
+              >
+                {showAdvancedUtxos ? t("history.hideAdvancedUtxos") : t("history.showAdvancedUtxos")}
+              </button>
+            </div>
+            {utxoError && <div className="error" style={{ marginTop: 8 }}>{utxoError}</div>}
+          </div>
+        )}
+
+        {currentAddress && showAdvancedUtxos && (
+          <details className="details" open>
             <summary>{t("history.utxosTitle")}</summary>
             {utxoError && <div className="error" style={{ marginTop: 8 }}>{utxoError}</div>}
             {!utxos.length ? (
               <div className="muted" style={{ marginTop: 8 }}>{t("history.utxosEmpty")}</div>
             ) : (
-              <div className="utxo-list">
-                {utxos.map((u) => (
-                  <div key={`${u.txid}-${u.vout ?? u.amount}`} className="utxo-row">
-                    <div>
-                      <div className="summary-value">{fmtPEPEWFromSats(u.amount)}</div>
-                      <div className="muted">{t("history.confirmations")}: {u.confirmations ?? 0}</div>
+              <>
+                <div className="utxo-list">
+                  {visibleUtxos.map((u) => (
+                    <div key={`${u.txid}-${u.vout ?? u.amount}`} className="utxo-row">
+                      <div>
+                        <div className="summary-value">{fmtPEPEWFromSats(u.amount)}</div>
+                        <div className="muted">{t("history.confirmations")}: {u.confirmations ?? 0}</div>
+                      </div>
+                      <div className="utxo-actions">
+                        <code>{shortTxid(u.txid)}</code>
+                        <button className="btn ghost small" onClick={() => copyTxid(u.txid)}>
+                          {copiedTxid === u.txid ? t("copied") : t("copy")}
+                        </button>
+                        <a
+                          href={`https://explorer.pepepow.net/tx/${u.txid}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="btn ghost small"
+                          title={t("viewInExplorer")}
+                        >
+                          🔍
+                        </a>
+                      </div>
                     </div>
-                    <div className="utxo-actions">
-                      <code>{shortTxid(u.txid)}</code>
-                      <button className="btn ghost small" onClick={() => copyTxid(u.txid)}>
-                        {copiedTxid === u.txid ? t("copied") : t("copy")}
-                      </button>
-                      <a
-                        href={`https://explorer.pepepow.net/tx/${u.txid}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="btn ghost small"
-                        title={t("viewInExplorer")}
-                      >
-                        🔍
-                      </a>
-                    </div>
+                  ))}
+                </div>
+                {utxos.length > visibleUtxoCount && (
+                  <div className="row" style={{ marginTop: 8 }}>
+                    <button
+                      className="btn secondary"
+                      onClick={() => setVisibleUtxoCount((v) => v + UTXO_ADV_PAGE_SIZE)}
+                    >
+                      {t("history.loadMoreUtxos")}
+                    </button>
                   </div>
-                ))}
-              </div>
+                )}
+              </>
             )}
           </details>
         )}
@@ -423,6 +526,7 @@ export default function History() {
             {(historyDebug.errorName || historyDebug.errorMessage) && (
               <div>{t("history.debug.error")}: <code>{historyDebug.errorName || t("errors.generic")}</code> {historyDebug.errorMessage || ""}</div>
             )}
+
             <div style={{ marginTop: 8 }}><strong>{t("history.debug.utxosLabel")}</strong></div>
             {utxosDebug.lastRequestPath && (
               <div>{t("history.debug.lastRequestPath")}: <code>{utxosDebug.lastRequestPath}</code></div>

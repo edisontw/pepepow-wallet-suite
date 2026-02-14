@@ -21,6 +21,7 @@ type StopSummary = {
     gridStopped: number;
     mmStopped: number;
     devmmStopped: boolean;
+    devmmUnknownVisible: number;
     cancelQueued: number;
     cancelFailed: number;
     retryCount: number;
@@ -67,6 +68,7 @@ async function stopByExchange(tgUserId: string, exchange: ExchangeName): Promise
         gridStopped: 0,
         mmStopped: 0,
         devmmStopped: false,
+        devmmUnknownVisible: 0,
         cancelQueued: 0,
         cancelFailed: 0,
         retryCount: 0,
@@ -139,11 +141,12 @@ async function stopByExchange(tgUserId: string, exchange: ExchangeName): Promise
         const res = await devmmStop(exchange);
         if (res.ok) {
             summary.devmmStopped = true;
+            summary.devmmUnknownVisible = Math.max(0, Number(res.unknownOrdersVisible || 0));
         } else {
             summary.errors.push(`DEVMM stop failed: ${res.error || "unknown"}`);
         }
         console.log(
-            `[trade-bot] stop.devmm exchange=${exchange} attempted=${res.ordersAttempted ?? 0} cancelled=${res.ordersCancelled ?? 0} failed=${res.ordersFailed ?? 0}`
+            `[trade-bot] stop.devmm exchange=${exchange} attempted=${res.ordersAttempted ?? 0} cancelled=${res.ordersCancelled ?? 0} failed=${res.ordersFailed ?? 0} unknownVisible=${res.unknownOrdersVisible ?? 0}`
         );
     } catch (err: any) {
         summary.errors.push(`DEVMM stop failed: ${err?.message || err}`);
@@ -156,22 +159,33 @@ async function stopByExchange(tgUserId: string, exchange: ExchangeName): Promise
 }
 
 function renderStopSummary(items: StopSummary[]): string {
-    const lines: string[] = ["Stop summary", ""];
+    const lines: string[] = ["🛑 Stop summary"];
+    let shown = 0;
     for (const item of items) {
-        lines.push(`[${exchangeLabel(item.exchange)}]`);
-        lines.push(`DCA stopped: ${item.dcaStopped}`);
-        lines.push(`GRID stopped: ${item.gridStopped}`);
-        lines.push(`MM stopped: ${item.mmStopped}`);
-        lines.push(`DEVMM stopped: ${item.devmmStopped ? 1 : 0}`);
-        lines.push(`Cancel queued: ${item.cancelQueued}`);
-        lines.push(`Cancel failed: ${item.cancelFailed}`);
-        lines.push(`Cancel retries: ${item.retryCount}`);
+        const details: string[] = [];
+        if (item.dcaStopped > 0) details.push(`DCA ${item.dcaStopped}`);
+        if (item.gridStopped > 0) details.push(`GRID ${item.gridStopped}`);
+        if (item.mmStopped > 0) details.push(`MM ${item.mmStopped}`);
+        if (item.devmmStopped) details.push("DevMM 1");
+        if (item.cancelQueued > 0) details.push(`Cancel queued ${item.cancelQueued}`);
+        if (item.cancelFailed > 0) details.push(`Cancel failed ${item.cancelFailed}`);
+        if (item.retryCount > 0) details.push(`Retries ${item.retryCount}`);
+        if (item.devmmUnknownVisible > 0) details.push(`Unknown orders ${item.devmmUnknownVisible}`);
+
+        const hasIssue = item.errors.length > 0 || item.cancelFailed > 0 || item.devmmUnknownVisible > 0;
+        const icon = hasIssue ? "⚠️" : (details.length > 0 ? "✅" : "ℹ️");
+        const summaryText = details.length > 0 ? details.join(" · ") : "No active strategies";
+        lines.push(`${icon} ${exchangeLabel(item.exchange)}: ${summaryText}`);
+        shown += 1;
+
         if (item.errors.length > 0) {
-            lines.push(`Errors: ${item.errors.slice(0, 3).join(" | ")}`);
+            lines.push(`  errors: ${item.errors.slice(0, 2).join(" | ")}`);
         }
-        lines.push("");
     }
-    return lines.join("\n").trim();
+    if (shown === 0) {
+        lines.push("ℹ️ No active strategies");
+    }
+    return lines.join("\n");
 }
 
 export async function handleStop(ctx: Context): Promise<void> {

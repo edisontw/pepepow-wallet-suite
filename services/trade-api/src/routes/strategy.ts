@@ -141,7 +141,11 @@ type StrategyReportKey = "dca" | "grid" | "mm" | "devmm" | "total";
 type StrategyReportMetric = {
     strategy: StrategyReportKey;
     fillCount: number;
+    fillBuyCount: number;
+    fillSellCount: number;
     orderCount: number;
+    orderBuyCount: number;
+    orderSellCount: number;
     quoteVolume: number;
     baseVolume: number;
     fee: number;
@@ -193,7 +197,11 @@ function zeroMetric(strategy: StrategyReportKey): StrategyReportMetric {
     return {
         strategy,
         fillCount: 0,
+        fillBuyCount: 0,
+        fillSellCount: 0,
         orderCount: 0,
+        orderBuyCount: 0,
+        orderSellCount: 0,
         quoteVolume: 0,
         baseVolume: 0,
         fee: 0,
@@ -575,7 +583,11 @@ router.get("/v1/strategy/report", (req, res) => {
             SELECT
                 UPPER(TRIM(o.strategy)) AS strategy,
                 COUNT(f.id) AS fill_count,
+                COUNT(CASE WHEN UPPER(TRIM(o.side)) = 'BUY' THEN f.id END) AS fill_buy_count,
+                COUNT(CASE WHEN UPPER(TRIM(o.side)) = 'SELL' THEN f.id END) AS fill_sell_count,
                 COUNT(DISTINCT f.order_id) AS order_count,
+                COUNT(DISTINCT CASE WHEN UPPER(TRIM(o.side)) = 'BUY' THEN f.order_id END) AS order_buy_count,
+                COUNT(DISTINCT CASE WHEN UPPER(TRIM(o.side)) = 'SELL' THEN f.order_id END) AS order_sell_count,
                 SUM(f.qty) AS base_volume,
                 SUM(f.price * f.qty) AS quote_volume,
                 SUM(COALESCE(f.fee, 0)) AS fee_total,
@@ -592,7 +604,11 @@ router.get("/v1/strategy/report", (req, res) => {
         `).all(tgUserId, exchange, startTs, endTs) as Array<{
             strategy: string;
             fill_count: number;
+            fill_buy_count: number;
+            fill_sell_count: number;
             order_count: number;
+            order_buy_count: number;
+            order_sell_count: number;
             base_volume: number;
             quote_volume: number;
             fee_total: number;
@@ -619,7 +635,11 @@ router.get("/v1/strategy/report", (req, res) => {
             report[strategy] = {
                 strategy,
                 fillCount: Number(row.fill_count || 0),
+                fillBuyCount: Number(row.fill_buy_count || 0),
+                fillSellCount: Number(row.fill_sell_count || 0),
                 orderCount: Number(row.order_count || 0),
+                orderBuyCount: Number(row.order_buy_count || 0),
+                orderSellCount: Number(row.order_sell_count || 0),
                 quoteVolume: Number(row.quote_volume || 0),
                 baseVolume: Number(row.base_volume || 0),
                 fee: Number(row.fee_total || 0),
@@ -633,7 +653,11 @@ router.get("/v1/strategy/report", (req, res) => {
             report.devmm = {
                 strategy: "devmm",
                 fillCount: Number(devmm.fillCount || 0),
+                fillBuyCount: Number(devmm.buyFillCount || 0),
+                fillSellCount: Number(devmm.sellFillCount || 0),
                 orderCount: Number(devmm.fillCount || 0),
+                orderBuyCount: Number(devmm.buyFillCount || 0),
+                orderSellCount: Number(devmm.sellFillCount || 0),
                 quoteVolume: Number(devmm.totalTurnoverUsdt || 0),
                 baseVolume: Number((devmm.buyQtyPepew || 0) + (devmm.sellQtyPepew || 0)),
                 fee: devmmFee,
@@ -644,7 +668,11 @@ router.get("/v1/strategy/report", (req, res) => {
         const total = zeroMetric("total");
         for (const key of ["dca", "grid", "mm", "devmm"] as const) {
             total.fillCount += report[key].fillCount;
+            total.fillBuyCount += report[key].fillBuyCount;
+            total.fillSellCount += report[key].fillSellCount;
             total.orderCount += report[key].orderCount;
+            total.orderBuyCount += report[key].orderBuyCount;
+            total.orderSellCount += report[key].orderSellCount;
             total.quoteVolume += report[key].quoteVolume;
             total.baseVolume += report[key].baseVolume;
             total.fee += report[key].fee;

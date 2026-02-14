@@ -34,6 +34,7 @@ import { decryptKeyPair } from "../crypto.js";
 import { getExchangeSpec, normalizeExchangeId } from "../registry/exchanges.js";
 import { getLastBalanceMeta } from "../lib/balanceHelper.js";
 import {
+    DevmmIssueCode,
     DevmmPauseReason,
     extractIssueCodesFromText,
     mapPauseReasonToIssueCode,
@@ -47,6 +48,7 @@ const DEVMM_EXCHANGE_ALIASES: Record<string, DevmmExchange> = {
     "dex-trade": "dextrade",
     nestex: "nestex",
 };
+const NESTEX_RUNTIME_ORDER_QUOTE_USDT = 1;
 
 function normalizeDevmmExchange(value: unknown): DevmmExchange | null {
     if (typeof value !== "string") return null;
@@ -101,6 +103,65 @@ const StopSchema = z.object({
     tgUserId: z.string().min(1).optional(),
 });
 
+type ManagedOrderScope = "managed_only" | "unknown_only" | "all";
+type DevmmOpenOrder = {
+    id: string;
+    side: "BUY" | "SELL" | "UNKNOWN";
+    clientOrderId?: string;
+};
+
+function normalizeOrderId(value: string | number | null | undefined): string {
+    return String(value ?? "").trim().replace(/\.0+$/, "");
+}
+
+function normalizeOrderSide(value: any): "BUY" | "SELL" | "UNKNOWN" {
+    if (typeof value === "number") {
+        if (value === 0) return "BUY";
+        if (value === 1) return "SELL";
+    }
+    const raw = String(value ?? "").trim().toUpperCase();
+    if (!raw) return "UNKNOWN";
+    if (raw === "BUY" || raw === "BID" || raw === "B" || raw === "0") return "BUY";
+    if (raw === "SELL" || raw === "ASK" || raw === "S" || raw === "1") return "SELL";
+    if (raw.includes("BUY") || raw.includes("BID")) return "BUY";
+    if (raw.includes("SELL") || raw.includes("ASK")) return "SELL";
+    return "UNKNOWN";
+}
+
+function summarizeOpenOrdersBySide(orders: DevmmOpenOrder[]): { buy: number; sell: number; unknown: number } {
+    let buy = 0;
+    let sell = 0;
+    let unknown = 0;
+    for (const order of orders) {
+        if (order.side === "BUY") buy++;
+        else if (order.side === "SELL") sell++;
+        else unknown++;
+    }
+    return { buy, sell, unknown };
+}
+
+function hasDevmmClientPrefix(clientOrderId: string | undefined): boolean {
+    return typeof clientOrderId === "string" && clientOrderId.startsWith("PPW-DEVMM-");
+}
+
+function mergeIssueCodes(baseIssueCode: string | null, extraCodes: string[]): string | null {
+    const merged = new Set<string>();
+    for (const code of String(baseIssueCode || "").split("|")) {
+        const normalized = code.trim();
+        if (normalized) merged.add(normalized);
+    }
+    for (const code of extraCodes) {
+        const normalized = code.trim();
+        if (normalized) merged.add(normalized);
+    }
+    return merged.size > 0 ? Array.from(merged).join("|") : null;
+}
+
+function resolveRuntimeOrderQuoteUsdt(exchange: DevmmExchange, configuredOrderQuoteUsdt: number): number {
+    if (exchange === "nestex") return NESTEX_RUNTIME_ORDER_QUOTE_USDT;
+    return configuredOrderQuoteUsdt;
+}
+
 // Helper to get decrypted keys
 async function getKeys(exchange: DevmmExchange, tgUserId?: string | null): Promise<{ accessKey: string; secretKey: string } | null> {
     // Use provided tgUserId, or look up from config
@@ -126,27 +187,37 @@ async function getKeys(exchange: DevmmExchange, tgUserId?: string | null): Promi
     }
 }
 
-// Cancel all open orders for DevMM on an exchange
-async function cancelAllDevmmOrders(
+async function listOpenOrdersForDevmm(
     exchange: DevmmExchange,
     accessKey: string,
-    secretKey: string,
-    trackedOrderIds: string[] = []
-): Promise<{ attempted: number; visibleBefore: number; cancelled: number; alreadyClosed: number; failed: number }> {
+    secretKey: string
+): Promise<DevmmOpenOrder[]> {
     const rateLimitKey = `devmm:${exchange}`;
-    let attempted = 0;
-    let visibleBefore = 0;
-    let cancelled = 0;
-    let alreadyClosed = 0;
-    let failed = 0;
-    const normalizeOrderId = (value: string | number | null | undefined): string => String(value ?? "").trim().replace(/\.0+$/, "");
-    const isIdempotentCancelError = (error: string | null | undefined): boolean => {
-        if (!error) return false;
-        const text = String(error).toLowerCase();
-        return text.includes("not found") || text.includes("not exist") || text.includes("already") || text.includes("closed") || text.includes("canceled") || text.includes("cancelled");
-    };
+    if (exchange === "nonkyc") {
+        const res = await listNonKycOpenOrders(accessKey, secretKey, "PEPEW_USDT");
+        if (!res.ok || !Array.isArray(res.orders)) return [];
+        return res.orders
+            .map((o: any) => ({
+                id: normalizeOrderId((o as any).order_id || (o as any).id),
+                side: normalizeOrderSide((o as any).side),
+                clientOrderId: String((o as any).userProvidedId || (o as any).clientOrderId || "").trim() || undefined,
+            }))
+            .filter((o) => !!o.id);
+    }
+
+    if (exchange === "dextrade") {
+        const res = await listDexTradeOpenOrders(accessKey, secretKey, "PEPEWUSDT");
+        if (!res.ok || !Array.isArray(res.orders)) return [];
+        return res.orders
+            .map((o: any) => ({
+                id: normalizeOrderId((o as any).id || (o as any).order_id),
+                side: normalizeOrderSide((o as any).side || (o as any).type),
+                clientOrderId: undefined,
+            }))
+            .filter((o) => !!o.id);
+    }
+
     const isTargetNestExOrder = (order: any): boolean => {
-        if (exchange !== "nestex") return true;
         const raw = order?.raw ?? order ?? {};
         const candidates = [
             raw?.cur,
@@ -163,57 +234,75 @@ async function cancelAllDevmmOrders(
         if (candidates.length === 0) return true;
         return candidates.some((v) => v === "PEPEW" || (v.includes("PEPEW") && v.includes("USDT")));
     };
+    const res = await listNestExOpenOrders(accessKey, secretKey, "PEPEW/USDT", rateLimitKey, { exhaustive: true, includeNoCur: true });
+    if (!res.ok || !Array.isArray(res.orders)) return [];
+    return res.orders
+        .filter((o: any) => isTargetNestExOrder(o))
+        .map((o: any) => ({
+            id: normalizeOrderId((o as any).order_id || (o as any).id),
+            side: normalizeOrderSide((o as any).side || (o as any).type || (o as any).order_type),
+            clientOrderId: String((o as any).client_order_id || (o as any).clientOrderId || "").trim() || undefined,
+        }))
+        .filter((o) => !!o.id);
+}
+
+// Cancel all open orders for DevMM on an exchange
+async function cancelAllDevmmOrders(
+    exchange: DevmmExchange,
+    accessKey: string,
+    secretKey: string,
+    options?: {
+        trackedOrderIds?: string[];
+        mode?: ManagedOrderScope;
+    }
+): Promise<{ attempted: number; visibleBefore: number; unknownVisible: number; cancelled: number; alreadyClosed: number; failed: number }> {
+    const rateLimitKey = `devmm:${exchange}`;
+    const mode = options?.mode || "managed_only";
+    const trackedOrderIds = options?.trackedOrderIds || [];
+    let attempted = 0;
+    let visibleBefore = 0;
+    let unknownVisible = 0;
+    let cancelled = 0;
+    let alreadyClosed = 0;
+    let failed = 0;
+    const isIdempotentCancelError = (error: string | null | undefined): boolean => {
+        if (!error) return false;
+        const text = String(error).toLowerCase();
+        return text.includes("not found") || text.includes("not exist") || text.includes("already") || text.includes("closed") || text.includes("canceled") || text.includes("cancelled");
+    };
 
     try {
         const orderIds = new Set<string>();
-        const visibleOrderIds = new Set<string>();
         const attemptedOrderIds = new Set<string>();
-
-        if (exchange === "nonkyc") {
-            const res = await listNonKycOpenOrders(accessKey, secretKey, "PEPEW_USDT");
-            if (res.ok && Array.isArray(res.orders)) {
-                for (const o of res.orders) {
-                    const id = normalizeOrderId((o as any).order_id || (o as any).id);
-                    if (id) {
-                        orderIds.add(id);
-                        visibleOrderIds.add(id);
-                    }
-                }
-            }
-        } else if (exchange === "dextrade") {
-            const res = await listDexTradeOpenOrders(accessKey, secretKey, "PEPEWUSDT");
-            if (res.ok && Array.isArray(res.orders)) {
-                for (const o of res.orders) {
-                    const id = normalizeOrderId((o as any).id || (o as any).order_id);
-                    if (id) {
-                        orderIds.add(id);
-                        visibleOrderIds.add(id);
-                    }
-                }
-            }
-        } else if (exchange === "nestex") {
-            const res = await listNestExOpenOrders(accessKey, secretKey, "PEPEW/USDT", rateLimitKey, { exhaustive: true, includeNoCur: true });
-            if (res.ok && Array.isArray(res.orders)) {
-                for (const o of res.orders) {
-                    if (!isTargetNestExOrder(o)) continue;
-                    const id = normalizeOrderId((o as any).order_id || (o as any).id);
-                    if (id) {
-                        orderIds.add(id);
-                        visibleOrderIds.add(id);
-                    }
-                }
-            }
-        }
-        visibleBefore = visibleOrderIds.size;
-
-        // Fallback when open-orders endpoint is unreliable: also cancel tracked IDs in devmm_state.
+        const state = getDevmmState(exchange, "PEPEW/USDT");
+        const trackedSet = new Set<string>();
         for (const id of trackedOrderIds) {
             const normalized = normalizeOrderId(id);
-            if (normalized) orderIds.add(normalized);
+            if (normalized) trackedSet.add(normalized);
         }
-        const state = getDevmmState(exchange, "PEPEW/USDT");
-        if (state?.open_buy_order_id) orderIds.add(normalizeOrderId(state.open_buy_order_id));
-        if (state?.open_sell_order_id) orderIds.add(normalizeOrderId(state.open_sell_order_id));
+        if (state?.open_buy_order_id) trackedSet.add(normalizeOrderId(state.open_buy_order_id));
+        if (state?.open_sell_order_id) trackedSet.add(normalizeOrderId(state.open_sell_order_id));
+
+        const selectOrderIds = (orders: DevmmOpenOrder[]): string[] => {
+            const managed = orders.filter((order) => trackedSet.has(order.id) || hasDevmmClientPrefix(order.clientOrderId));
+            const unknown = orders.filter((order) => !managed.some((m) => m.id === order.id));
+            visibleBefore = orders.length;
+            unknownVisible = unknown.length;
+            if (mode === "all") return orders.map((order) => order.id);
+            if (mode === "unknown_only") return unknown.map((order) => order.id);
+            return managed.map((order) => order.id);
+        };
+        const initialOpenOrders = await listOpenOrdersForDevmm(exchange, accessKey, secretKey);
+        for (const id of selectOrderIds(initialOpenOrders)) {
+            if (id) orderIds.add(id);
+        }
+
+        // Fallback when open-orders endpoint is unreliable: also cancel tracked IDs in devmm_state.
+        if (mode !== "unknown_only") {
+            for (const id of trackedSet) {
+                if (id) orderIds.add(id);
+            }
+        }
 
         const attemptCancel = async (orderId: string): Promise<"CANCELLED" | "ALREADY_CLOSED" | "FAILED" | null> => {
             if (!orderId || attemptedOrderIds.has(orderId)) return null;
@@ -271,13 +360,9 @@ async function cancelAllDevmmOrders(
         // NestEx open-orders visibility can lag/be partial; do a few extra sweeps and cancel newly discovered IDs.
         if (exchange === "nestex") {
             for (let round = 0; round < 3; round++) {
-                const sweep = await listNestExOpenOrders(accessKey, secretKey, "PEPEW/USDT", rateLimitKey, { exhaustive: true, includeNoCur: true });
-                if (!sweep.ok || !Array.isArray(sweep.orders)) {
-                    break;
-                }
-                const newIds = sweep.orders
-                    .filter((o: any) => isTargetNestExOrder(o))
-                    .map((o: any) => normalizeOrderId((o as any).order_id || (o as any).id))
+                const sweepOrders = await listOpenOrdersForDevmm(exchange, accessKey, secretKey);
+                const selectedIds = selectOrderIds(sweepOrders);
+                const newIds = selectedIds
                     .filter((id: string) => !!id && !attemptedOrderIds.has(id));
                 if (newIds.length === 0) break;
                 for (const id of newIds) {
@@ -294,7 +379,7 @@ async function cancelAllDevmmOrders(
         console.error(`[devmmApi] Failed to cancel orders: ${err}`);
     }
 
-    return { attempted, visibleBefore, cancelled, alreadyClosed, failed };
+    return { attempted, visibleBefore, unknownVisible, cancelled, alreadyClosed, failed };
 }
 
 // POST /v1/devmm/start
@@ -321,6 +406,7 @@ router.post("/v1/devmm/start", async (req, res) => {
         if (orderQuote < DEVMM_MIN_NOTIONAL[exchange]) {
             orderQuote = DEVMM_MIN_NOTIONAL[exchange] * 1.05;
         }
+        const runtimeOrderQuote = resolveRuntimeOrderQuoteUsdt(exchange, orderQuote);
 
         const symbol = "PEPEW/USDT";
         console.log(`[devmm:start] exchange=${exchange}, symbol=${symbol}, params=`, parsed);
@@ -330,7 +416,7 @@ router.post("/v1/devmm/start", async (req, res) => {
             exchange,
             symbol,
             tgUserId,
-            orderQuoteUsdt: orderQuote,
+            orderQuoteUsdt: runtimeOrderQuote,
             buyOffsetPct: parsed.buyOffsetPct,
             sellOffsetPct: parsed.sellOffsetPct,
             refreshSeconds: parsed.refreshSeconds,
@@ -365,6 +451,7 @@ router.post("/v1/devmm/start", async (req, res) => {
                 exchange: config.exchange,
                 symbol: config.symbol,
                 orderQuoteUsdt: config.order_quote_usdt,
+                effectiveOrderQuoteUsdt: resolveRuntimeOrderQuoteUsdt(exchange, config.order_quote_usdt),
                 minNotionalUsdt: config.min_notional_usdt,
                 buyOffsetPct: config.buy_offset_pct,
                 sellOffsetPct: config.sell_offset_pct,
@@ -398,9 +485,12 @@ router.post("/v1/devmm/stop", async (req, res) => {
 
         // Cancel open orders
         const keys = await getKeys(exchange);
-        let cancelResult = { attempted: 0, visibleBefore: 0, cancelled: 0, alreadyClosed: 0, failed: 0 };
+        let cancelResult = { attempted: 0, visibleBefore: 0, unknownVisible: 0, cancelled: 0, alreadyClosed: 0, failed: 0 };
         if (keys) {
-            cancelResult = await cancelAllDevmmOrders(exchange, keys.accessKey, keys.secretKey, trackedOrderIds);
+            cancelResult = await cancelAllDevmmOrders(exchange, keys.accessKey, keys.secretKey, {
+                trackedOrderIds,
+                mode: "managed_only",
+            });
         }
 
         // Update state after cancellation attempt
@@ -423,9 +513,12 @@ router.post("/v1/devmm/stop", async (req, res) => {
 
         res.json({
             ok: true,
-            message: `DevMM stopped on ${exchange}`,
+            message: cancelResult.unknownVisible > 0
+                ? `DevMM stopped on ${exchange}. ${cancelResult.unknownVisible} unknown open order(s) were left untouched; use /v1/devmm/cancel-unknown-orders to clear them explicitly.`
+                : `DevMM stopped on ${exchange}`,
             ordersAttempted: cancelResult.attempted,
             ordersVisibleBefore: cancelResult.visibleBefore,
+            unknownOrdersVisible: cancelResult.unknownVisible,
             ordersCancelled: cancelResult.cancelled,
             ordersAlreadyClosed: cancelResult.alreadyClosed,
             ordersFailed: cancelResult.failed,
@@ -436,6 +529,37 @@ router.post("/v1/devmm/stop", async (req, res) => {
         }
         console.error(`[devmmApi] stop error: ${err.message}`);
         res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// POST /v1/devmm/cancel-unknown-orders
+router.post("/v1/devmm/cancel-unknown-orders", async (req, res) => {
+    try {
+        const parsed = StopSchema.parse(req.body);
+        const exchange = parsed.exchange as DevmmExchange;
+        const keys = await getKeys(exchange, parsed.tgUserId);
+        if (!keys) {
+            return res.status(400).json({ ok: false, error: "MISSING_KEYS" });
+        }
+        const cancelResult = await cancelAllDevmmOrders(exchange, keys.accessKey, keys.secretKey, {
+            mode: "unknown_only",
+        });
+        return res.json({
+            ok: true,
+            message: `Unknown orders cancel attempted on ${exchange}`,
+            ordersAttempted: cancelResult.attempted,
+            ordersVisibleBefore: cancelResult.visibleBefore,
+            unknownOrdersVisible: cancelResult.unknownVisible,
+            ordersCancelled: cancelResult.cancelled,
+            ordersAlreadyClosed: cancelResult.alreadyClosed,
+            ordersFailed: cancelResult.failed,
+        });
+    } catch (err: any) {
+        if (err instanceof z.ZodError) {
+            return res.status(400).json({ ok: false, error: "Invalid input", details: err.errors });
+        }
+        console.error(`[devmmApi] cancel-unknown-orders error: ${err.message}`);
+        return res.status(500).json({ ok: false, error: err.message });
     }
 });
 
@@ -555,7 +679,7 @@ router.post("/v1/devmm/turnover/reset", resetDevmmTurnoverHandler);
 router.get("/v1/devmm/turnover/reset", resetDevmmTurnoverHandler);
 
 // GET /v1/devmm/status
-router.get("/v1/devmm/status", (req, res) => {
+router.get("/v1/devmm/status", async (req, res) => {
     try {
         const exchangeParam = req.query.exchange as string | undefined;
         const normalizedExchange = exchangeParam ? normalizeDevmmExchange(exchangeParam) : null;
@@ -577,10 +701,16 @@ router.get("/v1/devmm/status", (req, res) => {
             const trackedOpenOrders = (state?.open_buy_order_id ? 1 : 0) + (state?.open_sell_order_id ? 1 : 0);
             const trackedBuyOrders = state?.open_buy_order_id ? 1 : 0;
             const trackedSellOrders = state?.open_sell_order_id ? 1 : 0;
+            const trackedOrderIds = new Set<string>([
+                normalizeOrderId(state?.open_buy_order_id),
+                normalizeOrderId(state?.open_sell_order_id),
+            ].filter(Boolean));
             const parsedError = splitDevmmError(state?.last_error);
             let balanceLastOkTs: number | null = null;
             let balanceLastOkAgeSec: number | null = null;
             let balanceLastErrCode: string | null = null;
+            let liveOpenOrders: DevmmOpenOrder[] = [];
+            let liveOpenOrdersError: string | null = null;
             try {
                 const userId = config?.tg_user_id || process.env.DEVMM_TG_USER_ID || "devfee";
                 const keyRecord = getExchangeKey(userId, ex);
@@ -595,9 +725,11 @@ router.get("/v1/devmm/status", (req, res) => {
                     balanceLastOkTs = meta.lastOkTs || null;
                     balanceLastOkAgeSec = meta.lastOkTs ? Math.max(0, Math.round((Date.now() - meta.lastOkTs) / 1000)) : null;
                     balanceLastErrCode = meta.lastErrCode || null;
+                    liveOpenOrders = await listOpenOrdersForDevmm(ex, decrypted.apiKey, decrypted.apiSecret);
                 }
-            } catch {
+            } catch (err: any) {
                 // ignore key/balance meta errors in status endpoint
+                liveOpenOrdersError = err?.message || "OPEN_ORDERS_FETCH_FAILED";
             }
 
             if (!config && !state) {
@@ -607,7 +739,12 @@ router.get("/v1/devmm/status", (req, res) => {
                     issueCode: null,
                     isEnabled: false,
                     openOrders: 0,
+                    openOrdersRaw: 0,
+                    openOrdersManaged: 0,
+                    openOrdersUnmanaged: 0,
                     openOrdersBySide: { buy: 0, sell: 0 },
+                    openOrdersRawBySide: { buy: 0, sell: 0, unknown: 0 },
+                    openOrdersManagedBySide: { buy: 0, sell: 0, unknown: 0 },
                     openOrdersSource: "tracked_state",
                     pendingCount,
                     turnoverUsed: 0,
@@ -622,6 +759,9 @@ router.get("/v1/devmm/status", (req, res) => {
                     turnover: { todayUsdt: 0, capDayUsdt: 0, hourUsdt: 0, capHourUsdt: 0, vol24hUsdt: 0 },
                     market: { bid: null, ask: null, mid: null, ref: null, spread: null },
                     orders: { buyOrderId: null, sellOrderId: null },
+                    spreadZero: false,
+                    bookSource: null,
+                    statusHint: null,
                     phase: bootstrap.phase,
                     bootstrapDone: bootstrap.bootstrapDone,
                     bootstrapBypassActive: bootstrap.bootstrapBypassActive,
@@ -639,8 +779,8 @@ router.get("/v1/devmm/status", (req, res) => {
             const turnoverRemaining = Math.max(0, capDay - turnoverToday);
             const turnoverHourRemaining = Math.max(0, capHour - turnoverHour);
             const requestedExchange = config?.exchange || ex;
-            const normalizedExchange = normalizeExchangeId(requestedExchange);
-            const resolvedSpec = getExchangeSpec(normalizedExchange);
+            const normalizedExchangeId = normalizeExchangeId(requestedExchange);
+            const resolvedSpec = getExchangeSpec(normalizedExchangeId);
             const resolvedExchange = resolvedSpec.exchangeId;
             const missingBalance = state
                 ? state.usdt_balance === null || state.usdt_balance === undefined || state.pepew_balance === null || state.pepew_balance === undefined
@@ -658,19 +798,71 @@ router.get("/v1/devmm/status", (req, res) => {
                         usdtShare: state.usdt_share ?? null,
                     }
                     : null;
+            const managedOpenOrders = liveOpenOrders.filter((order) => {
+                if (trackedOrderIds.has(order.id)) return true;
+                return hasDevmmClientPrefix(order.clientOrderId);
+            });
+            const unmanagedOrderIds = liveOpenOrders
+                .filter((order) => !managedOpenOrders.some((managed) => managed.id === order.id))
+                .map((order) => order.id)
+                .slice(0, 10);
+            const liveRawBySide = summarizeOpenOrdersBySide(liveOpenOrders);
+            const liveManagedBySide = summarizeOpenOrdersBySide(managedOpenOrders);
+            const rawOpenCount = liveOpenOrders.length > 0 ? liveOpenOrders.length : trackedOpenOrders;
+            const managedOpenCount = liveOpenOrders.length > 0 ? managedOpenOrders.length : trackedOpenOrders;
+            const unmanagedOpenCount = Math.max(0, rawOpenCount - managedOpenCount);
+            const openOrdersSource = liveOpenOrders.length > 0 ? "exchange_live" : "tracked_state";
+            const rawBySide = liveOpenOrders.length > 0
+                ? liveRawBySide
+                : { buy: trackedBuyOrders, sell: trackedSellOrders, unknown: 0 };
+            const managedBySide = liveOpenOrders.length > 0
+                ? liveManagedBySide
+                : { buy: trackedBuyOrders, sell: trackedSellOrders, unknown: 0 };
+            const baseIssueCode = deriveDevmmIssueCode(state?.pause_reason || null, state?.last_decision || null);
+            const issueCode = unmanagedOpenCount > 0
+                ? mergeIssueCodes(baseIssueCode, [DevmmIssueCode.F08_UNKNOWN_ORDERS_PRESENT])
+                : baseIssueCode;
+            const spreadValue = state?.last_bid && state?.last_ask && state?.last_mid
+                ? ((state.last_ask - state.last_bid) / state.last_mid)
+                : null;
+            const spreadZero = String(issueCode || "").includes(DevmmIssueCode.F07_ZERO_SPREAD_LOOP) || (typeof spreadValue === "number" && spreadValue <= 0);
+            const bookSource = (
+                state?.pause_reason === DevmmPauseReason.TICKER_FALLBACK_BOOK ||
+                String(state?.last_decision || "").includes(DevmmPauseReason.TICKER_FALLBACK_BOOK)
+            ) ? "ticker_fallback" : null;
+            const statusHint = unmanagedOpenCount > 0
+                ? `Unmanaged orders: ${unmanagedOpenCount} on exchange`
+                : spreadZero
+                    ? `Spread=0${bookSource ? " (ticker fallback)" : ""}, paused quoting`
+                    : (bookSource ? "Data fallback" : null);
+            const displayStatus = state?.status === "ACTIVE" && unmanagedOpenCount > 0
+                ? "DEGRADED"
+                : (state?.status || "STOPPED");
+            if (liveOpenOrdersError) {
+                console.warn(`[devmmStatus] open orders fetch failed exchange=${ex} err=${liveOpenOrdersError}`);
+            }
 
             results.push({
                 exchange: ex,
                 requestedExchange,
-                normalizedExchange,
+                normalizedExchange: normalizedExchangeId,
                 resolvedExchange,
                 adapterKey: resolvedSpec.adapterKey,
-                status: state?.status || "STOPPED",
+                status: displayStatus,
                 pauseReason: state?.pause_reason || null,
-                issueCode: deriveDevmmIssueCode(state?.pause_reason || null, state?.last_decision || null),
+                issueCode,
+                statusHint,
+                spreadZero,
+                bookSource,
                 openOrders: trackedOpenOrders,
-                openOrdersBySide: { buy: trackedBuyOrders, sell: trackedSellOrders },
-                openOrdersSource: "tracked_state",
+                openOrdersRaw: rawOpenCount,
+                openOrdersManaged: managedOpenCount,
+                openOrdersUnmanaged: unmanagedOpenCount,
+                openOrdersBySide: { buy: managedBySide.buy, sell: managedBySide.sell },
+                openOrdersRawBySide: rawBySide,
+                openOrdersManagedBySide: managedBySide,
+                unmanagedOrderIds,
+                openOrdersSource,
                 pendingCount,
                 turnoverUsed: turnoverToday,
                 turnoverCap: capDay,
@@ -685,6 +877,7 @@ router.get("/v1/devmm/status", (req, res) => {
                 config: config ? {
                     symbol: config.symbol,
                     orderQuoteUsdt: config.order_quote_usdt,
+                    effectiveOrderQuoteUsdt: resolveRuntimeOrderQuoteUsdt(ex, config.order_quote_usdt),
                     minNotionalUsdt: config.min_notional_usdt,
                     buyOffsetPct: config.buy_offset_pct,
                     sellOffsetPct: config.sell_offset_pct,
@@ -707,9 +900,7 @@ router.get("/v1/devmm/status", (req, res) => {
                     ask: state?.last_ask || null,
                     mid: state?.last_mid || null,
                     ref: state?.last_ref || null,
-                    spread: state?.last_bid && state?.last_ask && state?.last_mid
-                        ? ((state.last_ask - state.last_bid) / state.last_mid)
-                        : null,
+                    spread: spreadValue,
                 },
                 orders: {
                     buyOrderId: state?.open_buy_order_id || null,

@@ -12,6 +12,7 @@ export const API_ENDPOINTS = {
     feeEstimate: "/wallet/fee/estimate",
     price: "/wallet/price",
     txRaw: "/wallet/tx/raw",
+    txRawBatch: "/wallet/tx/raw/batch",
     txBroadcast: "/wallet/tx/broadcast",
   },
   v1: {
@@ -58,6 +59,21 @@ export function getApiUrl(path: string) {
   return joinUrl(API_BASE, path);
 }
 
+function createRequestId() {
+  const g = globalThis as typeof globalThis & {
+    crypto?: {
+      randomUUID?: () => string;
+      getRandomValues?: (arr: Uint8Array) => Uint8Array;
+    };
+  };
+  if (g.crypto?.randomUUID) return g.crypto.randomUUID();
+  if (g.crypto?.getRandomValues) {
+    const bytes = g.crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
 export function getAuthToken() {
   if (typeof localStorage === "undefined") return "";
   return localStorage.getItem(AUTH_TOKEN_KEY) || "";
@@ -79,6 +95,9 @@ export async function apiFetch(path: string, options: RequestInit & { signal?: A
   const token = getAuthToken();
   if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
+  }
+  if (!headers.has("x-request-id")) {
+    headers.set("x-request-id", createRequestId());
   }
   const url = getApiUrl(path);
   if (debug) {

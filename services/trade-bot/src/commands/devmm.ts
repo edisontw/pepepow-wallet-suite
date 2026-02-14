@@ -171,8 +171,12 @@ async function startDevmmOnExchange(
         const cfg = res.config;
         let msg = `DevMM started on ${exchangeLabel(exchange)}\n\n`;
         if (cfg) {
+            const effectiveOrderQuoteUsdt = Number(
+                cfg.effectiveOrderQuoteUsdt ??
+                (exchange === "nestex" ? 1 : cfg.orderQuoteUsdt)
+            );
             msg += `Symbol: ${cfg.symbol || "PEPEW/USDT"}\n`;
-            msg += `Order size: ${formatUsdt(cfg.orderQuoteUsdt)} USDT\n`;
+            msg += `Order size: ${formatUsdt(effectiveOrderQuoteUsdt)} USDT\n`;
             msg += `Min notional: ${formatUsdt(cfg.minNotionalUsdt)} USDT\n`;
             msg += `Buy offset: -${(cfg.buyOffsetPct * 100).toFixed(1)}%\n`;
             msg += `Sell offset: +${(cfg.sellOffsetPct * 100).toFixed(1)}%\n`;
@@ -390,7 +394,8 @@ function formatStatusEntry(entry: DevmmStatusEntry): string {
     }
 
     if (entry.config) {
-        msg += `Order: ${formatUsdt(entry.config.orderQuoteUsdt)} USDT\n`;
+        const effectiveOrderQuoteUsdt = entry.config.effectiveOrderQuoteUsdt ?? entry.config.orderQuoteUsdt;
+        msg += `Order: ${formatUsdt(effectiveOrderQuoteUsdt)} USDT\n`;
         msg += `Offsets: BUY -${(entry.config.buyOffsetPct * 100).toFixed(1)}% / SELL +${(entry.config.sellOffsetPct * 100).toFixed(1)}%\n`;
     }
 

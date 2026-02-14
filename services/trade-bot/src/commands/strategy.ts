@@ -66,7 +66,8 @@ function formatNumber(value: number | null | undefined, options: NumericFormatOp
 }
 
 function formatPrice(value: number | null | undefined): string {
-    return formatNumber(value, { maxDecimals: 12, minDecimals: 0, group: false });
+    if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+    return value.toFixed(8);
 }
 
 function formatInterval(sec: number | null | undefined): string {
@@ -152,72 +153,176 @@ function getStrategyRuntimeStatus(config: StrategyConfig): { icon: string; text:
     return config.enabled ? { icon: "✅", text: "ACTIVE" } : { icon: "⏸️", text: "STOPPED" };
 }
 
-function countOpenOrders(entry: DevmmStatusEntry): number {
-    return (entry.orders?.buyOrderId ? 1 : 0) + (entry.orders?.sellOrderId ? 1 : 0);
-}
-
 function getDevmmStatusIcon(status: DevmmStatusEntry["status"] | string): string {
-    if (status === "ACTIVE") return "✅";
+    if (status === "ACTIVE") return "🟢";
     if (status === "DEGRADED") return "⚠️";
-    if (status === "PAUSED") return "⏸️";
+    if (status === "PAUSED") return "⏸";
     return "⏹️";
 }
 
-function getDevmmFlags(entry: DevmmStatusEntry): string[] {
-    const flags: string[] = [];
-    if (entry.market && typeof entry.market.spread === "number" && entry.market.spread <= 0) {
-        flags.push("ZERO_SPREAD_LOOP");
+function countTrackedOrders(entry: DevmmStatusEntry): number {
+    return (entry.orders?.buyOrderId ? 1 : 0) + (entry.orders?.sellOrderId ? 1 : 0);
+}
+
+function resolveManagedOpenOrders(entry: DevmmStatusEntry): number {
+    if (typeof entry.openOrdersManaged === "number") return entry.openOrdersManaged;
+    const fromBySide = entry.openOrdersManagedBySide || entry.openOrdersBySide;
+    if (fromBySide) return (fromBySide.buy || 0) + (fromBySide.sell || 0);
+    return countTrackedOrders(entry);
+}
+
+function resolveRawOpenOrders(entry: DevmmStatusEntry): number {
+    if (typeof entry.openOrdersRaw === "number") return entry.openOrdersRaw;
+    if (typeof entry.openOrdersManaged === "number") return entry.openOrdersManaged;
+    return countTrackedOrders(entry);
+}
+
+function resolveUnmanagedOpenOrders(entry: DevmmStatusEntry): number {
+    if (typeof entry.openOrdersUnmanaged === "number") return entry.openOrdersUnmanaged;
+    const raw = resolveRawOpenOrders(entry);
+    const managed = resolveManagedOpenOrders(entry);
+    return Math.max(0, raw - managed);
+}
+
+function resolveManagedBySide(entry: DevmmStatusEntry): { buy: number; sell: number } {
+    if (entry.openOrdersManagedBySide) {
+        return {
+            buy: entry.openOrdersManagedBySide.buy || 0,
+            sell: entry.openOrdersManagedBySide.sell || 0,
+        };
     }
-    if (entry.pauseReason) flags.push(sanitizeReason(entry.pauseReason, 40));
-    if (entry.lastErrorCode) flags.push(sanitizeReason(entry.lastErrorCode, 40));
-    if (entry.lastError && !entry.lastErrorCode) flags.push(sanitizeReason(entry.lastError, 40));
-    return flags.filter((v, idx) => v.length > 0 && flags.indexOf(v) === idx);
+    if (entry.openOrdersBySide) {
+        return {
+            buy: entry.openOrdersBySide.buy || 0,
+            sell: entry.openOrdersBySide.sell || 0,
+        };
+    }
+    return {
+        buy: entry.orders?.buyOrderId ? 1 : 0,
+        sell: entry.orders?.sellOrderId ? 1 : 0,
+    };
+}
+
+function normalizeIssueLabel(value: string): string {
+    return value.replace(/^F\d+_/, "").replace(/_/g, " ").trim();
+}
+
+function getTopIssues(entry: DevmmStatusEntry, maxItems = 2): string[] {
+    const results: string[] = [];
+    const push = (v: string | null | undefined) => {
+        if (!v) return;
+        const text = sanitizeReason(v, 80);
+        if (!text) return;
+        if (!results.includes(text)) results.push(text);
+    };
+
+    const issueCodes = String(entry.issueCode || "")
+        .split("|")
+        .map((v) => v.trim())
+        .filter(Boolean);
+    for (const code of issueCodes) {
+        if (code === "F07_ZERO_SPREAD_LOOP") {
+            const source = entry.bookSource && entry.bookSource.includes("ticker")
+                ? "ticker fallback"
+                : "orderbook";
+            push(`Spread=0 (${source})`);
+            continue;
+        }
+        if (code === "F08_UNKNOWN_ORDERS_PRESENT") {
+            const unmanaged = resolveUnmanagedOpenOrders(entry);
+            push(`Unmanaged orders (${unmanaged})`);
+            continue;
+        }
+        push(normalizeIssueLabel(code));
+    }
+
+    if (entry.pauseReason === "TICKER_FALLBACK_BOOK" && !results.some(v => v.toLowerCase().includes("fallback"))) {
+        push("Data fallback");
+    }
+    if (!results.length && entry.statusHint) push(entry.statusHint);
+    if (!results.length) push(entry.pauseReason || null);
+    if (!results.length) push(entry.lastErrorCode || null);
+    if (!results.length) push(entry.lastError || null);
+
+    return results.slice(0, maxItems);
+}
+
+function formatDevmmOrdersInline(entry: DevmmStatusEntry): string | null {
+    const managed = resolveManagedOpenOrders(entry);
+    const raw = resolveRawOpenOrders(entry);
+    const unmanaged = resolveUnmanagedOpenOrders(entry);
+    const bySide = resolveManagedBySide(entry);
+    if (unmanaged > 0) {
+        return `Orders ${managed} managed / ${raw} on exchange (⚠️ unmanaged)`;
+    }
+    if (managed > 0) {
+        return `Orders ${managed} (${bySide.buy}B/${bySide.sell}S)`;
+    }
+    if (raw > 0) {
+        return `Orders ${raw} on exchange`;
+    }
+    return null;
 }
 
 function formatDevmmSummaryLine(entry: DevmmStatusEntry | null, exchange: ExchangeName): string {
-    const label = exchangeLabel(exchange).padEnd(9, " ");
+    const label = exchangeLabel(exchange);
     if (!entry) {
         return `• ${label} ⏹️ STOPPED`;
     }
     const status = entry.status || "STOPPED";
     const icon = getDevmmStatusIcon(status);
-    const detailParts: string[] = [];
-    const openOrders = countOpenOrders(entry);
-    if (openOrders > 0) detailParts.push(`open ${openOrders}`);
-    const flags = getDevmmFlags(entry);
-    if (flags.length > 0) detailParts.push(flags[0]);
-    const details = detailParts.length > 0 ? `  (${detailParts.join(" · ")})` : "";
-    return `• ${label} ${icon} ${status}${details}`;
+    const parts: string[] = [`${label} ${icon} ${status}`];
+    const orderPart = formatDevmmOrdersInline(entry);
+    if (orderPart) parts.push(orderPart);
+    if (entry.market?.mid && Number.isFinite(entry.market.mid)) {
+        parts.push(`Mid ${formatPrice(entry.market.mid)}`);
+    }
+    const issues = getTopIssues(entry, 1);
+    if (issues.length > 0) {
+        const text = issues[0].toLowerCase().includes("spread=0")
+            ? `${issues[0]}, paused quoting`
+            : issues[0];
+        parts.push(text);
+    }
+    return `• ${parts.join(" · ")}`;
 }
 
 function formatDebugSection(entry: DevmmStatusEntry | null, exchange: ExchangeName): string[] {
     const label = exchangeLabel(exchange);
     if (!entry) {
-        return [label, "• status           STOPPED (no data)"];
+        return [label, "• status          STOPPED (no data)"];
     }
 
-    const flags = getDevmmFlags(entry);
-    const decision = sanitizeReason(entry.lastDecision || entry.lastAction || "N/A", 100);
-    const reason = flags.length > 0 ? flags.join(" | ") : "-";
-    const inventoryUsdt = entry.inventory && !("status" in entry.inventory)
-        ? formatNumber(entry.inventory.usdtBalance, { maxDecimals: 4, group: false })
+    const decision = sanitizeReason(entry.lastDecision || entry.lastAction || "N/A", 120);
+    const managed = resolveManagedOpenOrders(entry);
+    const raw = resolveRawOpenOrders(entry);
+    const unmanaged = resolveUnmanagedOpenOrders(entry);
+    const issues = getTopIssues(entry, 2);
+    const issueText = issues.length > 0 ? issues.join(" | ") : "-";
+
+    const inventoryText = entry.inventory && !("status" in entry.inventory)
+        ? `USDT ${formatNumber(entry.inventory.usdtBalance, { maxDecimals: 4 })} | PEPEW ${formatPepewBalance(entry.inventory.pepewBalance)} | ${(entry.inventory.usdtShare ?? 0) * 100 > 0 ? `${formatNumber((entry.inventory.usdtShare ?? 0) * 100, { maxDecimals: 2 })}% USDT` : "-"}`
         : entry.inventory && "status" in entry.inventory
             ? `unavailable (${sanitizeReason(entry.inventory.reason || "unknown", 30)})`
             : "-";
 
     const turnover = entry.turnover
-        ? `${formatNumber(entry.turnover.hourUsdt, { maxDecimals: 4 })} / ${formatNumber(entry.turnover.capHourUsdt, { maxDecimals: 4 })}`
-        : "-";
+        ? (entry.turnover.hourUsdt > 0 || entry.turnover.capHourUsdt > 0
+            ? `${formatNumber(entry.turnover.hourUsdt, { maxDecimals: 4 })} / ${formatNumber(entry.turnover.capHourUsdt, { maxDecimals: 4 })}`
+            : "—")
+        : "—";
 
     return [
         label,
-        `• status           ${entry.status || "STOPPED"}`,
-        `• mid price        ${formatPrice(entry.market?.mid)}`,
-        `• hourly turnover  ${turnover}`,
-        `• inventory (USDT) ${inventoryUsdt}`,
-        `• open orders      ${countOpenOrders(entry)}`,
-        `• decision         ${decision}`,
-        `• reason / flags   ${reason}`,
+        `• status          ${entry.status || "STOPPED"}`,
+        `• mid / bid / ask ${formatPrice(entry.market?.mid)} / ${formatPrice(entry.market?.bid)} / ${formatPrice(entry.market?.ask)}`,
+        `• turnover (1h)   ${turnover}`,
+        `• inventory       ${inventoryText}`,
+        `• open orders     ${managed} managed / ${raw} on exchange${unmanaged > 0 ? " (⚠️ unmanaged)" : ""}`,
+        `• decision        ${decision}`,
+        `• issueCode       ${entry.issueCode || "-"}`,
+        `• issues          ${issueText}`,
+        `• market source   ${entry.bookSource || "-"}`,
     ];
 }
 
@@ -313,24 +418,38 @@ export async function handleStatus(ctx: Context): Promise<void> {
 
         lines.push("", "⚙️ Active Strategies");
         const realConfigs = (data.configs || []).filter(c => c.tradeMode === "REAL" && c.enabled);
-        if (realConfigs.length === 0) {
+        const activeStrategies = realConfigs.filter((cfg) => getStrategyRuntimeStatus(cfg).text === "ACTIVE");
+        if (activeStrategies.length === 0) {
             lines.push("• None active");
         } else {
-            for (const cfg of realConfigs) {
+            for (const cfg of activeStrategies) {
                 const exchangeDisplay = exchangeLabel(cfg.exchange || "");
-                const strategyState = getStrategyRuntimeStatus(cfg);
-                lines.push(`• ${cfg.strategy}  ${exchangeDisplay}  ${cfg.pair}   ${strategyState.icon} ${strategyState.text}`);
-                lines.push(`  ${formatStrategyParams(cfg)}`);
+                lines.push(`• ${cfg.strategy} ${exchangeDisplay} ${cfg.pair} · ${formatStrategyParams(cfg)}`);
                 if (cfg.lastRunAt) tsCandidates.push(cfg.lastRunAt);
             }
         }
 
         lines.push("", "🤖 DevMM Summary");
-        for (const exchange of EXCHANGE_ORDER) {
-            const entry = devmmMap.get(exchange) || null;
+        const devmmDisplayRows = EXCHANGE_ORDER
+            .map((exchange) => ({ exchange, entry: devmmMap.get(exchange) || null }))
+            .filter(({ entry }) => {
+                if (!entry) return false;
+                const raw = resolveRawOpenOrders(entry);
+                return entry.status !== "STOPPED" || raw > 0 || !!entry.isEnabled;
+            });
+        if (devmmDisplayRows.length === 0) {
+            lines.push("• None active");
+        }
+        for (const { exchange, entry } of devmmDisplayRows) {
             lines.push(formatDevmmSummaryLine(entry, exchange));
             if (entry?.updatedAt) tsCandidates.push(entry.updatedAt);
             if (entry?.lastActionAt) tsCandidates.push(entry.lastActionAt);
+        }
+        const degradedSummary = devmmDisplayRows
+            .filter(({ entry }) => !!entry && (entry.status === "DEGRADED" || entry.status === "PAUSED"))
+            .map(({ exchange }) => exchangeLabel(exchange));
+        if (degradedSummary.length > 0) {
+            lines.push(`⚠️ Degraded: ${degradedSummary.join(", ")}`);
         }
 
         const lastUpdateTs = tsCandidates.length > 0 ? Math.max(...tsCandidates) : Date.now();

@@ -4,28 +4,35 @@ import { Buffer } from "buffer";
 import { useTranslation } from "react-i18next";
 import { addressToScript, buildAndSignP2PKH, selectUtxos, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
 import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS, withAddress } from "../lib/api";
-import { broadcastTx, fetchRawTx, isTransientRawTxError, TxApiError } from "../lib/tx";
+import { broadcastTx, fetchRawTxBatchApi, TxApiError } from "../lib/tx";
 import { fmtPEPEWFromSats, satsToCoin } from "../lib/format";
 import { triggerRefresh } from "../lib/refresh";
 import { hasPendingSpendTxid, recordPendingSpend } from "../lib/pending";
 import { walletStore, WalletState, type Utxo } from "../lib/walletStore";
+import { requestWakeLock, releaseWakeLock, type WakeLockSentinelLike } from "../lib/wakeLock";
 import AppLayout from "../components/layout/AppLayout";
 import PageCard from "../components/layout/PageCard";
 import {
   buildConsolidationTx,
+  estimateConsolidationRounds,
   estimateP2PKHTxBytes,
   type ConsolidationInput,
   MAX_CONSOLIDATE_INPUTS,
+  MAX_SEND_INPUTS,
   MAX_CONSOLIDATE_TX_BYTES,
   selectConsolidationUtxos
 } from "../utils/consolidate";
 
 type ConsolidationPreview = {
   selected: Utxo[];
+  totalCandidates: number;
   totalInSats: number;
   outputSats: number;
   feeSats: number;
   estimatedBytes: number;
+  round: number;
+  totalRounds: number;
+  remainingAfterRound: number;
 };
 
 type RawTxBatchFailure = {
@@ -53,6 +60,40 @@ type RawTxRetryContext = {
   requestIds: string[];
 };
 
+type ConsolidationMode = "auto" | "manual";
+type ConsolidationPhase =
+  | "idle"
+  | "building"
+  | "signing"
+  | "broadcasting"
+  | "waiting"
+  | "refreshing"
+  | "paused"
+  | "done"
+  | "error"
+  | "cancelled";
+
+type ConsolidationProgress = {
+  totalUtxos: number;
+  roundSize: number;
+  currentRound: number;
+  totalRounds: number;
+  remaining: number;
+  lastTxid?: string;
+  requestId?: string;
+  mode: ConsolidationMode;
+  phase: ConsolidationPhase;
+};
+
+type PersistedConsolidationProgress = {
+  mode: ConsolidationMode;
+  cap: number;
+  roundDone: number;
+  estimatedRounds: number;
+  lastTxid?: string;
+  updatedAt: number;
+};
+
 const DEFAULT_PATH = "m/44'/5'/0'/0/0";
 const COIN_MULTIPLIER = 100000000n;
 const MIN_SEND_SATS = 100000000;
@@ -64,9 +105,52 @@ const SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
 const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g;
 const LAST_RAWTX_KEY = "pepew_last_broadcast";
 const LAST_RAWTX_TTL_MS = 2 * 60 * 1000;
-const RAWTX_BATCH_CONCURRENCY = 4;
+const RAWTX_BATCH_SIZE = 20;
 const RAWTX_BATCH_RETRIES = 1;
 const RAWTX_RETRY_BACKOFF_MS = [200, 500];
+const CONSOLIDATION_REFRESH_DELAY_MS = 1200;
+const CONSOLIDATION_PROPAGATION_DELAY_MS = 6000;
+const CONSOLIDATION_POLL_BACKOFF_MS = [2000, 3000, 5000, 8000, 13000];
+const CONSOLIDATION_POLL_MAX_WAIT_MS = 60000;
+const CONSOLIDATION_CLICK_DEBOUNCE_MS = 400;
+const CONSOLIDATION_CANCELLED_TOKEN = "__CONSOLIDATION_CANCELLED__";
+const CONSOLIDATION_PROGRESS_KEY = "pepew_consolidation_progress";
+const CONSOLIDATION_PROGRESS_TTL_MS = 24 * 60 * 60 * 1000;
+const POST_SEND_REFRESH_DELAYS_MS = [2000, 6000, 15000];
+const VISIBLE_REFRESH_MIN_AGE_MS = 30000;
+
+function loadConsolidationProgress(now = Date.now()): PersistedConsolidationProgress | null {
+  if (typeof localStorage === "undefined") return null;
+  const raw = localStorage.getItem(CONSOLIDATION_PROGRESS_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (parsed.mode !== "auto" && parsed.mode !== "manual") return null;
+    if (typeof parsed.cap !== "number" || parsed.cap <= 0) return null;
+    if (typeof parsed.roundDone !== "number" || parsed.roundDone < 0) return null;
+    if (typeof parsed.estimatedRounds !== "number" || parsed.estimatedRounds <= 0) return null;
+    if (typeof parsed.updatedAt !== "number") return null;
+    if (now - parsed.updatedAt > CONSOLIDATION_PROGRESS_TTL_MS) {
+      localStorage.removeItem(CONSOLIDATION_PROGRESS_KEY);
+      return null;
+    }
+    if (parsed.lastTxid !== undefined && typeof parsed.lastTxid !== "string") return null;
+    return parsed as PersistedConsolidationProgress;
+  } catch {
+    return null;
+  }
+}
+
+function saveConsolidationProgress(progress: PersistedConsolidationProgress) {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(CONSOLIDATION_PROGRESS_KEY, JSON.stringify(progress));
+}
+
+function clearConsolidationProgress() {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(CONSOLIDATION_PROGRESS_KEY);
+}
 
 function parseCoinToSats(value: string) {
   const trimmed = value.trim();
@@ -220,13 +304,27 @@ export default function Send() {
   const [consolidating, setConsolidating] = useState(false);
   const [consolidateOpen, setConsolidateOpen] = useState(false);
   const [consolidatePreview, setConsolidatePreview] = useState<ConsolidationPreview | null>(null);
+  const [consolidationProgress, setConsolidationProgress] = useState<ConsolidationProgress | null>(null);
+  const [consolidationMode, setConsolidationMode] = useState<ConsolidationMode>("auto");
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const [savedProgress, setSavedProgress] = useState<PersistedConsolidationProgress | null>(() => loadConsolidationProgress());
+  const [showResumeConsolidation, setShowResumeConsolidation] = useState(false);
+  const [wakeLockUnsupportedHint, setWakeLockUnsupportedHint] = useState(false);
   const [rawTxRetryContext, setRawTxRetryContext] = useState<RawTxRetryContext | null>(null);
   const [walletState, setWalletState] = useState<WalletState>(walletStore.getState());
   const resolveSeq = useRef(0);
   const mountedRef = useRef(true);
   const sendInFlightRef = useRef(false);
   const consolidateInFlightRef = useRef(false);
+  const cancelRequestedRef = useRef(false);
+  const consolidateClickRef = useRef(0);
+  const consolidationFailureRef = useRef(0);
   const rawTxCacheRef = useRef<Map<string, string>>(new Map());
+  const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
+  const backgroundPauseRef = useRef(false);
+  const postSendRefreshTimersRef = useRef<number[]>([]);
+  const postSendRefreshRunRef = useRef(0);
+  const lastVisibleRefreshAtRef = useRef(0);
   const lastSuccessSnapshotRef = useRef<{
     to: string;
     amount: string;
@@ -234,8 +332,76 @@ export default function Send() {
     subtractFee: boolean;
     address: string;
   } | null>(null);
+  const consolidationBusy = consolidating || consolidateInFlightRef.current;
   const normalizedTo = useMemo(() => normalizeAddressInput(to), [to]);
   const normalizedAddress = useMemo(() => normalizeAddressInput(address), [address]);
+  const hitConsolidationDebounce = () => {
+    const now = Date.now();
+    if (now - consolidateClickRef.current < CONSOLIDATION_CLICK_DEBOUNCE_MS) return true;
+    consolidateClickRef.current = now;
+    return false;
+  };
+  const setConsolidationCancel = (next: boolean) => {
+    cancelRequestedRef.current = next;
+    setCancelRequested(next);
+  };
+  const persistConsolidationProgress = (progress: PersistedConsolidationProgress | null) => {
+    setSavedProgress(progress);
+    if (progress) {
+      saveConsolidationProgress(progress);
+      return;
+    }
+    clearConsolidationProgress();
+  };
+  const clearPostSendRefreshTimers = useCallback(() => {
+    postSendRefreshRunRef.current += 1;
+    if (!postSendRefreshTimersRef.current.length) return;
+    postSendRefreshTimersRef.current.forEach((id) => window.clearTimeout(id));
+    postSendRefreshTimersRef.current = [];
+  }, []);
+  const refreshBalanceOnce = useCallback(async () => {
+    await walletStore.fetch();
+    walletStore.updatePending();
+  }, []);
+  const schedulePostSendRefresh = useCallback((baselineUtxoSum: number | null, baselineUtxoCount: number) => {
+    clearPostSendRefreshTimers();
+    const runId = postSendRefreshRunRef.current;
+    POST_SEND_REFRESH_DELAYS_MS.forEach((delayMs) => {
+      const timerId = window.setTimeout(async () => {
+        if (!mountedRef.current || runId !== postSendRefreshRunRef.current) return;
+        await refreshBalanceOnce();
+        if (!mountedRef.current || runId !== postSendRefreshRunRef.current) return;
+        const latest = walletStore.getState();
+        const sumChanged = latest.utxoSumSats !== baselineUtxoSum;
+        const countChanged = latest.utxos.length !== baselineUtxoCount;
+        if (sumChanged || countChanged) {
+          clearPostSendRefreshTimers();
+        }
+      }, delayMs);
+      postSendRefreshTimersRef.current.push(timerId);
+    });
+  }, [clearPostSendRefreshTimers, refreshBalanceOnce]);
+  const requestConsolidationWakeLock = useCallback(async () => {
+    const sentinel = await requestWakeLock();
+    if (sentinel) {
+      if (wakeLockRef.current && wakeLockRef.current !== sentinel) {
+        await releaseWakeLock(wakeLockRef.current);
+      }
+      wakeLockRef.current = sentinel;
+      setWakeLockUnsupportedHint(false);
+      return true;
+    }
+    setWakeLockUnsupportedHint(true);
+    return false;
+  }, []);
+  const releaseConsolidationWakeLock = useCallback(async () => {
+    if (!wakeLockRef.current) return;
+    await releaseWakeLock(wakeLockRef.current);
+    wakeLockRef.current = null;
+  }, []);
+  const lastUpdatedLabel = walletState.lastUpdate
+    ? new Date(walletState.lastUpdate).toLocaleTimeString()
+    : "--";
 
   useEffect(() => {
     return walletStore.subscribe(setWalletState);
@@ -255,8 +421,10 @@ export default function Send() {
     return () => {
       mountedRef.current = false;
       rawTxCacheRef.current.clear();
+      clearPostSendRefreshTimers();
+      void releaseConsolidationWakeLock();
     };
-  }, []);
+  }, [clearPostSendRefreshTimers, releaseConsolidationWakeLock]);
 
   useEffect(() => {
     if (!sendLocked) return;
@@ -274,6 +442,66 @@ export default function Send() {
       setErr(null);
     }
   }, [sendLocked, to, amount, fee, subtractFee, address]);
+
+  useEffect(() => {
+    if (!savedProgress) {
+      setShowResumeConsolidation(false);
+      return;
+    }
+    if (!consolidationBusy) {
+      setShowResumeConsolidation(true);
+    }
+  }, [savedProgress, consolidationBusy]);
+
+  useEffect(() => {
+    const maybeRefreshWhenVisible = () => {
+      const now = Date.now();
+      if (now - lastVisibleRefreshAtRef.current < 1000) return;
+      const lastUpdate = walletStore.getState().lastUpdate || 0;
+      if (now - lastUpdate <= VISIBLE_REFRESH_MIN_AGE_MS) return;
+      lastVisibleRefreshAtRef.current = now;
+      void refreshBalanceOnce();
+    };
+    const pauseForBackground = () => {
+      if (!consolidationBusy) return;
+      backgroundPauseRef.current = true;
+      setConsolidationPhase("paused");
+      setSendStatusNote(t("send.consolidatePausedBackground"));
+      setShowResumeConsolidation(true);
+      void releaseConsolidationWakeLock();
+    };
+    const handleVisible = () => {
+      maybeRefreshWhenVisible();
+      if (!consolidationBusy) return;
+      if (backgroundPauseRef.current) {
+        setShowResumeConsolidation(true);
+        return;
+      }
+      void requestConsolidationWakeLock();
+    };
+    const handleVisibility = () => {
+      if (document.hidden) {
+        pauseForBackground();
+        return;
+      }
+      handleVisible();
+    };
+    const handlePageHide = () => {
+      pauseForBackground();
+    };
+    const handlePageShow = () => {
+      handleVisible();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("pageshow", handlePageShow);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("pageshow", handlePageShow);
+    };
+  }, [consolidationBusy, refreshBalanceOnce, releaseConsolidationWakeLock, requestConsolidationWakeLock, t]);
 
 
   useEffect(() => {
@@ -575,6 +803,9 @@ export default function Send() {
   };
 
   const resetSendState = () => {
+    clearPostSendRefreshTimers();
+    void releaseConsolidationWakeLock();
+    backgroundPauseRef.current = false;
     setSendLocked(false);
     setResult(null);
     setLastTxid(null);
@@ -584,6 +815,11 @@ export default function Send() {
     setConsolidating(false);
     setConsolidateOpen(false);
     setConsolidatePreview(null);
+    setConsolidationProgress(null);
+    setConsolidationMode("auto");
+    setShowResumeConsolidation(false);
+    setWakeLockUnsupportedHint(false);
+    setConsolidationCancel(false);
     setRawTxRetryContext(null);
     setTo("");
     setAmount("");
@@ -595,6 +831,7 @@ export default function Send() {
     setResolveMessage(null);
     setResolveResult(null);
     setRequestUrl(null);
+    persistConsolidationProgress(null);
   };
 
   const copyTxid = async (txid: string) => {
@@ -639,6 +876,19 @@ export default function Send() {
   };
 
   const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+
+  const isTransientBatchItemFailure = (item: RawTxBatchFailure) => {
+    if (item.status === 502 || item.status === 503 || item.status === 504) return true;
+    if (item.code === "UPSTREAM_TIMEOUT" || item.code === "RPC_TIMEOUT" || item.code === "UPSTREAM_ERROR") return true;
+    return /timeout|econnreset/i.test(item.error || "");
+  };
+
+  const isTransientBatchRequestError = (err: unknown) => {
+    if (!(err instanceof TxApiError)) return false;
+    if (err.status === 502 || err.status === 503 || err.status === 504) return true;
+    if (err.code === "UPSTREAM_TIMEOUT" || err.code === "RPC_TIMEOUT" || err.code === "UPSTREAM_ERROR") return true;
+    return /timeout|econnreset/i.test(err.detail || "");
+  };
 
   const shouldOfferFailedOnlyRetry = (failed: number, total: number) => {
     if (failed <= 1) return true;
@@ -695,41 +945,6 @@ export default function Send() {
     };
   };
 
-  const fetchRawTxWithRetry = useCallback(async (txid: string) => {
-    const cached = rawTxCacheRef.current.get(txid);
-    if (cached) {
-      return { txid, rawTx: cached, fromCache: true, attempts: 0 };
-    }
-
-    let attempt = 0;
-    while (attempt <= RAWTX_BATCH_RETRIES) {
-      attempt += 1;
-      try {
-        const rawTx = await fetchRawTx(txid);
-        rawTxCacheRef.current.set(txid, rawTx);
-        return { txid, rawTx, fromCache: false, attempts: attempt };
-      } catch (err: any) {
-        const willRetry = isTransientRawTxError(err) && attempt <= RAWTX_BATCH_RETRIES;
-        if (debugEnabled) {
-          console.warn("[rawtx-batch] fetch attempt failed", {
-            txid,
-            attempt,
-            willRetry,
-            status: err instanceof TxApiError ? err.status : undefined,
-            code: err instanceof TxApiError ? err.code : undefined,
-            requestId: err instanceof TxApiError ? err.requestId : undefined,
-            error: err instanceof TxApiError ? (err.detail || err.message) : (err?.message || String(err))
-          });
-        }
-        if (!willRetry) throw err;
-        const backoffMs = RAWTX_RETRY_BACKOFF_MS[Math.min(attempt - 1, RAWTX_RETRY_BACKOFF_MS.length - 1)];
-        await sleep(backoffMs);
-      }
-    }
-
-    throw new Error(`rawtx fetch retries exhausted: ${txid}`);
-  }, [debugEnabled]);
-
   const fetchRawTxBatch = useCallback(async (txids: string[]): Promise<RawTxBatchResult> => {
     const uniqueTxids = Array.from(new Set(txids.filter(Boolean)));
     const startedAt = Date.now();
@@ -740,40 +955,106 @@ export default function Send() {
     const ok: Array<{ txid: string; rawTx: string }> = [];
     const failed: RawTxBatchFailure[] = [];
     let fromCache = 0;
-    let nextIndex = 0;
-    const workerCount = Math.min(RAWTX_BATCH_CONCURRENCY, uniqueTxids.length);
 
     if (debugEnabled) {
       console.info("[rawtx-batch] start", {
         total: uniqueTxids.length,
-        concurrency: workerCount,
+        batchSize: RAWTX_BATCH_SIZE,
         retries: RAWTX_BATCH_RETRIES
       });
     }
 
-    const workers = Array.from({ length: workerCount }, async () => {
-      while (nextIndex < uniqueTxids.length) {
-        const current = nextIndex;
-        nextIndex += 1;
-        const txid = uniqueTxids[current];
+    const pendingChunks: string[][] = [];
+    for (let i = 0; i < uniqueTxids.length; i += RAWTX_BATCH_SIZE) {
+      pendingChunks.push(uniqueTxids.slice(i, i + RAWTX_BATCH_SIZE));
+    }
+
+    for (const chunk of pendingChunks) {
+      let remaining = chunk.filter((txid) => !rawTxCacheRef.current.has(txid));
+      chunk.forEach((txid) => {
+        const cached = rawTxCacheRef.current.get(txid);
+        if (cached) {
+          ok.push({ txid, rawTx: cached });
+          fromCache += 1;
+        }
+      });
+      if (!remaining.length) continue;
+
+      let attempt = 0;
+      while (remaining.length) {
+        attempt += 1;
         try {
-          const fetched = await fetchRawTxWithRetry(txid);
-          if (fetched.fromCache) fromCache += 1;
-          ok.push({ txid, rawTx: fetched.rawTx });
+          const response = await fetchRawTxBatchApi(remaining);
+          const nextFailed: RawTxBatchFailure[] = [];
+
+          for (const item of response.results || []) {
+            if (item?.ok === true && typeof item.rawTx === "string" && typeof item.txid === "string") {
+              rawTxCacheRef.current.set(item.txid, item.rawTx);
+              ok.push({ txid: item.txid, rawTx: item.rawTx });
+              if (item.source === "cache") fromCache += 1;
+              continue;
+            }
+            if (item?.ok === false && typeof item.txid === "string") {
+              nextFailed.push({
+                txid: item.txid,
+                error: item.error || "rawtx batch item failed",
+                requestId: item.requestId || response.requestId,
+                code: item.code,
+                status: undefined,
+              });
+            }
+          }
+
+          if (!nextFailed.length) break;
+
+          const canRetry = attempt <= RAWTX_BATCH_RETRIES && nextFailed.every(isTransientBatchItemFailure);
+          if (debugEnabled) {
+            console.warn("[rawtx-batch] request partial failure", {
+              attempt,
+              remaining: remaining.length,
+              failed: nextFailed.length,
+              retry: canRetry
+            });
+          }
+          if (!canRetry) {
+            failed.push(...nextFailed);
+            break;
+          }
+
+          remaining = nextFailed.map((item) => item.txid);
+          const backoffMs = RAWTX_RETRY_BACKOFF_MS[Math.min(attempt - 1, RAWTX_RETRY_BACKOFF_MS.length - 1)];
+          await sleep(backoffMs);
         } catch (err: any) {
+          const canRetry = attempt <= RAWTX_BATCH_RETRIES && isTransientBatchRequestError(err);
+          if (debugEnabled) {
+            console.warn("[rawtx-batch] request failed", {
+              attempt,
+              remaining: remaining.length,
+              retry: canRetry,
+              status: err instanceof TxApiError ? err.status : undefined,
+              code: err instanceof TxApiError ? err.code : undefined,
+              requestId: err instanceof TxApiError ? err.requestId : undefined,
+              error: err instanceof TxApiError ? (err.detail || err.message) : (err?.message || String(err))
+            });
+          }
+          if (canRetry) {
+            const backoffMs = RAWTX_RETRY_BACKOFF_MS[Math.min(attempt - 1, RAWTX_RETRY_BACKOFF_MS.length - 1)];
+            await sleep(backoffMs);
+            continue;
+          }
           const errorText = err instanceof TxApiError ? (err.detail || err.message) : (err?.message || String(err));
-          failed.push({
+          failed.push(...remaining.map((txid) => ({
             txid,
             error: errorText,
             requestId: err instanceof TxApiError ? err.requestId : undefined,
             code: err instanceof TxApiError ? err.code : undefined,
             status: err instanceof TxApiError ? err.status : undefined,
-          });
+          })));
+          break;
         }
       }
-    });
+    }
 
-    await Promise.all(workers);
     const durationMs = Date.now() - startedAt;
 
     if (debugEnabled) {
@@ -793,9 +1074,61 @@ export default function Send() {
       total: uniqueTxids.length,
       durationMs
     };
-  }, [debugEnabled, fetchRawTxWithRetry]);
+  }, [debugEnabled]);
 
-  const prepareConsolidationPreview = () => {
+  const setConsolidationPhase = (phase: ConsolidationPhase) => {
+    setConsolidationProgress((prev) => (prev ? { ...prev, phase } : prev));
+  };
+
+  const setConsolidationProgressFromPreview = (
+    preview: ConsolidationPreview,
+    mode: ConsolidationMode,
+    phase: ConsolidationPhase,
+  ) => {
+    setConsolidationProgress((prev) => ({
+      totalUtxos: preview.totalCandidates,
+      roundSize: MAX_CONSOLIDATE_INPUTS,
+      currentRound: preview.round,
+      totalRounds: preview.totalRounds,
+      remaining: preview.totalCandidates,
+      lastTxid: prev?.lastTxid,
+      requestId: prev?.requestId,
+      mode,
+      phase,
+    }));
+  };
+
+  const toOutpointKey = (txid: string, vout: number) => `${txid}:${vout}`;
+  const applyConsolidationFailureHint = (message: string) => {
+    consolidationFailureRef.current += 1;
+    if (consolidationFailureRef.current < 2) return message;
+    return `${message} ${t("send.consolidateSuggestLowerCap", { size: 60 })}`;
+  };
+  const resetConsolidationFailureCount = () => {
+    consolidationFailureRef.current = 0;
+  };
+  const persistRoundProgress = (params: {
+    mode: ConsolidationMode;
+    roundDone: number;
+    estimatedRounds: number;
+    lastTxid?: string;
+  }) => {
+    persistConsolidationProgress({
+      mode: params.mode,
+      cap: MAX_CONSOLIDATE_INPUTS,
+      roundDone: Math.max(0, params.roundDone),
+      estimatedRounds: Math.max(1, params.estimatedRounds),
+      lastTxid: params.lastTxid,
+      updatedAt: Date.now(),
+    });
+  };
+  const clearConsolidationSession = () => {
+    backgroundPauseRef.current = false;
+    setShowResumeConsolidation(false);
+    persistConsolidationProgress(null);
+  };
+
+  const prepareConsolidationPreview = (explicitRound?: number) => {
     const st = walletStore.getState();
     const utxosForCheck = st.utxos;
     if (!utxosForCheck || utxosForCheck.length === 0) {
@@ -810,7 +1143,7 @@ export default function Send() {
       return null;
     }
 
-    const invalidUtxos = utxosForCheck.filter(u => u.invalid);
+    const invalidUtxos = utxosForCheck.filter((u) => u.invalid);
     if (invalidUtxos.length > 0) {
       setErr(t("send.errors.utxoIncomplete", { count: invalidUtxos.length }));
       return null;
@@ -839,11 +1172,21 @@ export default function Send() {
       return null;
     }
 
+    const totalCandidates = utxosForCheck.length;
     const selected = selectConsolidationUtxos(utxosForCheck, MAX_CONSOLIDATE_INPUTS);
     if (!selected.length) {
       setErr(t("send.errors.insufficientUtxo"));
       return null;
     }
+
+    const totalRounds = estimateConsolidationRounds(totalCandidates, MAX_CONSOLIDATE_INPUTS);
+    const computedRound = Number.isFinite(explicitRound as number)
+      ? Number(explicitRound)
+      : consolidationProgress
+        ? consolidationProgress.currentRound + 1
+        : 1;
+    const nextRound = Math.max(1, Math.min(computedRound, totalRounds));
+    const remainingAfterRound = Math.max(totalCandidates - selected.length, 0);
 
     const totalInSats = selected.reduce((sum, u) => sum + Number(u.valueSats || 0), 0);
     const outputSats = totalInSats - feeSats;
@@ -856,7 +1199,6 @@ export default function Send() {
       return null;
     }
 
-    // Guardrail: avoid building a tx that's too large to relay reliably.
     const estimatedBytes = estimateP2PKHTxBytes(selected.length, 1);
     if (estimatedBytes > MAX_CONSOLIDATE_TX_BYTES) {
       setErr(t("send.errors.consolidateTooLarge"));
@@ -865,207 +1207,602 @@ export default function Send() {
 
     return {
       selected,
+      totalCandidates,
       totalInSats,
       outputSats,
       feeSats,
-      estimatedBytes
+      estimatedBytes,
+      round: nextRound,
+      totalRounds,
+      remainingAfterRound,
     };
   };
 
+  const requestCancelConsolidation = () => {
+    if (!consolidating && !consolidateInFlightRef.current) return;
+    setConsolidationCancel(true);
+    setSendStatusNote(t("send.consolidateCancelPending"));
+    clearConsolidationSession();
+    void releaseConsolidationWakeLock();
+  };
+
+  const waitForConsolidationProgress = async (
+    spentOutpoints: Set<string>,
+    totalBeforeRound: number,
+    selectedCount: number,
+  ) => {
+    const startedAt = Date.now();
+    const requiredDecrease = Math.max(1, selectedCount - 1);
+    const requiredSpentGone = Math.max(1, selectedCount - 1);
+    let pollAttempt = 0;
+
+    while (Date.now() - startedAt < CONSOLIDATION_POLL_MAX_WAIT_MS) {
+      if (cancelRequestedRef.current) return { status: "cancelled" as const };
+      if (backgroundPauseRef.current) return { status: "paused" as const };
+      const waitMs = CONSOLIDATION_POLL_BACKOFF_MS[Math.min(pollAttempt, CONSOLIDATION_POLL_BACKOFF_MS.length - 1)];
+      await sleep(waitMs);
+      if (cancelRequestedRef.current) return { status: "cancelled" as const };
+      if (backgroundPauseRef.current) return { status: "paused" as const };
+
+      await walletStore.fetch();
+      const latest = walletStore.getState().utxos;
+      const remaining = Array.isArray(latest) ? latest.length : 0;
+
+      let spentGone = 0;
+      if (Array.isArray(latest)) {
+        const existingOutpoints = new Set(
+          latest
+            .filter((u) => !!u.txid && Number.isFinite(Number(u.vout)))
+            .map((u) => toOutpointKey(String(u.txid), Number(u.vout)))
+        );
+        for (const outpoint of spentOutpoints) {
+          if (!existingOutpoints.has(outpoint)) spentGone += 1;
+        }
+      }
+
+      const reducedEnough = remaining <= totalBeforeRound - requiredDecrease;
+      const spentGoneEnough = spentGone >= requiredSpentGone;
+      if (reducedEnough || spentGoneEnough) {
+        return { status: "progress" as const, remaining };
+      }
+      pollAttempt += 1;
+    }
+    return { status: "timeout" as const };
+  };
+
+  const executeConsolidationRound = async (
+    preview: ConsolidationPreview,
+    mode: ConsolidationMode,
+  ): Promise<{ txid?: string; requestId?: string; spentOutpoints: Set<string> }> => {
+    const trimmedMnemonic = mnemo.trim();
+    if (!trimmedMnemonic) {
+      throw new Error(t("send.errors.mnemonicMissing"));
+    }
+
+    const sendFrom = normalizeAddressInput(address);
+    if (!sendFrom) {
+      throw new Error(t("send.errors.senderAddressMissing"));
+    }
+    if (!changeValidation.ok) {
+      throw new Error(changeValidation.reason === "missing"
+        ? t("send.errors.senderAddressMissing")
+        : t("send.errors.senderAddressInvalid"));
+    }
+
+    const spentOutpoints = new Set(
+      preview.selected
+        .filter((u) => !!u.txid && Number.isFinite(Number(u.vout)))
+        .map((u) => toOutpointKey(String(u.txid), Number(u.vout)))
+    );
+
+    setConsolidationProgressFromPreview(preview, mode, "building");
+    const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
+    const requiredTxids = preview.selected
+      .map((u) => u.txid)
+      .filter((txid): txid is string => typeof txid === "string" && txid.length > 0);
+    const rawTxBatch = await fetchRawTxBatch(requiredTxids);
+    if (rawTxBatch.failed.length > 0) {
+      const summary = summarizeRawTxBatchError(rawTxBatch);
+      const canRetryFailedOnly = shouldOfferFailedOnlyRetry(rawTxBatch.failed.length, rawTxBatch.total);
+      if (canRetryFailedOnly) {
+        setRawTxRetryContext({
+          mode: "consolidate",
+          failedTxids: rawTxBatch.failed.map((item) => item.txid),
+          succeeded: rawTxBatch.ok.length,
+          failed: rawTxBatch.failed.length,
+          total: rawTxBatch.total,
+          requestIds: summary.requestIds,
+        });
+      } else {
+        setRawTxRetryContext(null);
+      }
+      throw new Error(summary.message);
+    }
+
+    if (cancelRequestedRef.current) throw new Error(CONSOLIDATION_CANCELLED_TOKEN);
+    setConsolidationPhase("signing");
+    const rawTxByTxid = new Map(rawTxBatch.ok.map((item) => [item.txid, item.rawTx]));
+    const inputs: ConsolidationInput[] = [];
+    for (const u of preview.selected) {
+      if (!u.txid || u.vout === undefined || !Number.isFinite(u.valueSats)) {
+        throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
+      }
+      const hex = rawTxByTxid.get(u.txid);
+      if (!hex || typeof hex !== "string" || hex.length === 0) {
+        throw new Error(t("send.errors.txRawFailed", { txid: u.txid }));
+      }
+      inputs.push({
+        txid: u.txid,
+        vout: u.vout,
+        value: Number(u.valueSats),
+        nonWitnessUtxo: hex
+      });
+    }
+
+    const { rawTx, totalInSats, outputSats } = buildConsolidationTx({
+      network: PEPEPOW,
+      inputs,
+      wif,
+      address: sendFrom,
+      feeSats: preview.feeSats
+    });
+    if (!rawTx) throw new Error(t("send.errors.txBuildMissingOutput"));
+    if (typeof rawTx !== "string" || rawTx.length < 20) {
+      throw new Error(t("send.errors.txBuildInvalidHex"));
+    }
+
+    const rawTxLen = rawTx.length;
+    const rawTxHash = rawTx ? await sha256HexFromHexString(rawTx) : null;
+    const rawTxHash16 = rawTxHash ? rawTxHash.slice(0, 16) : "n/a";
+    const localTxid = await computeTxidFromRawTx(rawTx);
+    console.info("[consolidate] raw tx result", {
+      rawTxLen,
+      rawTxHash16,
+      localTxid,
+      inputCount: preview.selected.length,
+      totalInSats,
+      outputSats
+    });
+
+    setConsolidationPhase("broadcasting");
+    const cached = loadLastBroadcastCache();
+    const cachedMatch = !!cached
+      && ((rawTxHash && cached.hash === rawTxHash)
+        || (localTxid && cached.txid === localTxid));
+    const pendingMatch = localTxid ? hasPendingSpendTxid(localTxid) : false;
+    if (pendingMatch || cachedMatch) {
+      const txidToShow = localTxid || cached?.txid || null;
+      if (txidToShow) {
+        setResult(txidToShow);
+        setLastTxid(txidToShow);
+      }
+      setConsolidationProgress((prev) => ({
+        totalUtxos: preview.totalCandidates,
+        roundSize: MAX_CONSOLIDATE_INPUTS,
+        currentRound: preview.round,
+        totalRounds: preview.totalRounds,
+        remaining: preview.remainingAfterRound,
+        mode,
+        phase: "broadcasting",
+        lastTxid: txidToShow || prev?.lastTxid,
+        requestId: prev?.requestId,
+      }));
+      return { txid: txidToShow || undefined, spentOutpoints };
+    }
+
+    const j = await broadcastTx(rawTx);
+    const txid = j.result || j.txid;
+    const txidString = typeof txid === "string" ? txid : (localTxid || null);
+    const requestId = typeof j?.requestId === "string" ? j.requestId : undefined;
+    setResult(txidString || JSON.stringify(j));
+    setLastTxid(txidString);
+    if (txidString) {
+      saveLastBroadcastCache({
+        hash: rawTxHash || "",
+        ts: Date.now(),
+        txid: txidString
+      });
+    }
+    setConsolidationProgress({
+      totalUtxos: preview.totalCandidates,
+      roundSize: MAX_CONSOLIDATE_INPUTS,
+      currentRound: preview.round,
+      totalRounds: preview.totalRounds,
+      remaining: preview.remainingAfterRound,
+      mode,
+      phase: "broadcasting",
+      lastTxid: txidString || undefined,
+      requestId,
+    });
+
+    const spendSats = preview.feeSats;
+    const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
+    if (!alreadyPending && Number.isFinite(spendSats) && spendSats > 0) {
+      walletStore.applyOptimistic(spendSats);
+      recordPendingSpend({
+        address: sendFrom,
+        sats: spendSats,
+        txid: txidString || undefined,
+        balanceBeforeSats: Number.isFinite(availableSats) ? availableSats : undefined
+      });
+    }
+    if (!alreadyPending) {
+      triggerRefresh({ reason: "consolidate", txid: txidString || undefined });
+      walletStore.scheduleRefresh();
+    }
+    return { txid: txidString || undefined, requestId, spentOutpoints };
+  };
+
   const openConsolidateConfirm = () => {
+    if (consolidating || sending || consolidateInFlightRef.current) return;
+    if (hitConsolidationDebounce()) return;
     setErr(null);
     setRawTxRetryContext(null);
-    const preview = prepareConsolidationPreview();
+    setSendStatusNote(null);
+    setConsolidationProgress(null);
+    setConsolidationMode("auto");
+    setShowResumeConsolidation(false);
+    setConsolidationCancel(false);
+    const preview = prepareConsolidationPreview(1);
     if (!preview) return;
+    if (preview.totalCandidates > MAX_CONSOLIDATE_INPUTS) {
+      setErr(t("send.consolidateMultiRoundPlan", {
+        roundSize: MAX_CONSOLIDATE_INPUTS,
+        remaining: preview.totalCandidates,
+        rounds: preview.totalRounds
+      }));
+    }
     setConsolidatePreview(preview);
     setConsolidateOpen(true);
   };
 
   const closeConsolidateConfirm = () => {
+    if (consolidationBusy) return;
     setConsolidateOpen(false);
     setConsolidatePreview(null);
   };
 
-  async function doConsolidate() {
-    if (consolidateInFlightRef.current) return;
-    const preview = consolidatePreview ?? prepareConsolidationPreview();
+  const startManualConsolidationRound = async (
+    initialPreview?: ConsolidationPreview,
+    opts: { skipDebounce?: boolean } = {}
+  ) => {
+    if (consolidateInFlightRef.current || consolidating || sending) return;
+    if (!opts.skipDebounce && hitConsolidationDebounce()) return;
+    const preview = initialPreview ?? consolidatePreview ?? prepareConsolidationPreview();
     if (!preview) return;
+    backgroundPauseRef.current = false;
+    setShowResumeConsolidation(false);
     consolidateInFlightRef.current = true;
     setConsolidating(true);
+    setConsolidateOpen(false);
     setErr(null);
     setRawTxRetryContext(null);
     setResult(null);
     setLastTxid(null);
     setSendStatusNote(null);
-    setConsolidateOpen(false);
+    setConsolidationCancel(false);
+    persistRoundProgress({
+      mode: "manual",
+      roundDone: Math.max(preview.round - 1, 0),
+      estimatedRounds: preview.totalRounds,
+      lastTxid: consolidationProgress?.lastTxid
+    });
+    await requestConsolidationWakeLock();
 
     try {
-      const trimmedMnemonic = mnemo.trim();
-      if (!trimmedMnemonic) {
-        setErr(t("send.errors.mnemonicMissing"));
-        return;
-      }
-
-      const sendFrom = normalizeAddressInput(address);
-      if (!sendFrom) {
-        setErr(t("send.errors.senderAddressMissing"));
-        return;
-      }
-      if (!changeValidation.ok) {
-        setErr(changeValidation.reason === "missing"
-          ? t("send.errors.senderAddressMissing")
-          : t("send.errors.senderAddressInvalid"));
-        return;
-      }
-
-      const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
-      // nonWitnessUtxo is required for each input; each txid fetch is independent, so bounded parallel fetch is safe.
-      const requiredTxids = preview.selected.map((u) => u.txid).filter((txid): txid is string => typeof txid === "string" && txid.length > 0);
-      const rawTxBatch = await fetchRawTxBatch(requiredTxids);
-      if (rawTxBatch.failed.length > 0) {
-        const summary = summarizeRawTxBatchError(rawTxBatch);
-        const canRetryFailedOnly = shouldOfferFailedOnlyRetry(rawTxBatch.failed.length, rawTxBatch.total);
-        if (canRetryFailedOnly) {
-          setRawTxRetryContext({
-            mode: "consolidate",
-            failedTxids: rawTxBatch.failed.map((item) => item.txid),
-            succeeded: rawTxBatch.ok.length,
-            failed: rawTxBatch.failed.length,
-            total: rawTxBatch.total,
-            requestIds: summary.requestIds,
-          });
-        } else {
-          setRawTxRetryContext(null);
-        }
-        setErr(summary.message);
-        return;
-      }
-
-      const rawTxByTxid = new Map(rawTxBatch.ok.map((item) => [item.txid, item.rawTx]));
-      const inputs: ConsolidationInput[] = [];
-      for (const u of preview.selected) {
-        if (!u.txid || u.vout === undefined || !Number.isFinite(u.valueSats)) {
-          console.error("[CONSOLIDATE_ASSERT] Invalid UTXO structure", u);
-          throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
-        }
-        const hex = rawTxByTxid.get(u.txid);
-        if (!hex || typeof hex !== "string" || hex.length === 0) {
-          setErr(t("send.errors.txRawFailed", { txid: u.txid }));
-          return;
-        }
-        inputs.push({
-          txid: u.txid,
-          vout: u.vout,
-          value: Number(u.valueSats),
-          nonWitnessUtxo: hex
-        });
-      }
-
-      const { rawTx, totalInSats, outputSats } = buildConsolidationTx({
-        network: PEPEPOW,
-        inputs,
-        wif,
-        address: sendFrom,
-        feeSats: preview.feeSats
+      const roundResult = await executeConsolidationRound(preview, "manual");
+      persistRoundProgress({
+        mode: "manual",
+        roundDone: preview.round,
+        estimatedRounds: preview.totalRounds,
+        lastTxid: roundResult.txid
       });
-
-      if (!rawTx) {
-        console.error("[CONSOLIDATE_ASSERT] buildConsolidationTx returned empty/undefined");
-        setErr(t("send.errors.txBuildMissingOutput"));
+      resetConsolidationFailureCount();
+      setSendStatusNote(t("send.consolidateRoundBroadcast", {
+        round: preview.round,
+        total: preview.totalRounds,
+        remaining: preview.remainingAfterRound
+      }));
+      setConsolidationPhase("waiting");
+      await sleep(CONSOLIDATION_PROPAGATION_DELAY_MS);
+      if (cancelRequestedRef.current) {
+        setConsolidationPhase("cancelled");
+        setSendStatusNote(t("send.consolidateCancelled"));
         return;
       }
-      if (typeof rawTx !== "string" || rawTx.length < 20) {
-        console.error("[CONSOLIDATE_ASSERT] invalid raw tx hex", { rawTx });
-        setErr(t("send.errors.txBuildInvalidHex"));
+      setConsolidationPhase("refreshing");
+      setSendStatusNote(t("send.consolidateRefreshing"));
+      const refresh = await waitForConsolidationProgress(roundResult.spentOutpoints, preview.totalCandidates, preview.selected.length);
+      if (refresh.status === "cancelled") {
+        setConsolidationPhase("cancelled");
+        setSendStatusNote(t("send.consolidateCancelled"));
+        clearConsolidationSession();
         return;
       }
-
-      const rawTxLen = rawTx.length;
-      const rawTxHash = rawTx ? await sha256HexFromHexString(rawTx) : null;
-      const rawTxHash16 = rawTxHash ? rawTxHash.slice(0, 16) : "n/a";
-      const localTxid = await computeTxidFromRawTx(rawTx);
-      console.info("[consolidate] raw tx result", {
-        rawTxLen,
-        rawTxHash16,
-        localTxid,
-        inputCount: preview.selected.length,
-        totalInSats,
-        outputSats
-      });
-
-      const cached = loadLastBroadcastCache();
-      const cachedMatch = !!cached
-        && ((rawTxHash && cached.hash === rawTxHash)
-          || (localTxid && cached.txid === localTxid));
-      const pendingMatch = localTxid ? hasPendingSpendTxid(localTxid) : false;
-
-      if (pendingMatch || cachedMatch) {
-        const txidToShow = localTxid || cached?.txid || null;
-        if (txidToShow) {
-          setResult(txidToShow);
-          setLastTxid(txidToShow);
-        }
-        setSendStatusNote(t("send.alreadyBroadcast"));
+      if (refresh.status === "paused") {
+        setConsolidationPhase("paused");
+        setSendStatusNote(t("send.consolidatePausedBackground"));
+        setShowResumeConsolidation(true);
         return;
       }
-
-      try {
-        const j = await broadcastTx(rawTx);
-        const txid = j.result || j.txid;
-        const txidString = typeof txid === "string" ? txid : (localTxid || null);
-        setResult(txidString || JSON.stringify(j));
-        setLastTxid(txidString);
-        setSendStatusNote(null);
-        if (txidString) {
-          saveLastBroadcastCache({
-            hash: rawTxHash || "",
-            ts: Date.now(),
-            txid: txidString
-          });
-        }
-        const spendSats = preview.feeSats;
-        const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
-
-        if (alreadyPending) {
-          setSendStatusNote(t("send.alreadyBroadcast"));
-        }
-
-        if (!alreadyPending && Number.isFinite(spendSats) && spendSats > 0) {
-          walletStore.applyOptimistic(spendSats);
-          recordPendingSpend({
-            address: sendFrom,
-            sats: spendSats,
-            txid: txidString || undefined,
-            balanceBeforeSats: Number.isFinite(availableSats) ? availableSats : undefined
-          });
-        }
-        if (!alreadyPending) {
-          triggerRefresh({ reason: "consolidate", txid: txidString || undefined });
-          walletStore.scheduleRefresh();
-        }
-      } catch (e: any) {
-        if (e instanceof TxApiError) {
-          const mapped = mapBroadcastError(e.detail);
-          if (mapped) {
-            setErr(mapped);
-          } else if (e.detail) {
-            setErr(e.detail);
-          } else {
-            setErr(t("send.errors.broadcastFailed"));
-          }
-        } else {
-          setErr(t("send.errors.broadcastFailed"));
-        }
+      if (refresh.status === "timeout") {
+        setConsolidationPhase("paused");
+        setErr(t("send.consolidatePausedSlow"));
+        setSendStatusNote(t("send.consolidatePausedSlow"));
+        setShowResumeConsolidation(true);
         return;
+      }
+      const isDone = refresh.remaining <= MAX_CONSOLIDATE_INPUTS;
+      setConsolidationProgress((prev) => (prev
+        ? { ...prev, remaining: refresh.remaining, phase: isDone ? "done" : "idle" }
+        : prev));
+      if (isDone) {
+        setSendStatusNote(t("send.consolidateCompleted", { remaining: refresh.remaining }));
+        clearConsolidationSession();
+      } else {
+        setSendStatusNote(t("send.consolidateContinueHint", { remaining: refresh.remaining }));
       }
     } catch (e: any) {
-      setErr(String(e.message || e));
+      const messageText = String(e?.message || e || "");
+      if (messageText === CONSOLIDATION_CANCELLED_TOKEN || cancelRequestedRef.current) {
+        setConsolidationPhase("cancelled");
+        setSendStatusNote(t("send.consolidateCancelled"));
+        clearConsolidationSession();
+        return;
+      }
+      const message = e instanceof TxApiError
+        ? mapBroadcastError(e.detail) || e.detail || t("send.errors.broadcastFailed")
+        : String(e?.message || e || t("send.errors.broadcastFailed"));
+      setErr(applyConsolidationFailureHint(message));
+      setConsolidationPhase("error");
     } finally {
       consolidateInFlightRef.current = false;
       setConsolidating(false);
       setConsolidatePreview(null);
+      void releaseConsolidationWakeLock();
     }
-  }
+  };
+
+  const startAutoConsolidation = async (
+    initialPreview?: ConsolidationPreview,
+    opts: { skipDebounce?: boolean } = {}
+  ) => {
+    if (consolidateInFlightRef.current || consolidating || sending) return;
+    if (!opts.skipDebounce && hitConsolidationDebounce()) return;
+    let preview = initialPreview ?? consolidatePreview ?? prepareConsolidationPreview(1);
+    if (!preview) return;
+    backgroundPauseRef.current = false;
+    setShowResumeConsolidation(false);
+    consolidateInFlightRef.current = true;
+    setConsolidating(true);
+    setConsolidateOpen(false);
+    setErr(null);
+    setRawTxRetryContext(null);
+    setResult(null);
+    setLastTxid(null);
+    setSendStatusNote(null);
+    setConsolidationCancel(false);
+    persistRoundProgress({
+      mode: "auto",
+      roundDone: Math.max(preview.round - 1, 0),
+      estimatedRounds: preview.totalRounds,
+      lastTxid: consolidationProgress?.lastTxid
+    });
+    await requestConsolidationWakeLock();
+
+    try {
+      while (preview) {
+        if (backgroundPauseRef.current) {
+          setConsolidationPhase("paused");
+          setSendStatusNote(t("send.consolidatePausedBackground"));
+          setShowResumeConsolidation(true);
+          break;
+        }
+        if (cancelRequestedRef.current) {
+          setConsolidationPhase("cancelled");
+          setSendStatusNote(t("send.consolidateCancelled"));
+          clearConsolidationSession();
+          break;
+        }
+
+        setConsolidationProgressFromPreview(preview, "auto", "building");
+        const roundResult = await executeConsolidationRound(preview, "auto");
+        persistRoundProgress({
+          mode: "auto",
+          roundDone: preview.round,
+          estimatedRounds: preview.totalRounds,
+          lastTxid: roundResult.txid
+        });
+        resetConsolidationFailureCount();
+        setSendStatusNote(t("send.consolidateRoundBroadcast", {
+          round: preview.round,
+          total: preview.totalRounds,
+          remaining: preview.remainingAfterRound
+        }));
+
+        if (cancelRequestedRef.current) {
+          setConsolidationPhase("cancelled");
+          setSendStatusNote(t("send.consolidateCancelled"));
+          clearConsolidationSession();
+          break;
+        }
+        if (backgroundPauseRef.current) {
+          setConsolidationPhase("paused");
+          setSendStatusNote(t("send.consolidatePausedBackground"));
+          setShowResumeConsolidation(true);
+          break;
+        }
+
+        setConsolidationPhase("waiting");
+        setSendStatusNote(t("send.consolidateWaitingPropagation"));
+        await sleep(CONSOLIDATION_PROPAGATION_DELAY_MS);
+        if (cancelRequestedRef.current) {
+          setConsolidationPhase("cancelled");
+          setSendStatusNote(t("send.consolidateCancelled"));
+          clearConsolidationSession();
+          break;
+        }
+        if (backgroundPauseRef.current) {
+          setConsolidationPhase("paused");
+          setSendStatusNote(t("send.consolidatePausedBackground"));
+          setShowResumeConsolidation(true);
+          break;
+        }
+
+        setConsolidationPhase("refreshing");
+        setSendStatusNote(t("send.consolidateRefreshing"));
+        const refresh = await waitForConsolidationProgress(roundResult.spentOutpoints, preview.totalCandidates, preview.selected.length);
+        if (refresh.status === "cancelled") {
+          setConsolidationPhase("cancelled");
+          setSendStatusNote(t("send.consolidateCancelled"));
+          clearConsolidationSession();
+          break;
+        }
+        if (refresh.status === "paused") {
+          setConsolidationPhase("paused");
+          setSendStatusNote(t("send.consolidatePausedBackground"));
+          setShowResumeConsolidation(true);
+          break;
+        }
+        if (refresh.status === "timeout") {
+          setConsolidationPhase("paused");
+          setErr(t("send.consolidatePausedSlow"));
+          setSendStatusNote(t("send.consolidatePausedSlow"));
+          setShowResumeConsolidation(true);
+          break;
+        }
+
+        setConsolidationProgress((prev) => (prev ? { ...prev, remaining: refresh.remaining } : prev));
+        if (refresh.remaining <= MAX_CONSOLIDATE_INPUTS) {
+          setConsolidationPhase("done");
+          setSendStatusNote(t("send.consolidateCompleted", { remaining: refresh.remaining }));
+          clearConsolidationSession();
+          break;
+        }
+
+        const nextRound = preview.round + 1;
+        preview = prepareConsolidationPreview(nextRound);
+        if (!preview) {
+          setConsolidationPhase("paused");
+          setSendStatusNote(t("send.consolidatePausedManual"));
+          setShowResumeConsolidation(true);
+          break;
+        }
+        setSendStatusNote(t("send.consolidateAutoProceed", {
+          round: preview.round,
+          total: preview.totalRounds,
+          remaining: preview.totalCandidates
+        }));
+      }
+    } catch (e: any) {
+      const messageText = String(e?.message || e || "");
+      if (messageText === CONSOLIDATION_CANCELLED_TOKEN || cancelRequestedRef.current) {
+        setConsolidationPhase("cancelled");
+        setSendStatusNote(t("send.consolidateCancelled"));
+        clearConsolidationSession();
+        return;
+      }
+      const message = e instanceof TxApiError
+        ? mapBroadcastError(e.detail) || e.detail || t("send.errors.broadcastFailed")
+        : String(e?.message || e || t("send.errors.broadcastFailed"));
+      setErr(applyConsolidationFailureHint(message));
+      setConsolidationPhase(cancelRequestedRef.current ? "cancelled" : "error");
+      if (cancelRequestedRef.current) {
+        setSendStatusNote(t("send.consolidateCancelled"));
+      } else {
+        setSendStatusNote(t("send.consolidatePausedManual"));
+      }
+    } finally {
+      consolidateInFlightRef.current = false;
+      setConsolidating(false);
+      setConsolidatePreview(null);
+      void releaseConsolidationWakeLock();
+    }
+  };
+
+  const doConsolidate = async () => {
+    if (consolidationMode === "auto") {
+      await startAutoConsolidation();
+      return;
+    }
+    await startManualConsolidationRound();
+  };
+
+  const resumeSavedConsolidation = async () => {
+    if (consolidating || sending || consolidateInFlightRef.current) return;
+    if (hitConsolidationDebounce()) return;
+    const saved = savedProgress ?? loadConsolidationProgress();
+    if (!saved) return;
+    setErr(null);
+    setRawTxRetryContext(null);
+    setConsolidationCancel(false);
+    setConsolidationMode(saved.mode);
+    setShowResumeConsolidation(false);
+    backgroundPauseRef.current = false;
+    setConsolidationProgress((prev) => ({
+      totalUtxos: walletStore.getState().utxos.length || prev?.totalUtxos || 0,
+      roundSize: MAX_CONSOLIDATE_INPUTS,
+      currentRound: saved.roundDone,
+      totalRounds: Math.max(saved.estimatedRounds, prev?.totalRounds || 1),
+      remaining: walletStore.getState().utxos.length || prev?.remaining || 0,
+      lastTxid: saved.lastTxid || prev?.lastTxid,
+      requestId: prev?.requestId,
+      mode: saved.mode,
+      phase: "paused",
+    }));
+    try {
+      await refreshBalanceOnce();
+      await sleep(CONSOLIDATION_REFRESH_DELAY_MS);
+      await refreshBalanceOnce();
+      const preview = prepareConsolidationPreview(Math.max(saved.roundDone + 1, 1));
+      if (!preview) {
+        setConsolidationPhase("paused");
+        setShowResumeConsolidation(true);
+        return;
+      }
+      if (saved.mode === "auto") {
+        await startAutoConsolidation(preview, { skipDebounce: true });
+        return;
+      }
+      await startManualConsolidationRound(preview, { skipDebounce: true });
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+      setConsolidationPhase("error");
+    }
+  };
+
+  const continueConsolidation = async () => {
+    if (consolidating || sending || consolidateInFlightRef.current) return;
+    if (hitConsolidationDebounce()) return;
+    if (!consolidationProgress || consolidationProgress.remaining <= MAX_CONSOLIDATE_INPUTS) return;
+    setErr(null);
+    setRawTxRetryContext(null);
+    setConsolidationCancel(false);
+    setShowResumeConsolidation(false);
+    backgroundPauseRef.current = false;
+    setConsolidationPhase("refreshing");
+    setSendStatusNote(t("send.consolidateRefreshing"));
+    try {
+      await walletStore.fetch();
+      await sleep(CONSOLIDATION_REFRESH_DELAY_MS);
+      await walletStore.fetch();
+      const preview = prepareConsolidationPreview((consolidationProgress?.currentRound || 0) + 1);
+      if (!preview) {
+        setConsolidationPhase("paused");
+        return;
+      }
+      setConsolidatePreview(preview);
+      setConsolidateOpen(true);
+      setConsolidationPhase("idle");
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+      setConsolidationPhase("error");
+    }
+  };
+  const handleManualRefresh = () => {
+    clearPostSendRefreshTimers();
+    void refreshBalanceOnce();
+  };
 
   async function doSend() {
     if (sendLocked) {
@@ -1079,9 +1816,11 @@ export default function Send() {
       setSending(true);
       setErr(null);
       setRawTxRetryContext(null);
+      setConsolidationProgress(null);
       setResult(null);
       setLastTxid(null);
       setSendStatusNote(null);
+      clearPostSendRefreshTimers();
 
       // 3️⃣ 加一道防呆：確保沒有 UTXO 時不會進到組交易邏輯
       const st = walletStore.getState();
@@ -1175,6 +1914,10 @@ export default function Send() {
       const { picked, total } = selectUtxos(chosen as any, target);
       if (!picked?.length) {
         setErr(t("send.errors.insufficientUtxo"));
+        return;
+      }
+      if (picked.length > MAX_SEND_INPUTS) {
+        setErr(t("send.errors.sendTooManyInputs", { count: picked.length, max: MAX_SEND_INPUTS }));
         return;
       }
       const totalIn = Number(total);
@@ -1321,6 +2064,8 @@ export default function Send() {
         }
         setSendStatusNote(t("send.alreadyBroadcast"));
         setSendLocked(true);
+        const baseline = walletStore.getState();
+        schedulePostSendRefresh(baseline.utxoSumSats, baseline.utxos.length);
         lastSuccessSnapshotRef.current = {
           to,
           amount,
@@ -1386,8 +2131,9 @@ export default function Send() {
           .filter((key) => key && !key.endsWith(":undefined"));
         // walletStore.markSpentOutpoints(spentOutpoints); // DISABLED to avoid double-deduction
         if (!alreadyPending) {
+          const baseline = walletStore.getState();
           triggerRefresh({ reason: "send", txid: txidString || undefined });
-          walletStore.scheduleRefresh();
+          schedulePostSendRefresh(baseline.utxoSumSats, baseline.utxos.length);
         }
       } catch (e: any) {
         if (e instanceof TxApiError) {
@@ -1419,8 +2165,15 @@ export default function Send() {
       void doSend();
       return;
     }
-    void doConsolidate();
+    void startManualConsolidationRound();
   };
+  const consolidationPhaseLabel = consolidationProgress
+    ? t(`send.consolidatePhase.${consolidationProgress.phase}`)
+    : t("send.consolidatePhase.idle");
+  const canContinueConsolidation = !!consolidationProgress
+    && consolidationProgress.remaining > MAX_CONSOLIDATE_INPUTS
+    && !consolidationBusy
+    && !sending;
 
   return (
     <AppLayout>
@@ -1559,25 +2312,75 @@ export default function Send() {
               <div className="summary-value">{totalLabel}</div>
             </div>
           </div>
+          <div className="row" style={{ marginTop: 8, justifyContent: "space-between" }}>
+            <div className="muted">{t("send.lastUpdated")}: {lastUpdatedLabel}</div>
+            <button
+              className="btn ghost small"
+              onClick={handleManualRefresh}
+              disabled={walletState.status === "loading"}
+            >
+              {t("send.refresh")}
+            </button>
+          </div>
           {invalidRecipient && <div className="error" style={{ marginTop: 8 }}>{t("send.errors.amountUnderFee")}</div>}
           {overBalance && <div className="error" style={{ marginTop: 8 }}>{t("send.errors.insufficientBalance")}</div>}
         </div>
+
+        {showResumeConsolidation && savedProgress && !consolidationBusy && (
+          <div className="card">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <div>
+                <div className="section-title">{t("send.savedConsolidationResume")}</div>
+                <div className="muted" style={{ marginTop: 6 }}>
+                  {t("send.consolidateRoundProgress", {
+                    round: Math.max(savedProgress.roundDone, 0),
+                    total: savedProgress.estimatedRounds,
+                    remaining: walletState.utxos.length
+                  })}
+                </div>
+              </div>
+              <button
+                className="btn secondary"
+                onClick={resumeSavedConsolidation}
+                disabled={sending || consolidationBusy}
+              >
+                {t("send.resumeConsolidation")}
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="card">
           <div className="row" style={{ justifyContent: "space-between" }}>
             <div>
               <div className="section-title">{t("send.utilitiesTitle")}</div>
               <div className="muted" style={{ marginTop: 6 }}>{t("send.consolidateHint")}</div>
+              <div className="muted" style={{ marginTop: 6 }}>{t("send.consolidateWarningMultiRound")}</div>
+              <div className="muted" style={{ marginTop: 4 }}>{t("send.consolidateWarningNoRepeat")}</div>
+              {wakeLockUnsupportedHint && (
+                <div className="muted" style={{ marginTop: 6 }}>
+                  {t("send.keepScreenAwake")}: {t("send.screenLockUnsupported")}
+                </div>
+              )}
             </div>
             <button
               className="btn secondary"
               onClick={openConsolidateConfirm}
               title={t("send.consolidateHint")}
-              disabled={sending || consolidating || walletState.status === "error" || !changeValidation.ok || walletState.utxos.length === 0}
+              disabled={sending || consolidationBusy || walletState.status === "error" || !changeValidation.ok || walletState.utxos.length === 0}
             >
               {t("send.consolidate")}
             </button>
           </div>
+          {walletState.utxos.length > MAX_CONSOLIDATE_INPUTS && (
+            <div className="muted" style={{ marginTop: 8 }}>
+              {t("send.consolidateMultiRoundPlan", {
+                roundSize: MAX_CONSOLIDATE_INPUTS,
+                remaining: walletState.utxos.length,
+                rounds: estimateConsolidationRounds(walletState.utxos.length, MAX_CONSOLIDATE_INPUTS)
+              })}
+            </div>
+          )}
         </div>
 
         {(walletState.status === "error") && (
@@ -1590,7 +2393,7 @@ export default function Send() {
           <button
             className="btn primary full"
             onClick={doSend}
-            disabled={sending || consolidating || sendLocked || addressInvalid || overBalance || !!err || walletState.status === "error" || walletState.utxos.length === 0}
+            disabled={sending || consolidationBusy || sendLocked || addressInvalid || overBalance || !!err || walletState.status === "error" || walletState.utxos.length === 0}
           >
             {sending ? t("send.sending") : t("send.submit")}
           </button>
@@ -1602,7 +2405,7 @@ export default function Send() {
             <button
               className="btn secondary"
               onClick={retryFailedRawTxOnly}
-              disabled={sending || consolidating}
+              disabled={sending || consolidationBusy}
             >
               {t("send.retryFailedRawTx")}
             </button>
@@ -1619,6 +2422,21 @@ export default function Send() {
           <div className="card" style={{ marginTop: 12 }}>
             <div>✅ {t("send.broadcasted")}: <code>{result}</code></div>
             {sendStatusNote && <div className="muted" style={{ marginTop: 6 }}>{sendStatusNote}</div>}
+            {consolidationProgress && (
+              <div className="muted" style={{ marginTop: 6 }}>
+                {t("send.consolidateRoundProgress", {
+                  round: consolidationProgress.currentRound,
+                  total: consolidationProgress.totalRounds,
+                  remaining: consolidationProgress.remaining
+                })}
+                {consolidationProgress.requestId ? ` | request-id: ${consolidationProgress.requestId}` : ""}
+              </div>
+            )}
+            {consolidationProgress && (
+              <div className="muted" style={{ marginTop: 6 }}>
+                {t("send.consolidateRoundSize", { size: consolidationProgress.roundSize })} | {t("send.consolidateStateLabel")}: {consolidationPhaseLabel}
+              </div>
+            )}
             <div className="row" style={{ marginTop: 8 }}>
               {lastTxid && (
                 <>
@@ -1635,6 +2453,33 @@ export default function Send() {
                     🔍
                   </a>
                 </>
+              )}
+              {canContinueConsolidation && (
+                <button
+                  className="btn"
+                  onClick={continueConsolidation}
+                  disabled={sending || consolidationBusy}
+                >
+                  {t("send.consolidateContinue")}
+                </button>
+              )}
+              {consolidationProgress && (
+                <button
+                  className="btn secondary"
+                  onClick={() => walletStore.scheduleRefresh([0, 2000])}
+                  disabled={sending || consolidationBusy}
+                >
+                  {t("send.refreshUtxos")}
+                </button>
+              )}
+              {consolidationBusy && (
+                <button
+                  className="btn secondary"
+                  onClick={requestCancelConsolidation}
+                  disabled={cancelRequested}
+                >
+                  {cancelRequested ? t("send.consolidateCancelPending") : t("send.consolidateCancelAction")}
+                </button>
               )}
               <button className="btn secondary" onClick={resetSendState}>
                 {t("send.newTransfer")}
@@ -1655,14 +2500,66 @@ export default function Send() {
             <div className="note" style={{ marginTop: 12 }}>
               <div>{t("send.consolidateConfirmCount", { count: consolidatePreview.selected.length })}</div>
               <div>{t("send.consolidateConfirmFee")}: {fmtPEPEWFromSats(consolidatePreview.feeSats)}</div>
+              <div>{t("send.consolidateRoundProgress", {
+                round: consolidatePreview.round,
+                total: consolidatePreview.totalRounds,
+                remaining: consolidatePreview.remainingAfterRound
+              })}</div>
+              <div>{t("send.consolidateRoundSize", { size: MAX_CONSOLIDATE_INPUTS })}</div>
+              <div>{t("send.consolidateStateLabel")}: {consolidationPhaseLabel}</div>
+              {consolidationProgress?.lastTxid && (
+                <div>{t("send.consolidateLastTxid")}: <code>{consolidationProgress.lastTxid}</code></div>
+              )}
+              {consolidationProgress?.requestId && (
+                <div>request-id: <code>{consolidationProgress.requestId}</code></div>
+              )}
+            </div>
+            <div className="note" style={{ marginTop: 12 }}>
+              <div className="muted">{t("send.consolidateModeTitle")}</div>
+              <label className="checkbox-row" style={{ marginTop: 8 }}>
+                <input
+                  type="radio"
+                  checked={consolidationMode === "auto"}
+                  onChange={() => setConsolidationMode("auto")}
+                  disabled={consolidationBusy}
+                />
+                <span>{t("send.consolidateModeAuto")}</span>
+              </label>
+              <label className="checkbox-row" style={{ marginTop: 6 }}>
+                <input
+                  type="radio"
+                  checked={consolidationMode === "manual"}
+                  onChange={() => setConsolidationMode("manual")}
+                  disabled={consolidationBusy}
+                />
+                <span>{t("send.consolidateModeManual")}</span>
+              </label>
+              <div className="muted" style={{ marginTop: 8 }}>{t("send.consolidateWarningNoRepeat")}</div>
             </div>
             <div className="row" style={{ marginTop: 16, justifyContent: "flex-end" }}>
-              <button className="btn secondary" onClick={closeConsolidateConfirm} disabled={consolidating}>
+              <button className="btn secondary" onClick={closeConsolidateConfirm} disabled={consolidationBusy}>
                 {t("send.consolidateCancel")}
               </button>
-              <button className="btn" onClick={doConsolidate} disabled={consolidating}>
-                {consolidating ? t("send.sending") : t("send.consolidateConfirmAction")}
-              </button>
+              {consolidationBusy && (
+                <button className="btn secondary" onClick={requestCancelConsolidation} disabled={cancelRequested}>
+                  {cancelRequested ? t("send.consolidateCancelPending") : t("send.consolidateCancelAction")}
+                </button>
+              )}
+              {consolidationMode === "auto" && (
+                <button className="btn" onClick={doConsolidate} disabled={consolidationBusy}>
+                  {consolidationBusy ? t("send.sending") : t("send.consolidateStartAuto")}
+                </button>
+              )}
+              {consolidationMode === "manual" && (
+                <button className="btn" onClick={doConsolidate} disabled={consolidationBusy}>
+                  {consolidationBusy ? t("send.sending") : t("send.consolidateConfirmAction")}
+                </button>
+              )}
+              {!consolidationBusy && consolidationProgress && (
+                <button className="btn secondary" onClick={continueConsolidation}>
+                  {t("send.consolidateContinue")}
+                </button>
+              )}
             </div>
           </div>
         </div>

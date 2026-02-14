@@ -129,6 +129,7 @@ function isLikelyTelegramToken(token: string) {
 function classifyFetchError(err: any, url: string) {
   const code = err?.code || "";
   if (code === "ECONNREFUSED") return `connection refused at ${url}`;
+  if (code === "ECONNRESET") return `ECONNRESET contacting ${url}`;
   if (code === "ENOTFOUND" || code === "EAI_AGAIN") return `host not found for ${url}`;
   if (code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
     return `timeout contacting ${url}`;
@@ -620,6 +621,70 @@ function parseEnvNumber(raw: string | undefined, fallback: number) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+class UpstreamBusyError extends Error {
+  status: number;
+  code: string;
+  constructor(message = "upstream queue is full") {
+    super(message);
+    this.name = "UpstreamBusyError";
+    this.status = 503;
+    this.code = "UPSTREAM_BUSY";
+  }
+}
+
+const pepewApiUpstreamTimeoutMs = Math.max(3000, parseEnvNumber(process.env.PEPEW_API_UPSTREAM_TIMEOUT_MS, 15000));
+const pepewApiHistoryTimeoutMs = Math.max(
+  pepewApiUpstreamTimeoutMs,
+  parseEnvNumber(process.env.PEPEW_API_HISTORY_TIMEOUT_MS, 25000)
+);
+const pepewApiUpstreamConcurrency = Math.max(1, Math.min(64, parseEnvNumber(process.env.PEPEW_API_UPSTREAM_CONCURRENCY, 8)));
+const pepewApiUpstreamMaxQueue = Math.max(1, parseEnvNumber(process.env.PEPEW_API_UPSTREAM_MAX_QUEUE, 200));
+const pepewApiUpstreamQueue: Array<() => void> = [];
+let pepewApiUpstreamActive = 0;
+
+async function acquirePepewApiSlot(label: string, rid: string) {
+  if (pepewApiUpstreamActive < pepewApiUpstreamConcurrency) {
+    pepewApiUpstreamActive += 1;
+    return;
+  }
+
+  if (pepewApiUpstreamQueue.length >= pepewApiUpstreamMaxQueue) {
+    console.warn(
+      `[pepew-upstream] queue-full label=${label} rid=${rid} active=${pepewApiUpstreamActive} queued=${pepewApiUpstreamQueue.length}`
+    );
+    throw new UpstreamBusyError();
+  }
+
+  const queuedAt = Date.now();
+  await new Promise<void>((resolve) => {
+    pepewApiUpstreamQueue.push(() => {
+      pepewApiUpstreamActive += 1;
+      const waitedMs = Date.now() - queuedAt;
+      if (waitedMs > 50) {
+        console.debug(
+          `[pepew-upstream] queue-wait label=${label} rid=${rid} waited=${waitedMs}ms active=${pepewApiUpstreamActive} queued=${pepewApiUpstreamQueue.length}`
+        );
+      }
+      resolve();
+    });
+  });
+}
+
+function releasePepewApiSlot() {
+  pepewApiUpstreamActive = Math.max(0, pepewApiUpstreamActive - 1);
+  const next = pepewApiUpstreamQueue.shift();
+  if (next) next();
+}
+
+async function withPepewApiSlot<T>(label: string, rid: string, fn: () => Promise<T>): Promise<T> {
+  await acquirePepewApiSlot(label, rid);
+  try {
+    return await fn();
+  } finally {
+    releasePepewApiSlot();
+  }
+}
+
 function getJwtSubject(req: RateLimitRequest) {
   if (typeof req.walletJwtSub === "string") return req.walletJwtSub;
   const header = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
@@ -1004,18 +1069,23 @@ app.get("/v1/requests/:id", ...readLimiters, requireAuth, (req, res) => {
 
 app.get("/wallet/balance", ...readLimiters, async (req, res) => {
   const startedAt = Date.now();
-  console.info(`[wallet.balance] start rid=${getRequestId(req)} address=${String(req.query.address || "")}`);
+  const rid = getRequestId(req);
+  console.info(`[wallet.balance] start rid=${rid} address=${String(req.query.address || "")}`);
   const address = req.query.address as string;
   try { addrSchema.parse(address); } catch (e: any) { return errorWithRequestId(req, res, 400, "VALIDATION_ERROR", "address invalid"); }
   const base = getPepewApiBaseV1();
   if (!base) return errorWithRequestId(req, res, 503, "CONFIG_ERROR", "PEPEW_API_BASE not set");
   const url = `${base}/addr/${address}/balance`;
   try {
-    const { res: r, data } = await fetchJson(
-      url,
-      { method: "GET" },
-      8000,
-      { requestId: getRequestId(req), label: "wallet.balance.pepew-api" }
+    const { res: r, data } = await withPepewApiSlot(
+      "wallet.balance.pepew-api",
+      rid,
+      () => fetchJson(
+        url,
+        { method: "GET" },
+        pepewApiUpstreamTimeoutMs,
+        { requestId: rid, label: "wallet.balance.pepew-api" }
+      )
     );
     if (!r.ok) {
       return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", data?.error || `upstream ${r.status}`);
@@ -1023,30 +1093,40 @@ app.get("/wallet/balance", ...readLimiters, async (req, res) => {
     if (!data) return errorWithRequestId(req, res, 502, "UPSTREAM_PARSE_ERROR", "upstream parse error");
     return res.json(data);
   } catch (err: any) {
+    if (err instanceof UpstreamBusyError) {
+      return errorWithRequestId(req, res, err.status, err.code, err.message);
+    }
     const detail = classifyFetchError(err, url);
     if (isTimeoutErrorMessage(detail)) {
       return errorWithRequestId(req, res, 504, "UPSTREAM_TIMEOUT", detail);
     }
     return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", detail);
   } finally {
-    console.info(`[wallet.balance] end rid=${getRequestId(req)} address=${address} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
+    console.info(`[wallet.balance] end rid=${rid} address=${address} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
   }
 });
 
 app.get("/wallet/utxos", ...readLimiters, async (req, res) => {
   const startedAt = Date.now();
-  console.info(`[wallet.utxos] start rid=${getRequestId(req)} address=${String(req.query.address || "")}`);
+  const rid = getRequestId(req);
+  console.info(`[wallet.utxos] start rid=${rid} address=${String(req.query.address || "")}`);
   const address = req.query.address as string;
   try { addrSchema.parse(address); } catch (e: any) { return errorWithRequestId(req, res, 400, "VALIDATION_ERROR", "address invalid"); }
   const base = getPepewApiBaseV1();
   if (!base) return errorWithRequestId(req, res, 503, "CONFIG_ERROR", "PEPEW_API_BASE not set");
   const url = `${base}/addr/${address}/utxos`;
+  const summaryOnlyRaw = String(req.query.summary || "").toLowerCase();
+  const summaryOnly = summaryOnlyRaw === "1" || summaryOnlyRaw === "true" || summaryOnlyRaw === "yes";
   try {
-    const { res: r, data } = await fetchJson(
-      url,
-      { method: "GET" },
-      8000,
-      { requestId: getRequestId(req), label: "wallet.utxos.pepew-api" }
+    const { res: r, data } = await withPepewApiSlot(
+      "wallet.utxos.pepew-api",
+      rid,
+      () => fetchJson(
+        url,
+        { method: "GET" },
+        pepewApiUpstreamTimeoutMs,
+        { requestId: rid, label: "wallet.utxos.pepew-api" }
+      )
     );
     if (!r.ok) {
       return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", data?.error || `upstream ${r.status}`);
@@ -1055,7 +1135,10 @@ app.get("/wallet/utxos", ...readLimiters, async (req, res) => {
 
     // Enrich with scriptPubKey if missing (for P2PKH)
     const utxos = Array.isArray(data) ? data : (data.utxos || []);
-    console.info(`[utxo] address=${address} count=${utxos.length} rid=${getRequestId(req)} timing=${Date.now() - startedAt}ms`);
+    console.info(`[utxo] address=${address} count=${utxos.length} rid=${rid} timing=${Date.now() - startedAt}ms`);
+    if (summaryOnly) {
+      return res.json({ count: utxos.length, requestId: rid });
+    }
     const enriched = utxos.map((u: any) => {
       if (u.scriptPubKey) return u;
       try {
@@ -1069,13 +1152,16 @@ app.get("/wallet/utxos", ...readLimiters, async (req, res) => {
 
     return res.json(enriched);
   } catch (err: any) {
+    if (err instanceof UpstreamBusyError) {
+      return errorWithRequestId(req, res, err.status, err.code, err.message);
+    }
     const detail = classifyFetchError(err, url);
     if (isTimeoutErrorMessage(detail)) {
       return errorWithRequestId(req, res, 504, "UPSTREAM_TIMEOUT", detail);
     }
     return errorWithRequestId(req, res, 502, "UPSTREAM_ERROR", detail);
   } finally {
-    console.info(`[wallet.utxos] end rid=${getRequestId(req)} address=${address} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
+    console.info(`[wallet.utxos] end rid=${rid} address=${address} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
   }
 });
 
@@ -1093,42 +1179,17 @@ function normalizeHistoryPayload(data: any) {
 }
 
 app.get("/wallet/history", ...readLimiters, async (req, res) => {
+  const rid = getRequestId(req);
   const address = req.query.address as string;
   try { addrSchema.parse(address); } catch (e: any) { return res.status(400).json({ error: "address invalid" }); }
   const base = getPepewApiBaseV1();
   if (!base) return res.status(503).json({ error: "PEPEW_API_BASE not set" });
   const url = `${base}/addr/${address}/txs`;
   try {
-    const { res: r, data } = await fetchJson(url, { method: "GET" }, 8000);
-    if (r.ok) {
-      const payload = normalizeHistoryPayload(data);
-      return res.json({ ...payload, ok: true });
-    }
-    if (r.status === 404) {
-      return res.json({ ok: true, txs: [] });
-    }
-    return res.status(502).json({ error: data?.error || `upstream ${r.status}` });
-  } catch (err: any) {
-    return res.status(502).json({ error: classifyFetchError(err, url) });
-  }
-});
-
-app.post("/v1/history", ...readLimiters, async (req, res) => {
-  const body = req.body as { addresses?: string[]; limit?: number };
-  const addresses = Array.isArray(body?.addresses) ? body.addresses.filter(Boolean) : [];
-  if (!addresses.length) return res.json({ ok: true, txs: [] });
-  const base = getPepewApiBaseV1();
-  if (!base) return res.status(503).json({ error: "PEPEW_API_BASE not set" });
-  const url = `${base}/history`;
-  try {
-    const { res: r, data } = await fetchJson(
-      url,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ addresses, limit: body?.limit }),
-      },
-      12_000
+    const { res: r, data } = await withPepewApiSlot(
+      "wallet.history.pepew-api",
+      rid,
+      () => fetchJson(url, { method: "GET" }, pepewApiUpstreamTimeoutMs, { requestId: rid, label: "wallet.history.pepew-api" })
     );
     if (r.ok) {
       const payload = normalizeHistoryPayload(data);
@@ -1139,6 +1200,48 @@ app.post("/v1/history", ...readLimiters, async (req, res) => {
     }
     return res.status(502).json({ error: data?.error || `upstream ${r.status}` });
   } catch (err: any) {
+    if (err instanceof UpstreamBusyError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    return res.status(502).json({ error: classifyFetchError(err, url) });
+  }
+});
+
+app.post("/v1/history", ...readLimiters, async (req, res) => {
+  const rid = getRequestId(req);
+  const body = req.body as { addresses?: string[]; limit?: number };
+  const addresses = Array.isArray(body?.addresses) ? body.addresses.filter(Boolean) : [];
+  if (!addresses.length) return res.json({ ok: true, txs: [] });
+  const base = getPepewApiBaseV1();
+  if (!base) return res.status(503).json({ error: "PEPEW_API_BASE not set" });
+  const url = `${base}/history`;
+  try {
+    const { res: r, data } = await withPepewApiSlot(
+      "v1.history.pepew-api",
+      rid,
+      () => fetchJson(
+        url,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ addresses, limit: body?.limit }),
+        },
+        pepewApiHistoryTimeoutMs,
+        { requestId: rid, label: "v1.history.pepew-api" }
+      )
+    );
+    if (r.ok) {
+      const payload = normalizeHistoryPayload(data);
+      return res.json({ ...payload, ok: true });
+    }
+    if (r.status === 404) {
+      return res.json({ ok: true, txs: [] });
+    }
+    return res.status(502).json({ error: data?.error || `upstream ${r.status}` });
+  } catch (err: any) {
+    if (err instanceof UpstreamBusyError) {
+      return res.status(err.status).json({ error: err.message });
+    }
     return res.status(502).json({ error: classifyFetchError(err, url) });
   }
 });
@@ -2101,9 +2204,9 @@ type RawTxFetchFailure = {
 type RawTxFetchResult = RawTxFetchSuccess | RawTxFetchFailure;
 
 const rawTxCacheTtlMs = Math.max(1000, parseEnvNumber(process.env.RAW_TX_CACHE_TTL_MS, 20000));
-const rawTxCacheMax = Math.max(100, parseEnvNumber(process.env.RAW_TX_CACHE_MAX, 2000));
-const rawTxBatchMax = Math.min(50, Math.max(1, parseEnvNumber(process.env.RAW_TX_BATCH_MAX, 50)));
-const rawTxBatchConcurrency = Math.max(1, Math.min(10, parseEnvNumber(process.env.RAW_TX_BATCH_CONCURRENCY, 6)));
+const rawTxCacheMax = Math.max(1, parseEnvNumber(process.env.RAW_TX_CACHE_MAX, 1000));
+const rawTxBatchMax = Math.max(1, Math.min(20, parseEnvNumber(process.env.RAW_TX_BATCH_MAX, 20)));
+const rawTxBatchConcurrency = Math.max(1, Math.min(4, parseEnvNumber(process.env.RAW_TX_BATCH_CONCURRENCY, 4)));
 const rawTxCache = new Map<string, RawTxCacheEntry>();
 
 function isRawTxFetchSuccess(result: RawTxFetchResult): result is RawTxFetchSuccess {
@@ -2114,15 +2217,39 @@ function normalizeTxid(txid: string) {
   return txid.trim().toLowerCase();
 }
 
-function evictRawTxCacheIfNeeded() {
+function sweepExpiredRawTxCacheEntries() {
   const now = Date.now();
   for (const [key, entry] of rawTxCache.entries()) {
     if (entry.expiresAt <= now) rawTxCache.delete(key);
   }
+}
+
+function evictRandomRawTxCacheEntries() {
+  if (!rawTxCache.size) return;
+  const keys = Array.from(rawTxCache.keys());
+  const deleteCount = Math.max(1, Math.ceil(keys.length * 0.1));
+  for (let i = keys.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = keys[i];
+    keys[i] = keys[j];
+    keys[j] = tmp;
+  }
+  for (let i = 0; i < deleteCount && i < keys.length; i += 1) {
+    rawTxCache.delete(keys[i]);
+  }
+}
+
+function enforceRawTxCacheBounds() {
+  if (rawTxCache.size <= rawTxCacheMax) return;
+  sweepExpiredRawTxCacheEntries();
   while (rawTxCache.size > rawTxCacheMax) {
-    const oldestKey = rawTxCache.keys().next().value as string | undefined;
-    if (!oldestKey) break;
-    rawTxCache.delete(oldestKey);
+    const sizeBefore = rawTxCache.size;
+    evictRandomRawTxCacheEntries();
+    if (rawTxCache.size === sizeBefore) {
+      const key = rawTxCache.keys().next().value as string | undefined;
+      if (!key) break;
+      rawTxCache.delete(key);
+    }
   }
 }
 
@@ -2142,7 +2269,16 @@ function setRawTxCache(txid: string, rawTx: string) {
     rawTx,
     expiresAt: Date.now() + rawTxCacheTtlMs,
   });
-  evictRawTxCacheIfNeeded();
+  enforceRawTxCacheBounds();
+}
+
+function shouldRetryRawTxFailure(result: RawTxFetchResult) {
+  if (result.ok) return false;
+  const failure = result as RawTxFetchFailure;
+  if (failure.status === 502 || failure.status === 503) return true;
+  if (failure.code === "UPSTREAM_TIMEOUT" || failure.code === "RPC_TIMEOUT") return true;
+  if (/\bECONNRESET\b/i.test(failure.error)) return true;
+  return isTimeoutErrorMessage(failure.error);
 }
 
 async function fetchRawTxUpstream(txid: string, requestId: string): Promise<RawTxFetchResult> {
@@ -2200,8 +2336,7 @@ async function fetchRawTxUpstream(txid: string, requestId: string): Promise<RawT
       15000,
       {
         requestId,
-        label: "rpc.getrawtransaction",
-        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
+        label: "rpc.getrawtransaction"
       }
     );
 
@@ -2248,11 +2383,22 @@ async function fetchRawTxWithCache(txid: string, requestId: string): Promise<Raw
   const normalized = normalizeTxid(txid);
   const cached = getRawTxFromCache(normalized);
   if (cached) {
-    console.info(`[rawtx-cache] hit txid=${normalized} rid=${requestId}`);
+    console.debug(`[rawtx-cache] hit txid=${normalized} rid=${requestId}`);
     return { ok: true, txid: normalized, rawTx: cached, source: "cache" };
   }
+  console.debug(`[rawtx-cache] miss txid=${normalized} rid=${requestId}`);
 
-  const upstream = await fetchRawTxUpstream(normalized, requestId);
+  let upstream = await fetchRawTxUpstream(normalized, requestId);
+  const maxAttempts = 2;
+  let attempt = 1;
+  while (!upstream.ok && attempt < maxAttempts) {
+    const failure = upstream as RawTxFetchFailure;
+    if (!shouldRetryRawTxFailure(upstream)) break;
+    console.debug(`[rawtx-retry] txid=${normalized} attempt=${attempt}/${maxAttempts} retry=1 code=${failure.code} rid=${requestId}`);
+    await sleep(200);
+    attempt += 1;
+    upstream = await fetchRawTxUpstream(normalized, requestId);
+  }
   if (upstream.ok) {
     setRawTxCache(normalized, upstream.rawTx);
   }
@@ -2263,6 +2409,7 @@ type RawTxBatchItemOk = {
   txid: string;
   ok: true;
   rawTx: string;
+  source: "cache" | "upstream";
 };
 
 type RawTxBatchItemErr = {
@@ -2271,6 +2418,7 @@ type RawTxBatchItemErr = {
   code: string;
   error: string;
   requestId: string;
+  source: "upstream";
 };
 
 async function handleRawTxBatch(req: express.Request, res: express.Response) {
@@ -2320,9 +2468,10 @@ async function handleRawTxBatch(req: express.Request, res: express.Response) {
       const txid = normalized[index];
       const fetched = await fetchRawTxWithCache(txid, rid);
       if (isRawTxFetchSuccess(fetched)) {
-        if (fetched.source === "cache") cacheHit += 1;
+        const source = fetched.source === "cache" ? "cache" : "upstream";
+        if (source === "cache") cacheHit += 1;
         else cacheMiss += 1;
-        results[index] = { txid, ok: true, rawTx: fetched.rawTx };
+        results[index] = { txid, ok: true, rawTx: fetched.rawTx, source };
       } else {
         cacheMiss += 1;
         console.warn(`[rawtx-batch] txid=${txid} ok=false code=${fetched.code} status=${fetched.status} rid=${rid} err=${fetched.error}`);
@@ -2332,6 +2481,7 @@ async function handleRawTxBatch(req: express.Request, res: express.Response) {
           code: fetched.code,
           error: fetched.error,
           requestId: rid,
+          source: "upstream",
         };
       }
     }
@@ -2342,7 +2492,7 @@ async function handleRawTxBatch(req: express.Request, res: express.Response) {
   const failedCount = results.length - okCount;
   const timingMs = Date.now() - startedAt;
 
-  console.info(`[rawtx-batch] total=${results.length} ok=${okCount} failed=${failedCount} cacheHit=${cacheHit} cacheMiss=${cacheMiss} timing=${timingMs}ms rid=${rid}`);
+  console.info(`[rawtx-batch] total=${results.length} ok=${okCount} failed=${failedCount} cacheHit=${cacheHit} cacheMiss=${cacheMiss} timing=${timingMs} rid=${rid}`);
   return res.json({
     requestId: rid,
     results,

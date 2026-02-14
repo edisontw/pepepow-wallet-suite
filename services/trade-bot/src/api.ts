@@ -376,7 +376,11 @@ export type ReportExchange = "nonkyc" | "dextrade" | "nestex";
 export interface StrategyReportMetrics {
     strategy: "dca" | "grid" | "mm" | "devmm" | "total";
     fillCount: number;
+    fillBuyCount: number;
+    fillSellCount: number;
     orderCount: number;
+    orderBuyCount: number;
+    orderSellCount: number;
     quoteVolume: number;
     baseVolume: number;
     fee: number;
@@ -550,15 +554,34 @@ export interface DevmmStatusEntry {
     adapterKey?: string;
     status: "ACTIVE" | "DEGRADED" | "PAUSED" | "STOPPED" | "NOT_CONFIGURED";
     pauseReason?: string | null;
+    issueCode?: string | null;
+    statusHint?: string | null;
+    spreadZero?: boolean;
+    bookSource?: string | null;
     isEnabled?: boolean;
+    openOrdersRaw?: number;
+    openOrdersManaged?: number;
+    openOrdersUnmanaged?: number;
     openOrdersBySide?: {
         buy: number;
         sell: number;
     };
+    openOrdersRawBySide?: {
+        buy: number;
+        sell: number;
+        unknown: number;
+    };
+    openOrdersManagedBySide?: {
+        buy: number;
+        sell: number;
+        unknown: number;
+    };
+    unmanagedOrderIds?: string[];
     openOrdersSource?: string;
     config?: {
         symbol: string;
         orderQuoteUsdt: number;
+        effectiveOrderQuoteUsdt?: number;
         minNotionalUsdt: number;
         buyOffsetPct: number;
         sellOffsetPct: number;
@@ -642,6 +665,7 @@ export async function devmmStop(exchange: "nonkyc" | "dextrade" | "nestex"): Pro
     message?: string;
     ordersAttempted?: number;
     ordersVisibleBefore?: number;
+    unknownOrdersVisible?: number;
     ordersCancelled?: number;
     ordersAlreadyClosed?: number;
     ordersFailed?: number;
@@ -652,11 +676,39 @@ export async function devmmStop(exchange: "nonkyc" | "dextrade" | "nestex"): Pro
         message?: string;
         ordersAttempted?: number;
         ordersVisibleBefore?: number;
+        unknownOrdersVisible?: number;
         ordersCancelled?: number;
         ordersAlreadyClosed?: number;
         ordersFailed?: number;
         error?: string;
     }>("/v1/devmm/stop", {
+        method: "POST",
+        body: { exchange },
+    });
+}
+
+export async function devmmCancelUnknownOrders(exchange: "nonkyc" | "dextrade" | "nestex"): Promise<{
+    ok: boolean;
+    message?: string;
+    ordersAttempted?: number;
+    ordersVisibleBefore?: number;
+    unknownOrdersVisible?: number;
+    ordersCancelled?: number;
+    ordersAlreadyClosed?: number;
+    ordersFailed?: number;
+    error?: string;
+}> {
+    return fetchApi<{
+        ok: boolean;
+        message?: string;
+        ordersAttempted?: number;
+        ordersVisibleBefore?: number;
+        unknownOrdersVisible?: number;
+        ordersCancelled?: number;
+        ordersAlreadyClosed?: number;
+        ordersFailed?: number;
+        error?: string;
+    }>("/v1/devmm/cancel-unknown-orders", {
         method: "POST",
         body: { exchange },
     });

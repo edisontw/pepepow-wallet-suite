@@ -1,7 +1,8 @@
 import { buildAndSignP2PKH, PEPEPOW, type PepepowNetwork } from "@pepepow/wallet-core";
 import type { Utxo } from "../lib/walletStore";
 
-export const MAX_CONSOLIDATE_INPUTS = 200;
+export const MAX_CONSOLIDATE_INPUTS = 80;
+export const MAX_SEND_INPUTS = 120;
 export const MAX_CONSOLIDATE_TX_BYTES = 100000;
 
 export type ConsolidationInput = {
@@ -15,6 +16,12 @@ export function selectConsolidationUtxos(utxos: Utxo[], maxInputs = MAX_CONSOLID
   return [...utxos]
     .sort((a, b) => a.valueSats - b.valueSats)
     .slice(0, maxInputs);
+}
+
+export function estimateConsolidationRounds(totalUtxos: number, roundSize = MAX_CONSOLIDATE_INPUTS) {
+  if (!Number.isFinite(totalUtxos) || totalUtxos <= 0) return 0;
+  const safeRound = Math.max(1, Math.floor(roundSize));
+  return Math.ceil(totalUtxos / safeRound);
 }
 
 export function estimateP2PKHTxBytes(inputCount: number, outputCount = 1) {

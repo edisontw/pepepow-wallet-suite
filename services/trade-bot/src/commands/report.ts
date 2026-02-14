@@ -14,6 +14,7 @@ type ReportState = {
     step: "period";
     updatedAt: number;
 };
+type ReportViewMode = "compact" | "all";
 
 const REPORT_STATE_TTL_MS = 10 * 60 * 1000;
 const REPORT_EXCHANGES: ReportExchange[] = ["nonkyc", "dextrade", "nestex"];
@@ -46,36 +47,110 @@ function buildPeriodKeyboard(): InlineKeyboard {
         .text("Monthly", "report:period:monthly"));
 }
 
-function formatUsdt(value: number): string {
-    if (!Number.isFinite(value)) return "0.000 USDT";
-    return `${value.toFixed(3)} USDT`;
+function formatSignedUsdt(value: number): string {
+    if (!Number.isFinite(value)) return "0.0000 USDT";
+    const abs = Math.abs(value).toFixed(4);
+    if (value > 0) return `+${abs} USDT`;
+    if (value < 0) return `-${abs} USDT`;
+    return "0.0000 USDT";
 }
 
 function formatPepewVolume(value: number): string {
-    if (!Number.isFinite(value)) return "0 PEPEW";
+    if (!Number.isFinite(value) || value <= 0) return "0 PEPEW";
     return `${Math.round(value).toLocaleString("en-US")} PEPEW`;
 }
 
-function formatMetricLine(label: string, metric: StrategyReportMetrics): string {
-    return `${label.toUpperCase()}: orders=${metric.orderCount} fills=${metric.fillCount} volume=${formatPepewVolume(metric.baseVolume)} net=${formatUsdt(metric.netQuote)}`;
+function formatOrderSideCount(metric: StrategyReportMetrics): string {
+    const orderBuy = Number(metric.orderBuyCount || 0);
+    const orderSell = Number(metric.orderSellCount || 0);
+    if (orderBuy > 0 || orderSell > 0) {
+        return `${orderBuy + orderSell} (${orderBuy}B/${orderSell}S)`;
+    }
+    const fillBuy = Number(metric.fillBuyCount || 0);
+    const fillSell = Number(metric.fillSellCount || 0);
+    if (fillBuy > 0 || fillSell > 0) {
+        return `${fillBuy + fillSell} (${fillBuy}B/${fillSell}S)`;
+    }
+    return `${Number(metric.orderCount || 0)} (0B/0S)`;
 }
 
-function buildExchangeReportLines(
-    exchange: ReportExchange,
+function hasTradeActivity(total: StrategyReportMetrics): boolean {
+    return Number(total.fillCount || 0) > 0 && Number(total.quoteVolume || 0) > 0;
+}
+
+function buildReportResultKeyboard(period: ReportPeriod, hiddenExchanges: ReportExchange[]): InlineKeyboard | undefined {
+    if (hiddenExchanges.length === 0) return undefined;
+    return new InlineKeyboard().text("Show all exchanges", `report:period_all:${period}`);
+}
+
+function formatReportLines(
     period: ReportPeriod,
-    result: Awaited<ReturnType<typeof getStrategyReport>>
-): string[] {
-    const report = result.report;
-    return [
-        `[${exchangeLabel(exchange)}] bucket=${result.bucket}`,
-        formatMetricLine("dca", report.dca),
-        formatMetricLine("grid", report.grid),
-        formatMetricLine("mm", report.mm),
-        formatMetricLine("devmm", report.devmm),
-        formatMetricLine("total", report.total),
-        `gross=${formatUsdt(report.total.quoteVolume)} fee=${formatUsdt(report.total.fee)}`,
-        `period=${periodLabel(period)}`,
+    viewMode: ReportViewMode,
+    reportResults: PromiseSettledResult<Awaited<ReturnType<typeof getStrategyReport>>>[]
+): { lines: string[]; hiddenExchanges: ReportExchange[] } {
+    const lines: string[] = [
+        `📈 ${periodLabel(period)} Report`,
+        "--------------------",
     ];
+    const hiddenExchanges: ReportExchange[] = [];
+
+    reportResults.forEach((item, index) => {
+        const exchange = REPORT_EXCHANGES[index];
+        const label = exchangeLabel(exchange);
+        if (item.status !== "fulfilled") {
+            const reason = item.reason instanceof ApiError
+                ? item.reason.message
+                : (item.reason?.message || "unknown error");
+            lines.push(`⚠️ ${label}: failed (${reason})`);
+            return;
+        }
+
+        const total = item.value.report.total;
+        const active = hasTradeActivity(total);
+        if (!active && viewMode === "compact") {
+            hiddenExchanges.push(exchange);
+            return;
+        }
+
+        if (!active) {
+            lines.push(`— ${label}: 0 trades`);
+            return;
+        }
+
+        const icon = total.netQuote >= 0 ? "✅" : "⚠️";
+        lines.push(
+            `${icon} ${label}: ${formatSignedUsdt(total.netQuote)} · Vol ${formatPepewVolume(total.baseVolume)} · Orders ${formatOrderSideCount(total)}`
+        );
+    });
+
+    if (viewMode === "compact" && hiddenExchanges.length > 0) {
+        lines.push(`(Hidden: ${hiddenExchanges.map(exchangeLabel).join(", ")} = 0 trades)`);
+    }
+    if (lines.length === 2) {
+        lines.push("No filled trades in this period.");
+    }
+
+    return { lines, hiddenExchanges };
+}
+
+async function renderReportForPeriod(ctx: Context, tgUserId: string, period: ReportPeriod, viewMode: ReportViewMode): Promise<void> {
+    const reportResults = await Promise.allSettled(
+        REPORT_EXCHANGES.map((exchange) => getStrategyReport(tgUserId, period, exchange))
+    );
+    const { lines, hiddenExchanges } = formatReportLines(period, viewMode, reportResults);
+    await safeSend(ctx, {
+        step: `report.result.${period}.${viewMode}`,
+        text: lines.join("\n"),
+        replyMarkup: buildReportResultKeyboard(period, hiddenExchanges),
+    });
+
+    for (const [index, item] of reportResults.entries()) {
+        if (item.status !== "fulfilled") continue;
+        const exchange = REPORT_EXCHANGES[index];
+        console.log(
+            `[trade-bot] report.generate userId=${tgUserId} period=${period} exchange=${exchange} total=${item.value.report.total.quoteVolume}`
+        );
+    }
 }
 
 export async function handleReport(ctx: Context): Promise<void> {
@@ -102,6 +177,7 @@ export async function handleReportCallback(ctx: Context): Promise<boolean> {
     const parts = data.split(":");
     const action = parts[1] || "";
     const value = parts[2] || "";
+    const extra = parts[3] || "";
     const maybeExchange = value === "nonkyc" || value === "dextrade" || value === "nestex" ? value : undefined;
     console.log(
         `[trade-bot] callback userId=${tgUserId || "unknown"} action=report:${action} exchange=${maybeExchange || "n/a"} strategy=n/a params=${value || "n/a"}`
@@ -125,46 +201,35 @@ export async function handleReportCallback(ctx: Context): Promise<boolean> {
         return true;
     }
 
-    const state = pendingReport.get(tgUserId);
-    if (!state || isExpired(state)) {
-        pendingReport.delete(tgUserId);
-        await safeSend(ctx, { step: "report.cb.expired", text: "Report flow expired. Use /report again." });
-        await sendMainMenu(ctx);
-        return true;
+    if (action === "period_all" && (value === "daily" || value === "weekly" || value === "monthly")) {
+        try {
+            await renderReportForPeriod(ctx, tgUserId, value as ReportPeriod, "all");
+            await sendMainMenu(ctx);
+            return true;
+        } catch (err: any) {
+            if (err instanceof ApiError) {
+                await safeSend(ctx, { step: "report.cb.api_error", text: `❌ Report failed: ${err.message}` });
+            } else {
+                await safeSend(ctx, { step: "report.cb.error", text: "❌ Report failed. Please try again." });
+            }
+            await sendMainMenu(ctx);
+            return true;
+        }
     }
 
     if (action === "period" && (value === "daily" || value === "weekly" || value === "monthly")) {
+        const viewMode: ReportViewMode = extra === "all" ? "all" : "compact";
+        const state = pendingReport.get(tgUserId);
+        if (!state || isExpired(state)) {
+            pendingReport.delete(tgUserId);
+            await safeSend(ctx, { step: "report.cb.expired", text: "Report flow expired. Use /report again." });
+            await sendMainMenu(ctx);
+            return true;
+        }
+
         pendingReport.delete(tgUserId);
-        const period = value as ReportPeriod;
         try {
-            const reportResults = await Promise.allSettled(
-                REPORT_EXCHANGES.map((exchange) => getStrategyReport(tgUserId, period, exchange))
-            );
-            const lines: string[] = [
-                `📈 Report ${periodLabel(period)} (All Exchanges)`,
-                "--------------------",
-                "Source: strategy logs only (manual exchange trades excluded)",
-            ];
-
-            reportResults.forEach((item, index) => {
-                const exchange = REPORT_EXCHANGES[index];
-                lines.push("");
-                if (item.status === "fulfilled") {
-                    const exchangeLines = buildExchangeReportLines(exchange, period, item.value);
-                    lines.push(...exchangeLines);
-                    console.log(
-                        `[trade-bot] report.generate userId=${tgUserId} period=${period} exchange=${exchange} total=${item.value.report.total.quoteVolume}`
-                    );
-                    return;
-                }
-
-                const reason = item.reason instanceof ApiError
-                    ? item.reason.message
-                    : (item.reason?.message || "unknown error");
-                lines.push(`[${exchangeLabel(exchange)}] failed: ${reason}`);
-            });
-
-            await safeSend(ctx, { step: "report.result", text: lines.join("\n") });
+            await renderReportForPeriod(ctx, tgUserId, value as ReportPeriod, viewMode);
             await sendMainMenu(ctx);
             return true;
         } catch (err: any) {

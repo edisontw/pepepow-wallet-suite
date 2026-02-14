@@ -2249,6 +2249,8 @@ export interface DevmmReport {
     netUsdtChange: number;
     netPepewChange: number;
     fillCount: number;
+    buyFillCount: number;
+    sellFillCount: number;
 }
 
 export function getDevmmReport(exchange: DevmmExchange, periodType: "daily" | "weekly" | "monthly", bucket?: string): DevmmReport | null {
@@ -2292,14 +2294,17 @@ export function getDevmmReport(exchange: DevmmExchange, periodType: "daily" | "w
     }
 
     let buyTurnover = 0, sellTurnover = 0, buyQty = 0, sellQty = 0, totalFee = 0, fillCount = 0;
+    let buyFillCount = 0, sellFillCount = 0;
     for (const row of rows) {
         fillCount += row.cnt;
         if (row.side === "BUY") {
             buyTurnover = row.total_quote;
             buyQty = row.total_qty;
+            buyFillCount = row.cnt;
         } else {
             sellTurnover = row.total_quote;
             sellQty = row.total_qty;
+            sellFillCount = row.cnt;
         }
         if (row.total_fee) totalFee += row.total_fee;
     }
@@ -2319,6 +2324,8 @@ export function getDevmmReport(exchange: DevmmExchange, periodType: "daily" | "w
         netUsdtChange: sellTurnover - buyTurnover,
         netPepewChange: buyQty - sellQty,
         fillCount,
+        buyFillCount,
+        sellFillCount,
     };
 }
 
