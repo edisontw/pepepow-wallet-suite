@@ -101,6 +101,11 @@ code {
   backdrop-filter: blur(10px);
 }
 
+.warning-banner {
+  border-color: rgba(242, 194, 48, 0.5);
+  background: rgba(242, 194, 48, 0.08);
+}
+
 .section-title {
   font-weight: 600;
   letter-spacing: 0.02em;
@@ -566,15 +571,21 @@ textarea.input {
   min-width: 0;
 }
 
+.tx-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tx-line code {
+  white-space: normal;
+  word-break: break-all;
+}
+
 .tx-info code {
   font-size: 0.95rem;
   color: var(--accent);
-}
-
-.tx-amount {
-  font-family: var(--font-mono);
-  font-size: 1.05rem;
-  white-space: nowrap;
 }
 
 .tx-actions {
@@ -626,6 +637,16 @@ textarea.input {
 
   .row {
     align-items: stretch;
+  }
+
+  .tx-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .tx-actions {
+    width: 100%;
+    justify-content: flex-end;
   }
 
   .qr {

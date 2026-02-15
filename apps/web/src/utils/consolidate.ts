@@ -1,14 +1,16 @@
 import { buildAndSignP2PKH, PEPEPOW, type PepepowNetwork } from "@pepepow/wallet-core";
 import type { Utxo } from "../lib/walletStore";
+import { assertAtomic, atomicToString, validateAtomicRange, type AtomicValue } from "../lib/atomic";
 
 export const MAX_CONSOLIDATE_INPUTS = 80;
 export const MAX_SEND_INPUTS = 120;
 export const MAX_CONSOLIDATE_TX_BYTES = 100000;
+const BUILDER_SATOSHI_MAX = 21n * 10n ** 14n;
 
 export type ConsolidationInput = {
   txid: string;
   vout: number;
-  value: number;
+  value: AtomicValue;
   nonWitnessUtxo: string;
 };
 
@@ -32,24 +34,38 @@ export function estimateP2PKHTxBytes(inputCount: number, outputCount = 1) {
 export function buildConsolidationTx(params: {
   inputs: ConsolidationInput[];
   address: string;
-  feeSats: number;
+  feeSats: AtomicValue;
   wif: string;
   network?: PepepowNetwork;
 }) {
   const { inputs, address, feeSats, wif, network = PEPEPOW } = params;
-  const totalInSats = inputs.reduce((sum, u) => sum + Number(u.value || 0), 0);
-  const outputSats = totalInSats - feeSats;
-  if (outputSats <= 0) {
+  const feeAtomic = assertAtomic(feeSats, "feeAtomic");
+  const totalInAtomic = inputs.reduce(
+    (sum, u, idx) => sum + assertAtomic(u.value, `inputs[${idx}].value`),
+    0n
+  );
+  const outputAtomic = totalInAtomic - feeAtomic;
+  if (outputAtomic <= 0n) {
     throw new Error("insufficient funds including fee");
   }
+  validateAtomicRange(feeAtomic, "feeAtomic", BUILDER_SATOSHI_MAX);
+  validateAtomicRange(totalInAtomic, "totalInAtomic", BUILDER_SATOSHI_MAX);
+  validateAtomicRange(outputAtomic, "outputAtomic", BUILDER_SATOSHI_MAX);
+
+  const normalizedInputs = inputs.map((input) => ({
+    ...input,
+    value: atomicToString(assertAtomic(input.value, `input:${input.txid}:${input.vout}`)),
+  }));
+
   const rawTx = buildAndSignP2PKH({
     network,
-    utxos: inputs,
+    utxos: normalizedInputs,
     wif,
     to: address,
-    amount: outputSats,
+    amount: atomicToString(outputAtomic),
     changeAddress: address,
-    fee: feeSats
+    fee: atomicToString(feeAtomic)
   });
-  return { rawTx, totalInSats, outputSats };
+
+  return { rawTx, totalInAtomic, outputAtomic };
 }

@@ -2,10 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Buffer } from "buffer";
 import { useTranslation } from "react-i18next";
-import { addressToScript, buildAndSignP2PKH, selectUtxos, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
+import { addressToScript, buildAndSignP2PKH, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
 import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS, withAddress } from "../lib/api";
 import { broadcastTx, fetchRawTxBatchApi, TxApiError } from "../lib/tx";
 import { fmtPEPEWFromSats, satsToCoin } from "../lib/format";
+import {
+  assertAtomic,
+  atomicToString,
+  describeOutputShape,
+  toAtomicBigInt,
+  validateAtomicRange,
+} from "../lib/atomic";
 import { triggerRefresh } from "../lib/refresh";
 import { hasPendingSpendTxid, recordPendingSpend } from "../lib/pending";
 import { walletStore, WalletState, type Utxo } from "../lib/walletStore";
@@ -26,9 +33,9 @@ import {
 type ConsolidationPreview = {
   selected: Utxo[];
   totalCandidates: number;
-  totalInSats: number;
-  outputSats: number;
-  feeSats: number;
+  totalInAtomic: bigint;
+  outputAtomic: bigint;
+  feeAtomic: bigint;
   estimatedBytes: number;
   round: number;
   totalRounds: number;
@@ -67,6 +74,7 @@ type ConsolidationPhase =
   | "signing"
   | "broadcasting"
   | "waiting"
+  | "waitingIndexer"
   | "refreshing"
   | "paused"
   | "done"
@@ -95,7 +103,6 @@ type PersistedConsolidationProgress = {
 };
 
 const DEFAULT_PATH = "m/44'/5'/0'/0/0";
-const COIN_MULTIPLIER = 100000000n;
 const MIN_SEND_SATS = 100000000;
 const DUST_THRESHOLD_SATS = 546;
 const FEE_FALLBACK = "0.0001";
@@ -105,19 +112,24 @@ const SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
 const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g;
 const LAST_RAWTX_KEY = "pepew_last_broadcast";
 const LAST_RAWTX_TTL_MS = 2 * 60 * 1000;
+const BUILDER_SATOSHI_MAX = 21n * 10n ** 14n;
 const RAWTX_BATCH_SIZE = 20;
 const RAWTX_BATCH_RETRIES = 1;
 const RAWTX_RETRY_BACKOFF_MS = [200, 500];
 const CONSOLIDATION_REFRESH_DELAY_MS = 1200;
-const CONSOLIDATION_PROPAGATION_DELAY_MS = 6000;
+const CONSOLIDATION_POST_BROADCAST_DELAY_MIN_MS = 8000;
+const CONSOLIDATION_POST_BROADCAST_DELAY_MAX_MS = 12000;
 const CONSOLIDATION_POLL_BACKOFF_MS = [2000, 3000, 5000, 8000, 13000];
 const CONSOLIDATION_POLL_MAX_WAIT_MS = 60000;
+const CONSOLIDATION_AUTO_RETRY_INTERVAL_MS = 6000;
+const CONSOLIDATION_AUTO_MAX_RETRIES = 10;
 const CONSOLIDATION_CLICK_DEBOUNCE_MS = 400;
 const CONSOLIDATION_CANCELLED_TOKEN = "__CONSOLIDATION_CANCELLED__";
 const CONSOLIDATION_PROGRESS_KEY = "pepew_consolidation_progress";
 const CONSOLIDATION_PROGRESS_TTL_MS = 24 * 60 * 60 * 1000;
 const POST_SEND_REFRESH_DELAYS_MS = [2000, 6000, 15000];
 const VISIBLE_REFRESH_MIN_AGE_MS = 30000;
+const UTXO_WARNING_THRESHOLD = 600;
 
 function loadConsolidationProgress(now = Date.now()): PersistedConsolidationProgress | null {
   if (typeof localStorage === "undefined") return null;
@@ -152,22 +164,31 @@ function clearConsolidationProgress() {
   localStorage.removeItem(CONSOLIDATION_PROGRESS_KEY);
 }
 
-function parseCoinToSats(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  const normalized = trimmed.replace(/,/g, "");
-  if (!/^\d+(\.\d+)?$/.test(normalized)) return null;
-  const [whole, frac = ""] = normalized.split(".");
-  if (frac.length > 8) return null;
-  const padded = (frac + "00000000").slice(0, 8);
+function randomIntInclusive(min: number, max: number) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return min;
+  if (max <= min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function parseCoinToAtomic(value: string) {
   try {
-    const sats = BigInt(whole) * COIN_MULTIPLIER + BigInt(padded);
-    const asNumber = Number(sats);
-    if (!Number.isSafeInteger(asNumber)) return null;
-    return asNumber;
+    return toAtomicBigInt(value, 8);
   } catch {
     return null;
   }
+}
+
+function walletSatsToAtomic(value: number, label: string) {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Invalid ${label}: expected non-negative integer`);
+  }
+  return assertAtomic(String(value), label);
+}
+
+function toBuilderAtomicString(value: unknown, label: string) {
+  const atomic = assertAtomic(value, label);
+  validateAtomicRange(atomic, label, BUILDER_SATOSHI_MAX);
+  return atomicToString(atomic);
 }
 
 function formatSatsInput(sats: number) {
@@ -279,6 +300,7 @@ export default function Send() {
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [rawInternalError, setRawInternalError] = useState<string | null>(null);
   const [sendLocked, setSendLocked] = useState(false);
   const [lastTxid, setLastTxid] = useState<string | null>(null);
   const [sendStatusNote, setSendStatusNote] = useState<string | null>(null);
@@ -440,6 +462,7 @@ export default function Send() {
       setLastTxid(null);
       setSendStatusNote(null);
       setErr(null);
+      setRawInternalError(null);
     }
   }, [sendLocked, to, amount, fee, subtractFee, address]);
 
@@ -593,6 +616,7 @@ export default function Send() {
     setResolveMessage(null);
     setResolveResult(null);
     setErr(null);
+    setRawInternalError(null);
 
     try {
       if (debug) console.info(`[send] resolve request for ${trimmed}`);
@@ -715,7 +739,7 @@ export default function Send() {
       const res = await apiCreatePaymentRequest({
         toTgUserId: isId ? query : "",
         toUsername: isId ? "" : query.replace(/^@/, ""),
-        amountSats: amountSats || undefined,
+        amountSats: amountSatsForRequest || undefined,
         memo: t("send.defaultMemo"),
       });
       if (res.ok) {
@@ -733,22 +757,26 @@ export default function Send() {
   };
 
   const availableSats = walletStore.getDisplayBalance() ?? 0;
-  const amountSats = parseCoinToSats(amount);
-  const feeSats = parseCoinToSats(fee);
-  const amountValid = amountSats !== null;
-  const feeValid = feeSats !== null && feeSats >= 0;
+  const availableAtomic = walletSatsToAtomic(availableSats, "availableSats");
+  const amountAtomicInput = parseCoinToAtomic(amount);
+  const feeAtomicInput = parseCoinToAtomic(fee);
+  const amountSatsForRequest = amountAtomicInput !== null && amountAtomicInput <= BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number(amountAtomicInput)
+    : null;
+  const amountValid = amountAtomicInput !== null;
+  const feeValid = feeAtomicInput !== null && feeAtomicInput >= 0n;
   const recipientSats = amountValid && feeValid
     ? subtractFee
-      ? amountSats - feeSats
-      : amountSats
+      ? amountAtomicInput - feeAtomicInput
+      : amountAtomicInput
     : null;
   const totalSats = amountValid && feeValid
     ? subtractFee
-      ? amountSats
-      : amountSats + feeSats
+      ? amountAtomicInput
+      : amountAtomicInput + feeAtomicInput
     : null;
-  const overBalance = totalSats !== null && totalSats > availableSats;
-  const invalidRecipient = recipientSats !== null && recipientSats <= 0;
+  const overBalance = totalSats !== null && totalSats > availableAtomic;
+  const invalidRecipient = recipientSats !== null && recipientSats <= 0n;
   const debugEnabled = import.meta.env.DEV || (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debug") === "1");
   const networkMeta = {
     pubKeyHash: PEPEPOW.pubKeyHash,
@@ -791,15 +819,21 @@ export default function Send() {
   const addressInvalid = !recipientValidation.ok || !changeValidation.ok;
 
   const balanceLabel = fmtPEPEWFromSats(address ? availableSats : null);
-  const feeLabel = feeValid ? fmtPEPEWFromSats(feeSats) : fmtPEPEWFromSats(null);
+  const feeLabel = feeValid ? fmtPEPEWFromSats(feeAtomicInput) : fmtPEPEWFromSats(null);
   const totalLabel = totalSats !== null ? fmtPEPEWFromSats(totalSats) : fmtPEPEWFromSats(null);
   const receiveLabel = recipientSats !== null ? fmtPEPEWFromSats(recipientSats) : fmtPEPEWFromSats(null);
   const feeEstimateLabel = feeEstimate ? `${feeEstimate} PEPEW` : "--";
 
   const handleMax = () => {
-    const feeForMax = feeValid ? feeSats : 0;
-    const maxSats = Math.max(availableSats - feeForMax, 0);
-    setAmount(formatSatsInput(maxSats));
+    const feeForMax = feeValid ? feeAtomicInput : 0n;
+    const maxSats = availableAtomic > feeForMax ? availableAtomic - feeForMax : 0n;
+    setAmount(formatSatsInput(Number(maxSats)));
+  };
+
+  const scrollToUtilities = () => {
+    const node = document.getElementById("send-utilities");
+    if (!node) return;
+    node.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
   const resetSendState = () => {
@@ -811,6 +845,7 @@ export default function Send() {
     setLastTxid(null);
     setSendStatusNote(null);
     setErr(null);
+    setRawInternalError(null);
     setSendAttempted(false);
     setConsolidating(false);
     setConsolidateOpen(false);
@@ -845,10 +880,23 @@ export default function Send() {
     }
   };
 
+  const isTypeforceLikeError = (detail?: string) => {
+    if (!detail) return false;
+    const message = detail.toLowerCase();
+    return message.includes("expected property \"1\" of type")
+      || message.includes("typeforce")
+      || message.includes("satoshi")
+      || message.includes("atomic value")
+      || message.includes("invalid amount")
+      || message.includes("invalid fee");
+  };
 
   const mapBroadcastError = (detail?: string) => {
     if (!detail) return null;
     const message = detail.toLowerCase();
+    if (isTypeforceLikeError(message)) {
+      return t("send.errors.amountTypeMismatch");
+    }
     if (message.includes("dust")) {
       return t("send.errors.amountDust");
     }
@@ -873,6 +921,30 @@ export default function Send() {
       return t("send.errors.utxoPending");
     }
     return null;
+  };
+
+  const reportTxBuildError = (params: {
+    label: string;
+    err: unknown;
+    round?: number;
+    utxoCount?: number;
+    raw?: unknown;
+  }) => {
+    const raw = typeof params.raw === "string"
+      ? params.raw
+      : String((params.err as any)?.message || params.err || "");
+    const stackText = typeof (params.err as any)?.stack === "string"
+      ? String((params.err as any).stack)
+      : "";
+    const stackTop3 = stackText
+      ? stackText.split("\n").slice(0, 3).join("\n")
+      : "";
+    const debugText = stackTop3 ? `${raw}\n${stackTop3}` : raw;
+    console.error(
+      `[TXBUILD_ERROR] label=${params.label} raw=${raw} typeof=${typeof params.raw} round=${params.round ?? "-"} utxoCount=${params.utxoCount ?? "-"}`,
+      { stackTop3 }
+    );
+    return debugText;
   };
 
   const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
@@ -1167,7 +1239,7 @@ export default function Send() {
       return null;
     }
 
-    if (feeSats === null || feeSats < 0) {
+    if (feeAtomicInput === null || feeAtomicInput < 0n) {
       setErr(t("send.errors.feeInvalid"));
       return null;
     }
@@ -1188,16 +1260,22 @@ export default function Send() {
     const nextRound = Math.max(1, Math.min(computedRound, totalRounds));
     const remainingAfterRound = Math.max(totalCandidates - selected.length, 0);
 
-    const totalInSats = selected.reduce((sum, u) => sum + Number(u.valueSats || 0), 0);
-    const outputSats = totalInSats - feeSats;
-    if (outputSats <= 0) {
+    const totalInAtomic = selected.reduce(
+      (sum, u, idx) => sum + walletSatsToAtomic(u.valueSats, `preview.selected[${idx}].valueSats`),
+      0n
+    );
+    const outputAtomic = totalInAtomic - feeAtomicInput;
+    if (outputAtomic <= 0n) {
       setErr(t("send.errors.amountUnderFee"));
       return null;
     }
-    if (outputSats < DUST_THRESHOLD_SATS) {
+    if (outputAtomic < BigInt(DUST_THRESHOLD_SATS)) {
       setErr(t("send.errors.amountDust"));
       return null;
     }
+    validateAtomicRange(totalInAtomic, "preview.totalInAtomic", BUILDER_SATOSHI_MAX);
+    validateAtomicRange(feeAtomicInput, "preview.feeAtomic", BUILDER_SATOSHI_MAX);
+    validateAtomicRange(outputAtomic, "preview.outputAtomic", BUILDER_SATOSHI_MAX);
 
     const estimatedBytes = estimateP2PKHTxBytes(selected.length, 1);
     if (estimatedBytes > MAX_CONSOLIDATE_TX_BYTES) {
@@ -1208,9 +1286,9 @@ export default function Send() {
     return {
       selected,
       totalCandidates,
-      totalInSats,
-      outputSats,
-      feeSats,
+      totalInAtomic,
+      outputAtomic,
+      feeAtomic: feeAtomicInput,
       estimatedBytes,
       round: nextRound,
       totalRounds,
@@ -1226,48 +1304,114 @@ export default function Send() {
     void releaseConsolidationWakeLock();
   };
 
+  const checkConsolidationProgressOnce = async (
+    spentOutpoints: Set<string>,
+    txid?: string,
+  ) => {
+    if (cancelRequestedRef.current) return { status: "cancelled" as const };
+    if (backgroundPauseRef.current) return { status: "paused" as const };
+
+    await walletStore.fetch();
+    const latest = walletStore.getState().utxos;
+    const remaining = Array.isArray(latest) ? latest.length : 0;
+
+    const existingOutpoints = new Set(
+      latest
+        .filter((u) => !!u.txid && Number.isFinite(Number(u.vout)))
+        .map((u) => toOutpointKey(String(u.txid), Number(u.vout)))
+    );
+    let spentGone = 0;
+    for (const outpoint of spentOutpoints) {
+      if (!existingOutpoints.has(outpoint)) spentGone += 1;
+    }
+    const spentGoneEnough = spentOutpoints.size === 0 || spentGone >= spentOutpoints.size;
+
+    const confirmationFieldAvailable = latest.some((u) => typeof u.confirmations === "number");
+    const txConfirmed = !!txid && latest.some(
+      (u) => u.txid === txid && typeof u.confirmations === "number" && Number(u.confirmations) >= 1
+    );
+    const confirmationSatisfied = !txid || !confirmationFieldAvailable || txConfirmed;
+
+    if (spentGoneEnough && confirmationSatisfied) {
+      return { status: "progress" as const, remaining };
+    }
+    return { status: "pending" as const, remaining };
+  };
+
   const waitForConsolidationProgress = async (
     spentOutpoints: Set<string>,
-    totalBeforeRound: number,
-    selectedCount: number,
+    opts: {
+      txid?: string;
+      maxWaitMs?: number;
+      pollBackoffMs?: number[];
+      singlePass?: boolean;
+    } = {},
   ) => {
     const startedAt = Date.now();
-    const requiredDecrease = Math.max(1, selectedCount - 1);
-    const requiredSpentGone = Math.max(1, selectedCount - 1);
+    const maxWaitMs = opts.maxWaitMs ?? CONSOLIDATION_POLL_MAX_WAIT_MS;
+    const pollBackoffMs = opts.pollBackoffMs ?? CONSOLIDATION_POLL_BACKOFF_MS;
     let pollAttempt = 0;
 
-    while (Date.now() - startedAt < CONSOLIDATION_POLL_MAX_WAIT_MS) {
-      if (cancelRequestedRef.current) return { status: "cancelled" as const };
-      if (backgroundPauseRef.current) return { status: "paused" as const };
-      const waitMs = CONSOLIDATION_POLL_BACKOFF_MS[Math.min(pollAttempt, CONSOLIDATION_POLL_BACKOFF_MS.length - 1)];
-      await sleep(waitMs);
-      if (cancelRequestedRef.current) return { status: "cancelled" as const };
-      if (backgroundPauseRef.current) return { status: "paused" as const };
-
-      await walletStore.fetch();
-      const latest = walletStore.getState().utxos;
-      const remaining = Array.isArray(latest) ? latest.length : 0;
-
-      let spentGone = 0;
-      if (Array.isArray(latest)) {
-        const existingOutpoints = new Set(
-          latest
-            .filter((u) => !!u.txid && Number.isFinite(Number(u.vout)))
-            .map((u) => toOutpointKey(String(u.txid), Number(u.vout)))
-        );
-        for (const outpoint of spentOutpoints) {
-          if (!existingOutpoints.has(outpoint)) spentGone += 1;
-        }
-      }
-
-      const reducedEnough = remaining <= totalBeforeRound - requiredDecrease;
-      const spentGoneEnough = spentGone >= requiredSpentGone;
-      if (reducedEnough || spentGoneEnough) {
-        return { status: "progress" as const, remaining };
-      }
+    while (Date.now() - startedAt < maxWaitMs) {
+      const waitMs = pollBackoffMs[Math.min(pollAttempt, pollBackoffMs.length - 1)] ?? 0;
+      if (waitMs > 0) await sleep(waitMs);
+      const check = await checkConsolidationProgressOnce(spentOutpoints, opts.txid);
+      if (check.status === "cancelled") return { status: "cancelled" as const };
+      if (check.status === "paused") return { status: "paused" as const };
+      if (check.status === "progress") return { status: "progress" as const, remaining: check.remaining };
+      if (opts.singlePass) break;
       pollAttempt += 1;
     }
     return { status: "timeout" as const };
+  };
+
+  const waitForIndexerAvailability = async (
+    spentOutpoints: Set<string>,
+    txid: string | undefined,
+    mode: ConsolidationMode,
+  ) => {
+    setConsolidationPhase("waitingIndexer");
+    setSendStatusNote(t("send.consolidateWaitingIndexer"));
+    console.info("[CONSOLIDATION] Waiting for indexer...");
+    const cooldownMs = randomIntInclusive(
+      CONSOLIDATION_POST_BROADCAST_DELAY_MIN_MS,
+      CONSOLIDATION_POST_BROADCAST_DELAY_MAX_MS
+    );
+    await sleep(cooldownMs);
+    if (cancelRequestedRef.current) return { status: "cancelled" as const };
+    if (backgroundPauseRef.current) return { status: "paused" as const };
+
+    setConsolidationPhase("refreshing");
+    setSendStatusNote(t("send.consolidateRefreshing"));
+    if (mode !== "auto") {
+      return waitForConsolidationProgress(spentOutpoints, { txid });
+    }
+
+    let refresh = await waitForConsolidationProgress(spentOutpoints, {
+      txid,
+      maxWaitMs: CONSOLIDATION_AUTO_RETRY_INTERVAL_MS,
+      pollBackoffMs: [0],
+      singlePass: true,
+    });
+    let retryCount = 0;
+    while (refresh.status === "timeout" && retryCount < CONSOLIDATION_AUTO_MAX_RETRIES) {
+      retryCount += 1;
+      setConsolidationPhase("waitingIndexer");
+      setSendStatusNote(t("send.consolidateWaitingIndexer"));
+      console.info("[CONSOLIDATION] Waiting for indexer...");
+      await sleep(CONSOLIDATION_AUTO_RETRY_INTERVAL_MS);
+      if (cancelRequestedRef.current) return { status: "cancelled" as const };
+      if (backgroundPauseRef.current) return { status: "paused" as const };
+      setConsolidationPhase("refreshing");
+      setSendStatusNote(t("send.consolidateRefreshing"));
+      refresh = await waitForConsolidationProgress(spentOutpoints, {
+        txid,
+        maxWaitMs: CONSOLIDATION_AUTO_RETRY_INTERVAL_MS,
+        pollBackoffMs: [0],
+        singlePass: true,
+      });
+    }
+    return refresh;
   };
 
   const executeConsolidationRound = async (
@@ -1288,6 +1432,8 @@ export default function Send() {
         ? t("send.errors.senderAddressMissing")
         : t("send.errors.senderAddressInvalid"));
     }
+
+    const feeAtomic = assertAtomic(preview.feeAtomic, "consolidate.feeAtomic");
 
     const spentOutpoints = new Set(
       preview.selected
@@ -1334,17 +1480,32 @@ export default function Send() {
       inputs.push({
         txid: u.txid,
         vout: u.vout,
-        value: Number(u.valueSats),
+        value: atomicToString(walletSatsToAtomic(u.valueSats, `consolidate.input:${u.txid}:${u.vout}`)),
         nonWitnessUtxo: hex
       });
     }
 
-    const { rawTx, totalInSats, outputSats } = buildConsolidationTx({
+    const totalInAtomic = inputs.reduce(
+      (sum, input, idx) => sum + assertAtomic(input.value, `consolidate.inputs[${idx}].value`),
+      0n
+    );
+    if (totalInAtomic <= feeAtomic) {
+      throw new Error(t("send.errors.amountUnderFee"));
+    }
+    const outputAtomic = totalInAtomic - feeAtomic;
+    const builderOutput = toBuilderAtomicString(outputAtomic, "consolidate.amountAtomic");
+    const builderFee = toBuilderAtomicString(feeAtomic, "consolidate.feeAtomic");
+    const logOutputs = [{ address: sendFrom, value: builderOutput }];
+    console.info(
+      `[TXBUILD] mode=consolidate round=${preview.round} ${describeOutputShape(logOutputs)} fee=${typeof feeAtomic} change=${typeof 0n} total=${typeof totalInAtomic} utxos=${preview.selected.length}`
+    );
+
+    const { rawTx, totalInAtomic: totalInBuiltAtomic, outputAtomic: outputBuiltAtomic } = buildConsolidationTx({
       network: PEPEPOW,
       inputs,
       wif,
       address: sendFrom,
-      feeSats: preview.feeSats
+      feeSats: builderFee
     });
     if (!rawTx) throw new Error(t("send.errors.txBuildMissingOutput"));
     if (typeof rawTx !== "string" || rawTx.length < 20) {
@@ -1360,8 +1521,9 @@ export default function Send() {
       rawTxHash16,
       localTxid,
       inputCount: preview.selected.length,
-      totalInSats,
-      outputSats
+      totalInAtomic: totalInBuiltAtomic.toString(),
+      outputAtomic: outputBuiltAtomic.toString(),
+      feeAtomic: builderFee,
     });
 
     setConsolidationPhase("broadcasting");
@@ -1387,6 +1549,7 @@ export default function Send() {
         lastTxid: txidToShow || prev?.lastTxid,
         requestId: prev?.requestId,
       }));
+      console.info(`[CONSOLIDATION] Broadcast success txid=${txidToShow || "unknown"}`);
       return { txid: txidToShow || undefined, spentOutpoints };
     }
 
@@ -1414,8 +1577,9 @@ export default function Send() {
       lastTxid: txidString || undefined,
       requestId,
     });
+    console.info(`[CONSOLIDATION] Broadcast success txid=${txidString || "unknown"}`);
 
-    const spendSats = preview.feeSats;
+    const spendSats = Number(preview.feeAtomic);
     const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
     if (!alreadyPending && Number.isFinite(spendSats) && spendSats > 0) {
       walletStore.applyOptimistic(spendSats);
@@ -1437,6 +1601,7 @@ export default function Send() {
     if (consolidating || sending || consolidateInFlightRef.current) return;
     if (hitConsolidationDebounce()) return;
     setErr(null);
+    setRawInternalError(null);
     setRawTxRetryContext(null);
     setSendStatusNote(null);
     setConsolidationProgress(null);
@@ -1476,6 +1641,7 @@ export default function Send() {
     setConsolidating(true);
     setConsolidateOpen(false);
     setErr(null);
+    setRawInternalError(null);
     setRawTxRetryContext(null);
     setResult(null);
     setLastTxid(null);
@@ -1503,16 +1669,7 @@ export default function Send() {
         total: preview.totalRounds,
         remaining: preview.remainingAfterRound
       }));
-      setConsolidationPhase("waiting");
-      await sleep(CONSOLIDATION_PROPAGATION_DELAY_MS);
-      if (cancelRequestedRef.current) {
-        setConsolidationPhase("cancelled");
-        setSendStatusNote(t("send.consolidateCancelled"));
-        return;
-      }
-      setConsolidationPhase("refreshing");
-      setSendStatusNote(t("send.consolidateRefreshing"));
-      const refresh = await waitForConsolidationProgress(roundResult.spentOutpoints, preview.totalCandidates, preview.selected.length);
+      const refresh = await waitForIndexerAvailability(roundResult.spentOutpoints, roundResult.txid, "manual");
       if (refresh.status === "cancelled") {
         setConsolidationPhase("cancelled");
         setSendStatusNote(t("send.consolidateCancelled"));
@@ -1527,11 +1684,11 @@ export default function Send() {
       }
       if (refresh.status === "timeout") {
         setConsolidationPhase("paused");
-        setErr(t("send.consolidatePausedSlow"));
-        setSendStatusNote(t("send.consolidatePausedSlow"));
+        setSendStatusNote(t("send.consolidateWaitingIndexer"));
         setShowResumeConsolidation(true);
         return;
       }
+      console.info("[CONSOLIDATION] UTXO refreshed, proceeding to next round");
       const isDone = refresh.remaining <= MAX_CONSOLIDATE_INPUTS;
       setConsolidationProgress((prev) => (prev
         ? { ...prev, remaining: refresh.remaining, phase: isDone ? "done" : "idle" }
@@ -1553,6 +1710,15 @@ export default function Send() {
       const message = e instanceof TxApiError
         ? mapBroadcastError(e.detail) || e.detail || t("send.errors.broadcastFailed")
         : String(e?.message || e || t("send.errors.broadcastFailed"));
+      if (isTypeforceLikeError(messageText)) {
+        setRawInternalError(reportTxBuildError({
+          label: "consolidate.manual.round",
+          err: e,
+          round: preview.round,
+          utxoCount: preview.selected.length,
+          raw: messageText,
+        }));
+      }
       setErr(applyConsolidationFailureHint(message));
       setConsolidationPhase("error");
     } finally {
@@ -1577,6 +1743,7 @@ export default function Send() {
     setConsolidating(true);
     setConsolidateOpen(false);
     setErr(null);
+    setRawInternalError(null);
     setRawTxRetryContext(null);
     setResult(null);
     setLastTxid(null);
@@ -1633,25 +1800,7 @@ export default function Send() {
           break;
         }
 
-        setConsolidationPhase("waiting");
-        setSendStatusNote(t("send.consolidateWaitingPropagation"));
-        await sleep(CONSOLIDATION_PROPAGATION_DELAY_MS);
-        if (cancelRequestedRef.current) {
-          setConsolidationPhase("cancelled");
-          setSendStatusNote(t("send.consolidateCancelled"));
-          clearConsolidationSession();
-          break;
-        }
-        if (backgroundPauseRef.current) {
-          setConsolidationPhase("paused");
-          setSendStatusNote(t("send.consolidatePausedBackground"));
-          setShowResumeConsolidation(true);
-          break;
-        }
-
-        setConsolidationPhase("refreshing");
-        setSendStatusNote(t("send.consolidateRefreshing"));
-        const refresh = await waitForConsolidationProgress(roundResult.spentOutpoints, preview.totalCandidates, preview.selected.length);
+        const refresh = await waitForIndexerAvailability(roundResult.spentOutpoints, roundResult.txid, "auto");
         if (refresh.status === "cancelled") {
           setConsolidationPhase("cancelled");
           setSendStatusNote(t("send.consolidateCancelled"));
@@ -1666,12 +1815,13 @@ export default function Send() {
         }
         if (refresh.status === "timeout") {
           setConsolidationPhase("paused");
-          setErr(t("send.consolidatePausedSlow"));
-          setSendStatusNote(t("send.consolidatePausedSlow"));
+          setErr(t("send.consolidateRetryFailed"));
+          setSendStatusNote(t("send.consolidatePausedManual"));
           setShowResumeConsolidation(true);
           break;
         }
 
+        console.info("[CONSOLIDATION] UTXO refreshed, proceeding to next round");
         setConsolidationProgress((prev) => (prev ? { ...prev, remaining: refresh.remaining } : prev));
         if (refresh.remaining <= MAX_CONSOLIDATE_INPUTS) {
           setConsolidationPhase("done");
@@ -1705,6 +1855,15 @@ export default function Send() {
       const message = e instanceof TxApiError
         ? mapBroadcastError(e.detail) || e.detail || t("send.errors.broadcastFailed")
         : String(e?.message || e || t("send.errors.broadcastFailed"));
+      if (isTypeforceLikeError(messageText)) {
+        setRawInternalError(reportTxBuildError({
+          label: "consolidate.auto.round",
+          err: e,
+          round: preview?.round,
+          utxoCount: preview?.selected.length,
+          raw: messageText,
+        }));
+      }
       setErr(applyConsolidationFailureHint(message));
       setConsolidationPhase(cancelRequestedRef.current ? "cancelled" : "error");
       if (cancelRequestedRef.current) {
@@ -1721,6 +1880,8 @@ export default function Send() {
   };
 
   const doConsolidate = async () => {
+    const state = consolidationProgress?.phase ?? "idle";
+    if (state !== "idle") return;
     if (consolidationMode === "auto") {
       await startAutoConsolidation();
       return;
@@ -1734,6 +1895,7 @@ export default function Send() {
     const saved = savedProgress ?? loadConsolidationProgress();
     if (!saved) return;
     setErr(null);
+    setRawInternalError(null);
     setRawTxRetryContext(null);
     setConsolidationCancel(false);
     setConsolidationMode(saved.mode);
@@ -1766,7 +1928,21 @@ export default function Send() {
       }
       await startManualConsolidationRound(preview, { skipDebounce: true });
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      const rawMessage = String(e?.message || e);
+      const mapped = mapBroadcastError(rawMessage);
+      if (mapped) {
+        setErr(mapped);
+        if (isTypeforceLikeError(rawMessage)) {
+          setRawInternalError(reportTxBuildError({
+            label: "consolidate.resume",
+            err: e,
+            round: saved.roundDone + 1,
+            raw: rawMessage,
+          }));
+        }
+      } else {
+        setErr(rawMessage);
+      }
       setConsolidationPhase("error");
     }
   };
@@ -1776,6 +1952,7 @@ export default function Send() {
     if (hitConsolidationDebounce()) return;
     if (!consolidationProgress || consolidationProgress.remaining <= MAX_CONSOLIDATE_INPUTS) return;
     setErr(null);
+    setRawInternalError(null);
     setRawTxRetryContext(null);
     setConsolidationCancel(false);
     setShowResumeConsolidation(false);
@@ -1795,7 +1972,21 @@ export default function Send() {
       setConsolidateOpen(true);
       setConsolidationPhase("idle");
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      const rawMessage = String(e?.message || e);
+      const mapped = mapBroadcastError(rawMessage);
+      if (mapped) {
+        setErr(mapped);
+        if (isTypeforceLikeError(rawMessage)) {
+          setRawInternalError(reportTxBuildError({
+            label: "consolidate.continue",
+            err: e,
+            round: (consolidationProgress?.currentRound || 0) + 1,
+            raw: rawMessage,
+          }));
+        }
+      } else {
+        setErr(rawMessage);
+      }
       setConsolidationPhase("error");
     }
   };
@@ -1805,6 +1996,7 @@ export default function Send() {
   };
 
   async function doSend() {
+    let sendBuildUtxoCount = 0;
     if (sendLocked) {
       setSendStatusNote(t("send.alreadyBroadcast"));
       return;
@@ -1815,6 +2007,7 @@ export default function Send() {
       setSendAttempted(true);
       setSending(true);
       setErr(null);
+      setRawInternalError(null);
       setRawTxRetryContext(null);
       setConsolidationProgress(null);
       setResult(null);
@@ -1850,32 +2043,39 @@ export default function Send() {
         setErr(t("send.errors.mnemonicMissing"));
         return;
       }
-      const amountSats = parseCoinToSats(amount);
-      if (amountSats === null) {
+      const amountAtomic = parseCoinToAtomic(amount);
+      if (amountAtomic === null) {
         setErr(t("send.errors.amountInvalid"));
         return;
       }
-      const feeSats = parseCoinToSats(fee);
-      if (feeSats === null || feeSats < 0) {
+      const feeAtomic = parseCoinToAtomic(fee);
+      if (feeAtomic === null) {
         setErr(t("send.errors.feeInvalid"));
         return;
       }
-      const recipientSats = subtractFee ? amountSats - feeSats : amountSats;
-      if (recipientSats <= 0) {
+      const amountSatsBigInt = amountAtomic;
+      const feeSatsBigInt = feeAtomic;
+      if (feeSatsBigInt < 0n) {
+        setErr(t("send.errors.feeInvalid"));
+        return;
+      }
+
+      const recipientSatsBigInt = subtractFee ? amountSatsBigInt - feeSatsBigInt : amountSatsBigInt;
+      if (recipientSatsBigInt <= 0n) {
         setErr(t("send.errors.amountUnderFee"));
         return;
       }
-      if (recipientSats < DUST_THRESHOLD_SATS) {
+      if (recipientSatsBigInt < BigInt(DUST_THRESHOLD_SATS)) {
         setErr(t("send.errors.amountDust"));
         return;
       }
-      if (recipientSats < MIN_SEND_SATS) {
+      if (recipientSatsBigInt < BigInt(MIN_SEND_SATS)) {
         setErr(t("send.errors.amountTooLow", { min: 1 }));
         return;
       }
-      const totalSats = subtractFee ? amountSats : amountSats + feeSats;
+      const totalSatsBigInt = subtractFee ? amountSatsBigInt : amountSatsBigInt + feeSatsBigInt;
+      validateAtomicRange(totalSatsBigInt, "send.totalAtomic", BUILDER_SATOSHI_MAX);
       const usableUtxos = walletStore.getState().utxos;
-      const availSatsRaw = usableUtxos.reduce((sum, u) => sum + Number(u.valueSats || 0), 0);
       const sendTo = normalizeAddressInput(to);
       const sendFrom = normalizeAddressInput(address);
       if (!sendTo) {
@@ -1903,16 +2103,25 @@ export default function Send() {
         return;
       }
       const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
-      const target = totalSats;
-      const chosen = usableUtxos.map(u => ({
+      const chosen = usableUtxos.map((u, idx) => ({
         txid: u.txid,
         vout: u.vout,
-        value: Number(u.valueSats),
-        amount: Number(u.valueSats),
+        valueAtomic: walletSatsToAtomic(u.valueSats, `send.utxos[${idx}].valueSats`),
         scriptPubKey: u.scriptHex
       }));
-      const { picked, total } = selectUtxos(chosen as any, target);
-      if (!picked?.length) {
+      const sortedChosen = [...chosen].sort((a, b) => {
+        if (a.valueAtomic > b.valueAtomic) return -1;
+        if (a.valueAtomic < b.valueAtomic) return 1;
+        return 0;
+      });
+      const picked: typeof sortedChosen = [];
+      let totalInAtomic = 0n;
+      for (const candidate of sortedChosen) {
+        picked.push(candidate);
+        totalInAtomic += candidate.valueAtomic;
+        if (totalInAtomic >= totalSatsBigInt) break;
+      }
+      if (!picked.length || totalInAtomic < totalSatsBigInt) {
         setErr(t("send.errors.insufficientUtxo"));
         return;
       }
@@ -1920,17 +2129,25 @@ export default function Send() {
         setErr(t("send.errors.sendTooManyInputs", { count: picked.length, max: MAX_SEND_INPUTS }));
         return;
       }
-      const totalIn = Number(total);
-      let changeSats = totalIn - recipientSats - feeSats;
-      if (changeSats < 0) {
+      sendBuildUtxoCount = picked.length;
+      validateAtomicRange(totalInAtomic, "send.totalInAtomic", BUILDER_SATOSHI_MAX);
+
+      let changeSatsBigInt = totalInAtomic - recipientSatsBigInt - feeSatsBigInt;
+      if (changeSatsBigInt < 0n) {
         setErr(t("send.errors.insufficientBalance"));
         return;
       }
-      let effectiveFeeSats = feeSats;
-      if (changeSats > 0 && changeSats < DUST_THRESHOLD_SATS) {
-        effectiveFeeSats += changeSats;
-        changeSats = 0;
+      let effectiveFeeSatsBigInt = feeSatsBigInt;
+      if (changeSatsBigInt > 0n && changeSatsBigInt < BigInt(DUST_THRESHOLD_SATS)) {
+        effectiveFeeSatsBigInt += changeSatsBigInt;
+        changeSatsBigInt = 0n;
       }
+      validateAtomicRange(recipientSatsBigInt, "send.recipientAtomic", BUILDER_SATOSHI_MAX);
+      validateAtomicRange(effectiveFeeSatsBigInt, "send.effectiveFeeAtomic", BUILDER_SATOSHI_MAX);
+      validateAtomicRange(changeSatsBigInt, "send.changeAtomic", BUILDER_SATOSHI_MAX);
+      const recipientSatsAtomic = toBuilderAtomicString(recipientSatsBigInt, "send.recipientAtomic");
+      const effectiveFeeAtomic = toBuilderAtomicString(effectiveFeeSatsBigInt, "send.effectiveFeeAtomic");
+      const changeSatsAtomic = toBuilderAtomicString(changeSatsBigInt, "send.changeAtomic");
       let toScriptHex = "";
       let toScriptLen = 0;
       try {
@@ -1941,21 +2158,16 @@ export default function Send() {
         console.warn("[send] toScript failed", { error: e?.message || String(e), toAddress: sendTo });
       }
 
+      const sendFeeAtomic = toBuilderAtomicString(feeSatsBigInt, "send.feeAtomic");
       console.info("[SEND_ASSERT]", {
         fromAddress: sendFrom,
         toAddress: sendTo,
-        recipientSats,
-        feeSats,
-        effectiveFeeSats,
-        totalInSats: totalIn,
-        changeSats,
+        recipientAtomic: recipientSatsAtomic,
+        feeAtomic: sendFeeAtomic,
+        effectiveFeeAtomic,
+        totalInAtomic: totalInAtomic.toString(),
+        changeAtomic: changeSatsAtomic,
         utxoCount: picked.length,
-        utxos: picked.map(u => ({
-          txid: u.txid,
-          vout: u.vout,
-          value: u.value,
-          scriptHex: u.scriptPubKey || (u as any).scriptHex || "MISSING"
-        }))
       });
 
       // nonWitnessUtxo is required for each selected input; fetches are independent and can be parallelized.
@@ -1987,7 +2199,7 @@ export default function Send() {
       for (const u of picked) {
         // buildAndSignP2PKH requires nonWitnessUtxo (full raw tx) as hex string
         // We must fetch the raw transaction for each UTXO
-        if (!u.txid || u.vout === undefined || (!u.amount && !u.value)) {
+        if (!u.txid || u.vout === undefined || u.valueAtomic === undefined) {
           console.error("[SEND_ASSERT] Invalid UTXO structure", u);
           throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
         }
@@ -2000,7 +2212,7 @@ export default function Send() {
         inputs.push({
           txid: u.txid,
           vout: u.vout,
-          value: Number(u.amount || u.value),
+          value: toBuilderAtomicString(u.valueAtomic, `send.input:${u.txid}:${u.vout}`),
           nonWitnessUtxo: hex  // hex string, not Buffer
         });
       }
@@ -2023,14 +2235,22 @@ export default function Send() {
         inspect("change", sendFrom);
       }
 
+      const outputsForLog = [{ address: sendTo, value: recipientSatsAtomic }];
+      if (changeSatsBigInt > 0n) {
+        outputsForLog.push({ address: sendFrom, value: changeSatsAtomic });
+      }
+      console.info(
+        `[TXBUILD] mode=send round=0 ${describeOutputShape(outputsForLog)} fee=${typeof effectiveFeeSatsBigInt} change=${typeof changeSatsBigInt} total=${typeof totalInAtomic} utxos=${picked.length}`
+      );
+
       const raw = buildAndSignP2PKH({
         network: PEPEPOW,
         utxos: inputs as any,
         wif,
         to: sendTo,
-        amount: recipientSats,
+        amount: recipientSatsAtomic,
         changeAddress: sendFrom,
-        fee: effectiveFeeSats
+        fee: effectiveFeeAtomic
       });
 
       if (!raw) {
@@ -2099,7 +2319,8 @@ export default function Send() {
           });
         }
         addRecentRecipient(sendTo);
-        const spendSats = recipientSats + effectiveFeeSats;
+        const spendSatsAtomic = recipientSatsBigInt + effectiveFeeSatsBigInt;
+        const spendSats = Number(spendSatsAtomic);
         const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
 
         if (alreadyPending) {
@@ -2109,15 +2330,15 @@ export default function Send() {
         if (debugEnabled) {
           console.log("[Send] TX Success Debug:", {
             oldSpendableSats: availableSats,
-            sendAmountSats: recipientSats,
-            feeSats: effectiveFeeSats,
+            sendAmountSats: Number(recipientSatsBigInt),
+            feeSats: Number(effectiveFeeSatsBigInt),
             optimisticDeltaSats: spendSats,
             newSpendableSatsOptimistic: availableSats - spendSats,
             lastBroadcastTxid: txid
           });
         }
 
-        if (!alreadyPending && Number.isFinite(spendSats) && spendSats > 0) {
+        if (!alreadyPending && spendSatsAtomic > 0n && Number.isFinite(spendSats) && spendSats > 0) {
           walletStore.applyOptimistic(spendSats);
           recordPendingSpend({
             address: sendFrom,
@@ -2140,6 +2361,15 @@ export default function Send() {
           const mapped = mapBroadcastError(e.detail);
           if (mapped) {
             setErr(mapped);
+            if (isTypeforceLikeError(e.detail)) {
+              setRawInternalError(reportTxBuildError({
+                label: "send.broadcast",
+                err: e,
+                round: 0,
+                utxoCount: sendBuildUtxoCount,
+                raw: e.detail || "",
+              }));
+            }
           } else if (e.detail) {
             setErr(e.detail);
           } else {
@@ -2151,7 +2381,22 @@ export default function Send() {
         return;
       }
     } catch (e: any) {
-      setErr(String(e.message || e));
+      const rawMessage = String(e?.message || e);
+      const mapped = mapBroadcastError(rawMessage);
+      if (mapped) {
+        setErr(mapped);
+        if (isTypeforceLikeError(rawMessage)) {
+          setRawInternalError(reportTxBuildError({
+            label: "send.build",
+            err: e,
+            round: 0,
+            utxoCount: sendBuildUtxoCount,
+            raw: rawMessage,
+          }));
+        }
+      } else {
+        setErr(rawMessage);
+      }
     } finally {
       sendInFlightRef.current = false;
       setSending(false);
@@ -2161,6 +2406,7 @@ export default function Send() {
   const retryFailedRawTxOnly = () => {
     if (!rawTxRetryContext) return;
     setErr(null);
+    setRawInternalError(null);
     if (rawTxRetryContext.mode === "send") {
       void doSend();
       return;
@@ -2170,6 +2416,17 @@ export default function Send() {
   const consolidationPhaseLabel = consolidationProgress
     ? t(`send.consolidatePhase.${consolidationProgress.phase}`)
     : t("send.consolidatePhase.idle");
+  const consolidationProgressPercent = consolidationProgress
+    ? Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round(
+          (consolidationProgress.currentRound / Math.max(consolidationProgress.totalRounds, 1)) * 100
+        )
+      )
+    )
+    : 0;
   const canContinueConsolidation = !!consolidationProgress
     && consolidationProgress.remaining > MAX_CONSOLIDATE_INPUTS
     && !consolidationBusy
@@ -2326,6 +2583,20 @@ export default function Send() {
           {overBalance && <div className="error" style={{ marginTop: 8 }}>{t("send.errors.insufficientBalance")}</div>}
         </div>
 
+        {walletState.utxos.length > UTXO_WARNING_THRESHOLD && (
+          <div className="card warning-banner">
+            <div className="section-title">{t("send.utxoWarningTitle")}</div>
+            <div style={{ marginTop: 6 }}>
+              {t("send.utxoWarningBody", { count: walletState.utxos.length })}
+            </div>
+            <div className="row" style={{ marginTop: 10 }}>
+              <button className="btn secondary" onClick={scrollToUtilities}>
+                {t("send.utxoWarningAction")}
+              </button>
+            </div>
+          </div>
+        )}
+
         {showResumeConsolidation && savedProgress && !consolidationBusy && (
           <div className="card">
             <div className="row" style={{ justifyContent: "space-between" }}>
@@ -2350,13 +2621,11 @@ export default function Send() {
           </div>
         )}
 
-        <div className="card">
+        <div className="card" id="send-utilities">
           <div className="row" style={{ justifyContent: "space-between" }}>
             <div>
               <div className="section-title">{t("send.utilitiesTitle")}</div>
               <div className="muted" style={{ marginTop: 6 }}>{t("send.consolidateHint")}</div>
-              <div className="muted" style={{ marginTop: 6 }}>{t("send.consolidateWarningMultiRound")}</div>
-              <div className="muted" style={{ marginTop: 4 }}>{t("send.consolidateWarningNoRepeat")}</div>
               {wakeLockUnsupportedHint && (
                 <div className="muted" style={{ marginTop: 6 }}>
                   {t("send.keepScreenAwake")}: {t("send.screenLockUnsupported")}
@@ -2400,6 +2669,12 @@ export default function Send() {
         </div>
 
         {err && <div className="error" style={{ marginTop: 12 }}>{err}</div>}
+        {debugEnabled && rawInternalError && (
+          <details className="details" style={{ marginTop: 8 }}>
+            <summary>Debug raw error</summary>
+            <pre style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{rawInternalError}</pre>
+          </details>
+        )}
         {err && rawTxRetryContext && (
           <div className="row" style={{ marginTop: 8, alignItems: "center", gap: 8 }}>
             <button
@@ -2423,14 +2698,44 @@ export default function Send() {
             <div>✅ {t("send.broadcasted")}: <code>{result}</code></div>
             {sendStatusNote && <div className="muted" style={{ marginTop: 6 }}>{sendStatusNote}</div>}
             {consolidationProgress && (
-              <div className="muted" style={{ marginTop: 6 }}>
-                {t("send.consolidateRoundProgress", {
-                  round: consolidationProgress.currentRound,
-                  total: consolidationProgress.totalRounds,
-                  remaining: consolidationProgress.remaining
-                })}
-                {consolidationProgress.requestId ? ` | request-id: ${consolidationProgress.requestId}` : ""}
-              </div>
+              <>
+                <div className="muted" style={{ marginTop: 6 }}>
+                  {t("send.consolidationProgressLabel", {
+                    round: consolidationProgress.currentRound,
+                    total: consolidationProgress.totalRounds
+                  })}
+                </div>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  {t("send.consolidationRemainingLabel", { remaining: consolidationProgress.remaining })}
+                </div>
+                <div
+                  style={{
+                    marginTop: 6,
+                    height: 6,
+                    width: "100%",
+                    borderRadius: 999,
+                    background: "rgba(0,0,0,0.12)",
+                    overflow: "hidden"
+                  }}
+                >
+                  <div
+                    style={{
+                      height: "100%",
+                      width: `${consolidationProgressPercent}%`,
+                      background: "var(--ok, #2e9f5b)",
+                      transition: "width 220ms ease"
+                    }}
+                  />
+                </div>
+                <div className="muted" style={{ marginTop: 6 }}>
+                  {t("send.consolidateRoundProgress", {
+                    round: consolidationProgress.currentRound,
+                    total: consolidationProgress.totalRounds,
+                    remaining: consolidationProgress.remaining
+                  })}
+                  {consolidationProgress.requestId ? ` | request-id: ${consolidationProgress.requestId}` : ""}
+                </div>
+              </>
             )}
             {consolidationProgress && (
               <div className="muted" style={{ marginTop: 6 }}>
@@ -2499,7 +2804,7 @@ export default function Send() {
             <div className="section-title">{t("send.consolidateConfirmTitle")}</div>
             <div className="note" style={{ marginTop: 12 }}>
               <div>{t("send.consolidateConfirmCount", { count: consolidatePreview.selected.length })}</div>
-              <div>{t("send.consolidateConfirmFee")}: {fmtPEPEWFromSats(consolidatePreview.feeSats)}</div>
+              <div>{t("send.consolidateConfirmFee")}: {fmtPEPEWFromSats(consolidatePreview.feeAtomic)}</div>
               <div>{t("send.consolidateRoundProgress", {
                 round: consolidatePreview.round,
                 total: consolidatePreview.totalRounds,

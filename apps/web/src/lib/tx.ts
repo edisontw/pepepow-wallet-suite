@@ -112,19 +112,6 @@ export async function fetchRawTxBatchApi(txids: string[]): Promise<RawTxBatchRes
   };
 }
 
-export async function fetchTxInfo(txid: string): Promise<any> {
-  const r = await apiFetch(API_ENDPOINTS.v1.txInfo(txid));
-  const payload = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const detail = typeof payload?.error === "string" ? payload.error : undefined;
-    const code = typeof payload?.code === "string" ? payload.code : undefined;
-    const requestId = r.headers.get("x-request-id")
-      || (typeof payload?.requestId === "string" ? payload.requestId : undefined);
-    throw new TxApiError(`fetchTxInfo failed: ${r.status}`, r.status, detail, { code, requestId, txid });
-  }
-  return payload;
-}
-
 export async function broadcastTx(rawTx: string): Promise<any> {
   const r = await apiFetch(API_ENDPOINTS.wallet.txBroadcast, {
     method: "POST",

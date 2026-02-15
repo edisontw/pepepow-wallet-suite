@@ -45,7 +45,6 @@
 | POST | `/v1/requests/:id/claim` | Claim payment request and set default address | Yes |
 | GET | `/v1/requests/:id` | Get payment request status | Yes |
 | POST | `/v1/history` | Batch history proxy (addresses[]) | No |
-| GET | `/v1/tx/:txid` | Raw tx lookup (proxy + RPC fallback) | No |
 | GET | `/v1/price` | PEPEW price (CoinMarketCap) | No |
 
 ## /wallet and /api Endpoints (Read/Broadcast)
@@ -66,10 +65,10 @@
 | POST | `/wallet/tx/send` | Alias of `/wallet/tx/broadcast` | No |
 | POST | `/api/tx/send` | Legacy alias of `/wallet/tx/broadcast` | No |
 | GET | `/wallet/tx/raw` | Raw tx lookup (proxy + RPC fallback) | No |
+| GET | `/v1/tx/raw/:txid` | Raw tx lookup (v1 path compatibility) | No |
 | POST | `/wallet/tx/raw/batch` | Batch raw tx lookup (cache + proxy/RPC fallback) | No |
 | GET | `/api/tx/raw` | Alias of `/wallet/tx/raw` | No |
 | POST | `/api/tx/raw/batch` | Alias of `/wallet/tx/raw/batch` | No |
-| GET | `/wallet/tx/:txid` | Alias of `/v1/tx/:txid` | No |
 | GET | `/wallet/price` | Alias of `/v1/price` | No |
 | GET | `/api/price` | Alias of `/v1/price` | No |
 | POST | `/api/paylink/create` | Create JWT-signed payment link | No |

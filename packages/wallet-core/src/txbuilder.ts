@@ -6,7 +6,43 @@ import { PepepowNetwork } from "./network";
 bitcoin.initEccLib(secp);
 const ECPair = ECPairFactory(secp);
 
-export type UTXO = { txid: string; vout: number; value: number; nonWitnessUtxo: string };
+const SATOSHI_MAX = 21n * 10n ** 14n;
+
+type AtomicLike = string | number | bigint;
+
+export type UTXO = { txid: string; vout: number; value: AtomicLike; nonWitnessUtxo: string };
+
+function normalizeAtomic(value: AtomicLike, label: string) {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || !Number.isInteger(value) || !Number.isSafeInteger(value)) {
+      throw new Error(`Invalid ${label}: non-integer or unsafe number`);
+    }
+    return value.toString();
+  }
+
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid ${label}: expected decimal integer string`);
+  }
+  return trimmed.replace(/^0+(?=\d)/, "") || "0";
+}
+
+function toSafeSatoshiNumber(value: AtomicLike, label: string) {
+  const normalized = normalizeAtomic(value, label);
+  const satoshi = BigInt(normalized);
+
+  if (satoshi < 0n) {
+    throw new Error(`Invalid ${label}: negative value`);
+  }
+  if (satoshi > SATOSHI_MAX) {
+    throw new Error(`Invalid ${label}: exceeds max satoshi range`);
+  }
+  if (satoshi > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`Invalid ${label}: exceeds safe integer range`);
+  }
+  return Number(satoshi);
+}
 
 export function toBitcoinNetwork(n: PepepowNetwork): bitcoin.Network {
   return {
@@ -21,11 +57,12 @@ export function toBitcoinNetwork(n: PepepowNetwork): bitcoin.Network {
 
 export function selectUtxos(utxos: UTXO[], target: number) {
   // simple largest-first
-  const sorted = [...utxos].sort((a,b)=>b.value - a.value);
+  const sorted = [...utxos].sort((a, b) => toSafeSatoshiNumber(b.value, "utxo.value") - toSafeSatoshiNumber(a.value, "utxo.value"));
   const picked: UTXO[] = [];
   let sum = 0;
   for (const u of sorted) {
-    picked.push(u); sum += u.value;
+    picked.push(u);
+    sum += toSafeSatoshiNumber(u.value, "utxo.value");
     if (sum >= target) break;
   }
   if (sum < target) throw new Error("insufficient funds");
@@ -37,9 +74,9 @@ export function buildAndSignP2PKH(params: {
   utxos: UTXO[];
   wif: string;
   to: string;
-  amount: number;  // satoshis
+  amount: AtomicLike;  // satoshis
   changeAddress: string;
-  fee: number;     // satoshis
+  fee: AtomicLike;     // satoshis
 }) {
   const { network, utxos, wif, to, amount, changeAddress, fee } = params;
   const net = toBitcoinNetwork(network);
@@ -53,11 +90,14 @@ export function buildAndSignP2PKH(params: {
       index: u.vout,
       nonWitnessUtxo: Buffer.from(u.nonWitnessUtxo, 'hex')
     });
-    totalIn += u.value;
+    totalIn += toSafeSatoshiNumber(u.value, "utxo.value");
   });
 
-  psbt.addOutput({ address: to, value: amount });
-  const change = totalIn - amount - fee;
+  const amountSats = toSafeSatoshiNumber(amount, "amount");
+  const feeSats = toSafeSatoshiNumber(fee, "fee");
+
+  psbt.addOutput({ address: to, value: amountSats });
+  const change = totalIn - amountSats - feeSats;
   if (change < 0) throw new Error("Insufficient funds including fee");
   if (change > 0) psbt.addOutput({ address: changeAddress, value: change });
 

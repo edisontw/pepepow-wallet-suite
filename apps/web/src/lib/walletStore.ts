@@ -6,6 +6,7 @@ export interface Utxo {
     vout: number;
     valueSats: number;
     scriptHex: string;
+    confirmations?: number;
     invalid?: boolean;
 }
 
@@ -185,12 +186,15 @@ class WalletStore {
                 const txid = u.txid || u.txId || u.tx;
                 const vout = u.vout ?? u.n ?? u.outputIndex ?? u.output_index;
                 const valueSats = u.satoshis ?? u.amount ?? u.value ?? 0;
+                const confirmationsRaw = u.confirmations ?? u.confirmation ?? u.confirmed ?? u.confirm;
+                const confirmations = Number(confirmationsRaw);
 
                 const utxo: Utxo = {
                     txid: String(txid || ""),
                     vout: Number(vout),
                     valueSats: Math.round(Number(valueSats)),
                     scriptHex: scriptHex,
+                    confirmations: Number.isFinite(confirmations) ? confirmations : undefined,
                 };
 
                 if (!utxo.txid || !Number.isFinite(utxo.vout) || !Number.isFinite(utxo.valueSats) || !utxo.scriptHex) {

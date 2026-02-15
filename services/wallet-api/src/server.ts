@@ -2532,7 +2532,6 @@ async function handleRawTx(req: express.Request, res: express.Response) {
 
 app.get("/wallet/tx/raw", ...readLimiters, handleRawTx);
 app.get("/api/tx/raw", ...readLimiters, handleRawTx);
-app.get("/v1/tx/:txid", ...readLimiters, handleRawTx);
-app.get("/wallet/tx/:txid", ...readLimiters, handleRawTx);
+app.get("/v1/tx/raw/:txid", ...readLimiters, handleRawTx);
 app.post("/wallet/tx/raw/batch", ...readLimiters, handleRawTxBatch);
 app.post("/api/tx/raw/batch", ...readLimiters, handleRawTxBatch);

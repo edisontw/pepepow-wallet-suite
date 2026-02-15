@@ -64,6 +64,8 @@ if (missingEnv.length > 0) {
 }
 
 const BOT_TOKEN = process.env.TRADE_BOT_TOKEN!;
+const CALLBACK_DEDUPE_TTL_MS = 60_000;
+const recentCallbackMap = new Map<string, number>();
 
 // Log masked token
 const maskToken = (t: string) => (t.length > 10 ? `${t.substring(0, 4)}...${t.substring(t.length - 4)}` : "***");
@@ -73,6 +75,21 @@ console.log(`[trade-bot] TRADE_BOT_TOKEN=${maskToken(BOT_TOKEN)}`);
 const bot = new Bot(BOT_TOKEN);
 
 console.log(`[trade-bot] TRADE_API_BASE=${getApiBase()}`);
+console.log(`[trade-bot] startup pid=${process.pid} startedAt=${new Date().toISOString()} mode=polling dedupeTtlMs=${CALLBACK_DEDUPE_TTL_MS}`);
+
+function cleanupCallbackDedup(now: number) {
+    for (const [key, ts] of recentCallbackMap.entries()) {
+        if (now - ts > CALLBACK_DEDUPE_TTL_MS) {
+            recentCallbackMap.delete(key);
+        }
+    }
+}
+
+function callbackDedupKey(callbackId: string, updateId: string, userId: string, data: string) {
+    if (callbackId) return `cb:${callbackId}`;
+    if (updateId) return `upd:${updateId}`;
+    return `fallback:${userId}:${data}`;
+}
 
 // Register commands
 bot.command("start", handleStart);
@@ -109,6 +126,20 @@ bot.command("keys_clear", handleKeysClear);
 bot.on("callback_query:data", async (ctx) => {
     const raw = ctx.callbackQuery?.data || "";
     const uid = String(ctx.from?.id || ctx.callbackQuery?.from?.id || "");
+    const callbackId = String(ctx.callbackQuery?.id || "");
+    const updateIdRaw = (ctx.update as any)?.update_id;
+    const updateId = updateIdRaw !== undefined && updateIdRaw !== null ? String(updateIdRaw) : "";
+    const dedupeKey = callbackDedupKey(callbackId, updateId, uid || "unknown", raw || "n/a");
+    const now = Date.now();
+    cleanupCallbackDedup(now);
+    const seenAt = recentCallbackMap.get(dedupeKey);
+    if (seenAt && now - seenAt <= CALLBACK_DEDUPE_TTL_MS) {
+        console.warn(`[trade-bot] DUP_CALLBACK id=${dedupeKey} data=${raw || "n/a"} userId=${uid || "unknown"}`);
+        await ctx.answerCallbackQuery().catch(() => { });
+        return;
+    }
+    recentCallbackMap.set(dedupeKey, now);
+
     const parts = raw.split(":");
     const scope = parts[0] || "unknown";
     const action = parts[1] || "unknown";

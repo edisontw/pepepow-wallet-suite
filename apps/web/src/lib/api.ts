@@ -2,6 +2,7 @@ const AUTH_TOKEN_KEY = "pepew_api_token";
 
 export const API_BASE =
   import.meta.env.VITE_API_BASE ?? "https://api.pepepow.net";
+export const EXPLORER_BASE_URL = "https://explorer.pepepow.net";
 
 export const API_ENDPOINTS = {
   wallet: {
@@ -24,7 +25,6 @@ export const API_ENDPOINTS = {
     requests: "/v1/requests",
     request: (id: string) => `/v1/requests/${id}`,
     requestClaim: (id: string) => `/v1/requests/${id}/claim`,
-    txInfo: (txid: string) => `/v1/tx/${encodeURIComponent(txid)}`,
   }
 } as const;
 
