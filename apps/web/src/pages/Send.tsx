@@ -5,14 +5,14 @@ import { useTranslation } from "react-i18next";
 import { addressToScript, buildAndSignP2PKH, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
 import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS, withAddress } from "../lib/api";
 import { broadcastTx, fetchRawTxBatchApi, TxApiError } from "../lib/tx";
-import { fmtPEPEWFromSats, satsToCoin } from "../lib/format";
+import { fmtPEPEWFromSats } from "../lib/format";
 import {
   assertAtomic,
   atomicToString,
   describeOutputShape,
-  toAtomicBigInt,
   validateAtomicRange,
 } from "../lib/atomic";
+import { formatAtomicToPepew, MAX_ATOMIC, parsePepewToAtomic, PEPEW_DECIMALS } from "../lib/amount";
 import { triggerRefresh } from "../lib/refresh";
 import { hasPendingSpendTxid, recordPendingSpend } from "../lib/pending";
 import { walletStore, WalletState, type Utxo } from "../lib/walletStore";
@@ -67,6 +67,12 @@ type RawTxRetryContext = {
   requestIds: string[];
 };
 
+type UtxoLimitErrorDetail = {
+  totalBalanceAtomic: bigint;
+  spendableNowAtomic: bigint;
+  maxInputs: number;
+};
+
 type ConsolidationMode = "auto" | "manual";
 type ConsolidationPhase =
   | "idle"
@@ -112,7 +118,6 @@ const SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
 const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g;
 const LAST_RAWTX_KEY = "pepew_last_broadcast";
 const LAST_RAWTX_TTL_MS = 2 * 60 * 1000;
-const BUILDER_SATOSHI_MAX = 21n * 10n ** 14n;
 const RAWTX_BATCH_SIZE = 20;
 const RAWTX_BATCH_RETRIES = 1;
 const RAWTX_RETRY_BACKOFF_MS = [200, 500];
@@ -172,7 +177,7 @@ function randomIntInclusive(min: number, max: number) {
 
 function parseCoinToAtomic(value: string) {
   try {
-    return toAtomicBigInt(value, 8);
+    return parsePepewToAtomic(value, PEPEW_DECIMALS);
   } catch {
     return null;
   }
@@ -187,15 +192,18 @@ function walletSatsToAtomic(value: number, label: string) {
 
 function toBuilderAtomicString(value: unknown, label: string) {
   const atomic = assertAtomic(value, label);
-  validateAtomicRange(atomic, label, BUILDER_SATOSHI_MAX);
+  validateAtomicRange(atomic, label, MAX_ATOMIC);
   return atomicToString(atomic);
 }
 
-function formatSatsInput(sats: number) {
-  if (!Number.isFinite(sats) || sats <= 0) return "0";
-  const coin = satsToCoin(sats);
-  const fixed = coin.toFixed(8);
-  return fixed.replace(/\.?0+$/, "");
+function formatSatsInput(sats: bigint) {
+  if (sats <= 0n) return "0";
+  return formatAtomicToPepew(sats, PEPEW_DECIMALS, {
+    group: false,
+    trimTrailingZeros: true,
+    minFractionDigits: 0,
+    maxFractionDigits: PEPEW_DECIMALS,
+  });
 }
 
 function loadRecentRecipients() {
@@ -323,6 +331,7 @@ export default function Send() {
   const [feeTouched, setFeeTouched] = useState(false);
   const [recentRecipients, setRecentRecipients] = useState<string[]>(loadRecentRecipients());
   const [sendAttempted, setSendAttempted] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   const [consolidating, setConsolidating] = useState(false);
   const [consolidateOpen, setConsolidateOpen] = useState(false);
   const [consolidatePreview, setConsolidatePreview] = useState<ConsolidationPreview | null>(null);
@@ -333,6 +342,7 @@ export default function Send() {
   const [showResumeConsolidation, setShowResumeConsolidation] = useState(false);
   const [wakeLockUnsupportedHint, setWakeLockUnsupportedHint] = useState(false);
   const [rawTxRetryContext, setRawTxRetryContext] = useState<RawTxRetryContext | null>(null);
+  const [utxoLimitErrorDetail, setUtxoLimitErrorDetail] = useState<UtxoLimitErrorDetail | null>(null);
   const [walletState, setWalletState] = useState<WalletState>(walletStore.getState());
   const resolveSeq = useRef(0);
   const mountedRef = useRef(true);
@@ -823,11 +833,25 @@ export default function Send() {
   const totalLabel = totalSats !== null ? fmtPEPEWFromSats(totalSats) : fmtPEPEWFromSats(null);
   const receiveLabel = recipientSats !== null ? fmtPEPEWFromSats(recipientSats) : fmtPEPEWFromSats(null);
   const feeEstimateLabel = feeEstimate ? `${feeEstimate} PEPEW` : "--";
+  const utxoLimitErrorMessage = t("send.errors.notEnoughSpendableUtxosOneTx");
+  const formatAtomicWithUnit = (atomic: bigint) => `${formatAtomicToPepew(atomic, PEPEW_DECIMALS, {
+    group: true,
+    trimTrailingZeros: true,
+    minFractionDigits: 0,
+    maxFractionDigits: PEPEW_DECIMALS,
+  })} PEPEW`;
+
+  useEffect(() => {
+    if (!utxoLimitErrorDetail) return;
+    if (!err || err !== utxoLimitErrorMessage) {
+      setUtxoLimitErrorDetail(null);
+    }
+  }, [err, utxoLimitErrorDetail, utxoLimitErrorMessage]);
 
   const handleMax = () => {
     const feeForMax = feeValid ? feeAtomicInput : 0n;
     const maxSats = availableAtomic > feeForMax ? availableAtomic - feeForMax : 0n;
-    setAmount(formatSatsInput(Number(maxSats)));
+    setAmount(formatSatsInput(maxSats));
   };
 
   const scrollToUtilities = () => {
@@ -845,6 +869,7 @@ export default function Send() {
     setLastTxid(null);
     setSendStatusNote(null);
     setErr(null);
+    setUtxoLimitErrorDetail(null);
     setRawInternalError(null);
     setSendAttempted(false);
     setConsolidating(false);
@@ -1273,9 +1298,9 @@ export default function Send() {
       setErr(t("send.errors.amountDust"));
       return null;
     }
-    validateAtomicRange(totalInAtomic, "preview.totalInAtomic", BUILDER_SATOSHI_MAX);
-    validateAtomicRange(feeAtomicInput, "preview.feeAtomic", BUILDER_SATOSHI_MAX);
-    validateAtomicRange(outputAtomic, "preview.outputAtomic", BUILDER_SATOSHI_MAX);
+    validateAtomicRange(totalInAtomic, "preview.totalInAtomic", MAX_ATOMIC);
+    validateAtomicRange(feeAtomicInput, "preview.feeAtomic", MAX_ATOMIC);
+    validateAtomicRange(outputAtomic, "preview.outputAtomic", MAX_ATOMIC);
 
     const estimatedBytes = estimateP2PKHTxBytes(selected.length, 1);
     if (estimatedBytes > MAX_CONSOLIDATE_TX_BYTES) {
@@ -1471,7 +1496,7 @@ export default function Send() {
     const inputs: ConsolidationInput[] = [];
     for (const u of preview.selected) {
       if (!u.txid || u.vout === undefined || !Number.isFinite(u.valueSats)) {
-        throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
+        throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u, (_key, value) => (typeof value === "bigint" ? value.toString() : value))}`);
       }
       const hex = rawTxByTxid.get(u.txid);
       if (!hex || typeof hex !== "string" || hex.length === 0) {
@@ -1996,17 +2021,41 @@ export default function Send() {
   };
 
   async function doSend() {
-    let sendBuildUtxoCount = 0;
-    if (sendLocked) {
-      setSendStatusNote(t("send.alreadyBroadcast"));
-      return;
+    if (isSending || sendInFlightRef.current) return;
+
+    const traceId = crypto.randomUUID();
+    console.log("SEND_CLICK", traceId);
+
+    class SendAbortError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = "SendAbortError";
+      }
     }
-    if (sendInFlightRef.current) return;
+
+    const stringifyForSendError = (value: unknown) => JSON.stringify(
+      value,
+      (_key, item) => (typeof item === "bigint" ? item.toString() : item)
+    );
+
+    const abortSend = (message: string, detail: UtxoLimitErrorDetail | null = null): never => {
+      setErr(message);
+      setUtxoLimitErrorDetail(detail);
+      console.error("SEND_ERROR", traceId, new Error(message));
+      throw new SendAbortError(message);
+    };
+
+    setIsSending(true);
+    setErr(null);
+    setUtxoLimitErrorDetail(null);
+
+    let sendBuildUtxoCount = 0;
     sendInFlightRef.current = true;
     try {
       setSendAttempted(true);
       setSending(true);
       setErr(null);
+      setUtxoLimitErrorDetail(null);
       setRawInternalError(null);
       setRawTxRetryContext(null);
       setConsolidationProgress(null);
@@ -2015,94 +2064,91 @@ export default function Send() {
       setSendStatusNote(null);
       clearPostSendRefreshTimers();
 
-      // 3️⃣ 加一道防呆：確保沒有 UTXO 時不會進到組交易邏輯
+      if (sendLocked) {
+        setSendStatusNote(t("send.alreadyBroadcast"));
+        abortSend("Broadcast skipped by dedupe guard: send is locked from prior broadcast");
+      }
+
       const st = walletStore.getState();
       const utxosForCheck = st.utxos;
       if (!utxosForCheck || utxosForCheck.length === 0) {
         if (st.status === "loading") {
-          setErr(t("send.errors.utxoLoading"));
+          abortSend(t("send.errors.utxoLoading"));
         } else if (st.status === "error") {
           const detail = st.rawUtxoSumError || st.error || t("errors.unknown");
-          setErr(t("send.errors.utxoFetchFailed", { error: detail }));
+          abortSend(t("send.errors.utxoFetchFailed", { error: detail }));
         } else {
-          setErr(t("send.errors.utxoEmpty"));
+          abortSend(t("send.errors.utxoEmpty"));
         }
-        setSending(false);
-        return;
       }
 
-      const invalidUtxos = utxosForCheck.filter(u => u.invalid);
+      const invalidUtxos = utxosForCheck.filter((u) => u.invalid);
       if (invalidUtxos.length > 0) {
-        setErr(t("send.errors.utxoIncomplete", { count: invalidUtxos.length }));
-        setSending(false);
-        return;
+        abortSend(t("send.errors.utxoIncomplete", { count: invalidUtxos.length }));
       }
 
       const trimmedMnemonic = mnemo.trim();
       if (!trimmedMnemonic) {
-        setErr(t("send.errors.mnemonicMissing"));
-        return;
+        abortSend(t("send.errors.mnemonicMissing"));
       }
       const amountAtomic = parseCoinToAtomic(amount);
       if (amountAtomic === null) {
-        setErr(t("send.errors.amountInvalid"));
-        return;
+        abortSend(t("send.errors.amountInvalid"));
       }
       const feeAtomic = parseCoinToAtomic(fee);
       if (feeAtomic === null) {
-        setErr(t("send.errors.feeInvalid"));
-        return;
+        abortSend(t("send.errors.feeInvalid"));
       }
       const amountSatsBigInt = amountAtomic;
       const feeSatsBigInt = feeAtomic;
       if (feeSatsBigInt < 0n) {
-        setErr(t("send.errors.feeInvalid"));
-        return;
+        abortSend(t("send.errors.feeInvalid"));
       }
 
       const recipientSatsBigInt = subtractFee ? amountSatsBigInt - feeSatsBigInt : amountSatsBigInt;
       if (recipientSatsBigInt <= 0n) {
-        setErr(t("send.errors.amountUnderFee"));
-        return;
+        abortSend(t("send.errors.amountUnderFee"));
       }
       if (recipientSatsBigInt < BigInt(DUST_THRESHOLD_SATS)) {
-        setErr(t("send.errors.amountDust"));
-        return;
+        abortSend(t("send.errors.amountDust"));
       }
       if (recipientSatsBigInt < BigInt(MIN_SEND_SATS)) {
-        setErr(t("send.errors.amountTooLow", { min: 1 }));
-        return;
+        abortSend(t("send.errors.amountTooLow", { min: 1 }));
       }
       const totalSatsBigInt = subtractFee ? amountSatsBigInt : amountSatsBigInt + feeSatsBigInt;
-      validateAtomicRange(totalSatsBigInt, "send.totalAtomic", BUILDER_SATOSHI_MAX);
+      if (debugEnabled) {
+        console.info("[send] atomic values", {
+          amountInput: amount,
+          amountAtomic: amountSatsBigInt.toString(),
+          feeAtomic: feeSatsBigInt.toString(),
+          totalAtomic: totalSatsBigInt.toString(),
+          maxAtomic: MAX_ATOMIC.toString(),
+        });
+      }
+      validateAtomicRange(totalSatsBigInt, "send.totalAtomic", MAX_ATOMIC);
       const usableUtxos = walletStore.getState().utxos;
       const sendTo = normalizeAddressInput(to);
       const sendFrom = normalizeAddressInput(address);
       if (!sendTo) {
-        setErr(t("send.errors.recipientMissing"));
-        return;
+        abortSend(t("send.errors.recipientMissing"));
       }
       if (!sendFrom) {
-        setErr(t("send.errors.senderAddressMissing"));
-        return;
+        abortSend(t("send.errors.senderAddressMissing"));
       }
       if (!recipientValidation.ok) {
-        setErr(recipientValidation.reason === "missing"
+        abortSend(recipientValidation.reason === "missing"
           ? t("send.errors.recipientMissing")
           : t("send.errors.recipientInvalid"));
-        return;
       }
       if (!changeValidation.ok) {
-        setErr(changeValidation.reason === "missing"
+        abortSend(changeValidation.reason === "missing"
           ? t("send.errors.senderAddressMissing")
           : t("send.errors.senderAddressInvalid"));
-        return;
       }
       if (resolveBlocked) {
-        setErr(t("send.errors.telegramResolveBlocked"));
-        return;
+        abortSend(t("send.errors.telegramResolveBlocked"));
       }
-      const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
+      console.log("SEND_VALIDATE_OK", traceId);
       const chosen = usableUtxos.map((u, idx) => ({
         txid: u.txid,
         vout: u.vout,
@@ -2114,37 +2160,55 @@ export default function Send() {
         if (a.valueAtomic < b.valueAtomic) return 1;
         return 0;
       });
-      const picked: typeof sortedChosen = [];
+
+      const totalBalanceAtomic = sortedChosen.reduce((sum, u) => sum + u.valueAtomic, 0n);
+      const spendableCandidates = sortedChosen.slice(0, MAX_SEND_INPUTS);
+      const spendableNowAtomic = spendableCandidates.reduce((sum, u) => sum + u.valueAtomic, 0n);
+      const insufficientWithinLimit = spendableNowAtomic < totalSatsBigInt;
+      const walletEnough = totalBalanceAtomic >= totalSatsBigInt;
+
+      if (insufficientWithinLimit && walletEnough) {
+        abortSend(t("send.errors.notEnoughSpendableUtxosOneTx"), {
+          totalBalanceAtomic,
+          spendableNowAtomic,
+          maxInputs: MAX_SEND_INPUTS,
+        });
+      }
+      if (insufficientWithinLimit && !walletEnough) {
+        abortSend(t("send.errors.insufficientUtxo"));
+      }
+
+      const picked: typeof spendableCandidates = [];
       let totalInAtomic = 0n;
-      for (const candidate of sortedChosen) {
+      for (const candidate of spendableCandidates) {
         picked.push(candidate);
         totalInAtomic += candidate.valueAtomic;
         if (totalInAtomic >= totalSatsBigInt) break;
       }
       if (!picked.length || totalInAtomic < totalSatsBigInt) {
-        setErr(t("send.errors.insufficientUtxo"));
-        return;
-      }
-      if (picked.length > MAX_SEND_INPUTS) {
-        setErr(t("send.errors.sendTooManyInputs", { count: picked.length, max: MAX_SEND_INPUTS }));
-        return;
+        abortSend(t("send.errors.insufficientUtxo"));
       }
       sendBuildUtxoCount = picked.length;
-      validateAtomicRange(totalInAtomic, "send.totalInAtomic", BUILDER_SATOSHI_MAX);
+      console.log("SEND_SELECT_OK", traceId, {
+        count: picked.length,
+        sum: totalInAtomic.toString(),
+        target: totalSatsBigInt.toString(),
+      });
+      validateAtomicRange(totalInAtomic, "send.totalInAtomic", MAX_ATOMIC);
+      const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
 
       let changeSatsBigInt = totalInAtomic - recipientSatsBigInt - feeSatsBigInt;
       if (changeSatsBigInt < 0n) {
-        setErr(t("send.errors.insufficientBalance"));
-        return;
+        abortSend(t("send.errors.insufficientBalance"));
       }
       let effectiveFeeSatsBigInt = feeSatsBigInt;
       if (changeSatsBigInt > 0n && changeSatsBigInt < BigInt(DUST_THRESHOLD_SATS)) {
         effectiveFeeSatsBigInt += changeSatsBigInt;
         changeSatsBigInt = 0n;
       }
-      validateAtomicRange(recipientSatsBigInt, "send.recipientAtomic", BUILDER_SATOSHI_MAX);
-      validateAtomicRange(effectiveFeeSatsBigInt, "send.effectiveFeeAtomic", BUILDER_SATOSHI_MAX);
-      validateAtomicRange(changeSatsBigInt, "send.changeAtomic", BUILDER_SATOSHI_MAX);
+      validateAtomicRange(recipientSatsBigInt, "send.recipientAtomic", MAX_ATOMIC);
+      validateAtomicRange(effectiveFeeSatsBigInt, "send.effectiveFeeAtomic", MAX_ATOMIC);
+      validateAtomicRange(changeSatsBigInt, "send.changeAtomic", MAX_ATOMIC);
       const recipientSatsAtomic = toBuilderAtomicString(recipientSatsBigInt, "send.recipientAtomic");
       const effectiveFeeAtomic = toBuilderAtomicString(effectiveFeeSatsBigInt, "send.effectiveFeeAtomic");
       const changeSatsAtomic = toBuilderAtomicString(changeSatsBigInt, "send.changeAtomic");
@@ -2155,7 +2219,7 @@ export default function Send() {
         toScriptHex = info.script.toString("hex");
         toScriptLen = info.script.length;
       } catch (e: any) {
-        console.warn("[send] toScript failed", { error: e?.message || String(e), toAddress: sendTo });
+        throw e;
       }
 
       const sendFeeAtomic = toBuilderAtomicString(feeSatsBigInt, "send.feeAtomic");
@@ -2170,7 +2234,6 @@ export default function Send() {
         utxoCount: picked.length,
       });
 
-      // nonWitnessUtxo is required for each selected input; fetches are independent and can be parallelized.
       const requiredTxids = picked
         .map((u) => u.txid)
         .filter((txid): txid is string => typeof txid === "string" && txid.length > 0);
@@ -2190,30 +2253,25 @@ export default function Send() {
         } else {
           setRawTxRetryContext(null);
         }
-        setErr(summary.message);
-        return;
+        abortSend(summary.message);
       }
 
       const rawTxByTxid = new Map(rawTxBatch.ok.map((item) => [item.txid, item.rawTx]));
       const inputs = [];
       for (const u of picked) {
-        // buildAndSignP2PKH requires nonWitnessUtxo (full raw tx) as hex string
-        // We must fetch the raw transaction for each UTXO
         if (!u.txid || u.vout === undefined || u.valueAtomic === undefined) {
           console.error("[SEND_ASSERT] Invalid UTXO structure", u);
-          throw new Error(`Invalid UTXO in Selection: ${JSON.stringify(u)}`);
+          throw new Error(`Invalid UTXO in Selection: ${stringifyForSendError(u)}`);
         }
         const hex = rawTxByTxid.get(u.txid);
         if (!hex || typeof hex !== "string" || hex.length === 0) {
-          setErr(t("send.errors.txRawFailed", { txid: u.txid }));
-          return;
+          abortSend(t("send.errors.txRawFailed", { txid: u.txid }));
         }
-        // Pass hex string directly, NOT Buffer - buildAndSignP2PKH will convert it
         inputs.push({
           txid: u.txid,
           vout: u.vout,
           value: toBuilderAtomicString(u.valueAtomic, `send.input:${u.txid}:${u.vout}`),
-          nonWitnessUtxo: hex  // hex string, not Buffer
+          nonWitnessUtxo: hex
         });
       }
 
@@ -2228,7 +2286,7 @@ export default function Send() {
               scriptHex: info.script.toString("hex"),
             });
           } catch (e: any) {
-            console.warn("[send] address script failed", { label, address: addr, error: e?.message });
+            throw e;
           }
         };
         inspect("recipient", sendTo);
@@ -2255,14 +2313,14 @@ export default function Send() {
 
       if (!raw) {
         console.error("[SEND_ASSERT] buildAndSignP2PKH returned empty/undefined");
-        setErr(t("send.errors.txBuildMissingOutput"));
-        return;
+        abortSend(t("send.errors.txBuildMissingOutput"));
       }
       if (typeof raw !== "string" || raw.length < 20) {
         console.error("[SEND_ASSERT] invalid raw tx hex", { raw });
-        setErr(t("send.errors.txBuildInvalidHex"));
-        return;
+        abortSend(t("send.errors.txBuildInvalidHex"));
       }
+      console.log("SEND_BUILD_OK", traceId);
+      console.log("SEND_SIGN_OK", traceId);
 
       const rawTxLen = raw.length;
       const rawTxHash = raw ? await sha256HexFromHexString(raw) : null;
@@ -2293,111 +2351,87 @@ export default function Send() {
           subtractFee,
           address
         };
-        return;
+        abortSend("Broadcast skipped by dedupe guard: pending/cached match");
       }
 
-      try {
-        const j = await broadcastTx(raw);
-        const txid = j.result || j.txid;
-        const txidString = typeof txid === "string" ? txid : (localTxid || null);
-        setResult(txidString || JSON.stringify(j));
-        setLastTxid(txidString);
-        setSendLocked(true);
-        setSendStatusNote(null);
-        lastSuccessSnapshotRef.current = {
-          to,
-          amount,
-          fee,
-          subtractFee,
-          address
-        };
-        if (txidString) {
-          saveLastBroadcastCache({
-            hash: rawTxHash || "",
-            ts: Date.now(),
-            txid: txidString
-          });
-        }
-        addRecentRecipient(sendTo);
-        const spendSatsAtomic = recipientSatsBigInt + effectiveFeeSatsBigInt;
-        const spendSats = Number(spendSatsAtomic);
-        const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
+      console.log("SEND_BROADCAST_REQUEST", traceId);
+      const j = await broadcastTx(raw);
+      const txid = j.result || j.txid;
+      const txidString = typeof txid === "string" ? txid : (localTxid || null);
+      console.log("SEND_BROADCAST_OK", traceId, txidString || null);
+      setResult(txidString || JSON.stringify(j));
+      setLastTxid(txidString);
+      setSendLocked(true);
+      setSendStatusNote(null);
+      lastSuccessSnapshotRef.current = {
+        to,
+        amount,
+        fee,
+        subtractFee,
+        address
+      };
+      if (txidString) {
+        saveLastBroadcastCache({
+          hash: rawTxHash || "",
+          ts: Date.now(),
+          txid: txidString
+        });
+      }
+      addRecentRecipient(sendTo);
+      const spendSatsAtomic = recipientSatsBigInt + effectiveFeeSatsBigInt;
+      const spendSats = Number(spendSatsAtomic);
+      const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
 
-        if (alreadyPending) {
-          setSendStatusNote(t("send.alreadyBroadcast"));
-        }
+      if (alreadyPending) {
+        setSendStatusNote(t("send.alreadyBroadcast"));
+      }
 
-        if (debugEnabled) {
-          console.log("[Send] TX Success Debug:", {
-            oldSpendableSats: availableSats,
-            sendAmountSats: Number(recipientSatsBigInt),
-            feeSats: Number(effectiveFeeSatsBigInt),
-            optimisticDeltaSats: spendSats,
-            newSpendableSatsOptimistic: availableSats - spendSats,
-            lastBroadcastTxid: txid
-          });
-        }
+      if (debugEnabled) {
+        console.log("[Send] TX Success Debug:", {
+          oldSpendableSats: availableSats,
+          sendAmountSats: Number(recipientSatsBigInt),
+          feeSats: Number(effectiveFeeSatsBigInt),
+          optimisticDeltaSats: spendSats,
+          newSpendableSatsOptimistic: availableSats - spendSats,
+          lastBroadcastTxid: txid
+        });
+      }
 
-        if (!alreadyPending && spendSatsAtomic > 0n && Number.isFinite(spendSats) && spendSats > 0) {
-          walletStore.applyOptimistic(spendSats);
-          recordPendingSpend({
-            address: sendFrom,
-            sats: spendSats,
-            txid: txidString || undefined,
-            balanceBeforeSats: Number.isFinite(availableSats) ? availableSats : undefined
-          });
-        }
-        const spentOutpoints = picked
-          .map((u) => `${u.txid}:${u.vout}`)
-          .filter((key) => key && !key.endsWith(":undefined"));
-        // walletStore.markSpentOutpoints(spentOutpoints); // DISABLED to avoid double-deduction
-        if (!alreadyPending) {
-          const baseline = walletStore.getState();
-          triggerRefresh({ reason: "send", txid: txidString || undefined });
-          schedulePostSendRefresh(baseline.utxoSumSats, baseline.utxos.length);
-        }
-      } catch (e: any) {
-        if (e instanceof TxApiError) {
-          const mapped = mapBroadcastError(e.detail);
-          if (mapped) {
-            setErr(mapped);
-            if (isTypeforceLikeError(e.detail)) {
-              setRawInternalError(reportTxBuildError({
-                label: "send.broadcast",
-                err: e,
-                round: 0,
-                utxoCount: sendBuildUtxoCount,
-                raw: e.detail || "",
-              }));
-            }
-          } else if (e.detail) {
-            setErr(e.detail);
-          } else {
-            setErr(t("send.errors.broadcastFailed"));
-          }
-        } else {
-          setErr(t("send.errors.broadcastFailed"));
-        }
-        return;
+      if (!alreadyPending && spendSatsAtomic > 0n && Number.isFinite(spendSats) && spendSats > 0) {
+        walletStore.applyOptimistic(spendSats);
+        recordPendingSpend({
+          address: sendFrom,
+          sats: spendSats,
+          txid: txidString || undefined,
+          balanceBeforeSats: Number.isFinite(availableSats) ? availableSats : undefined
+        });
+      }
+      const spentOutpoints = picked
+        .map((u) => `${u.txid}:${u.vout}`)
+        .filter((key) => key && !key.endsWith(":undefined"));
+      // walletStore.markSpentOutpoints(spentOutpoints); // DISABLED to avoid double-deduction
+      if (!alreadyPending) {
+        const baseline = walletStore.getState();
+        triggerRefresh({ reason: "send", txid: txidString || undefined });
+        schedulePostSendRefresh(baseline.utxoSumSats, baseline.utxos.length);
       }
     } catch (e: any) {
+      console.error("SEND_ERROR", traceId, e);
+      if (!(e instanceof SendAbortError)) {
+        setErr(e?.message || String(e));
+      }
       const rawMessage = String(e?.message || e);
-      const mapped = mapBroadcastError(rawMessage);
-      if (mapped) {
-        setErr(mapped);
-        if (isTypeforceLikeError(rawMessage)) {
-          setRawInternalError(reportTxBuildError({
-            label: "send.build",
-            err: e,
-            round: 0,
-            utxoCount: sendBuildUtxoCount,
-            raw: rawMessage,
-          }));
-        }
-      } else {
-        setErr(rawMessage);
+      if (!(e instanceof SendAbortError) && isTypeforceLikeError(rawMessage)) {
+        setRawInternalError(reportTxBuildError({
+          label: "send.build",
+          err: e,
+          round: 0,
+          utxoCount: sendBuildUtxoCount,
+          raw: rawMessage,
+        }));
       }
     } finally {
+      setIsSending(false);
       sendInFlightRef.current = false;
       setSending(false);
     }
@@ -2406,6 +2440,7 @@ export default function Send() {
   const retryFailedRawTxOnly = () => {
     if (!rawTxRetryContext) return;
     setErr(null);
+    setUtxoLimitErrorDetail(null);
     setRawInternalError(null);
     if (rawTxRetryContext.mode === "send") {
       void doSend();
@@ -2662,13 +2697,24 @@ export default function Send() {
           <button
             className="btn primary full"
             onClick={doSend}
-            disabled={sending || consolidationBusy || sendLocked || addressInvalid || overBalance || !!err || walletState.status === "error" || walletState.utxos.length === 0}
+            disabled={isSending || sending || consolidationBusy || sendLocked || addressInvalid || overBalance || walletState.status === "error" || walletState.utxos.length === 0}
           >
-            {sending ? t("send.sending") : t("send.submit")}
+            {isSending ? "Sending..." : sending ? t("send.sending") : t("send.submit")}
           </button>
         </div>
 
         {err && <div className="error" style={{ marginTop: 12 }}>{err}</div>}
+        {err && utxoLimitErrorDetail && (
+          <div className="note" style={{ marginTop: 8 }}>
+            <div>
+              {t("send.errors.totalBalanceLine")} {formatAtomicWithUnit(utxoLimitErrorDetail.totalBalanceAtomic)}
+            </div>
+            <div>
+              {t("send.errors.spendableNowLine", { max: utxoLimitErrorDetail.maxInputs })}{" "}
+              {formatAtomicWithUnit(utxoLimitErrorDetail.spendableNowAtomic)}
+            </div>
+          </div>
+        )}
         {debugEnabled && rawInternalError && (
           <details className="details" style={{ marginTop: 8 }}>
             <summary>Debug raw error</summary>

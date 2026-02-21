@@ -6,7 +6,7 @@ import { PepepowNetwork } from "./network";
 bitcoin.initEccLib(secp);
 const ECPair = ECPairFactory(secp);
 
-const SATOSHI_MAX = 21n * 10n ** 14n;
+const SATOSHI_MAX = 9223372036854775807n;
 
 type AtomicLike = string | number | bigint;
 
@@ -38,10 +38,14 @@ function toSafeSatoshiNumber(value: AtomicLike, label: string) {
   if (satoshi > SATOSHI_MAX) {
     throw new Error(`Invalid ${label}: exceeds max satoshi range`);
   }
-  if (satoshi > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new Error(`Invalid ${label}: exceeds safe integer range`);
+  const asNumber = Number(satoshi);
+  if (!Number.isFinite(asNumber) || !Number.isInteger(asNumber)) {
+    throw new Error(`Invalid ${label}: cannot represent satoshi value as number`);
   }
-  return Number(satoshi);
+  if (BigInt(asNumber) !== satoshi) {
+    throw new Error(`Invalid ${label}: cannot represent satoshi value precisely`);
+  }
+  return asNumber;
 }
 
 export function toBitcoinNetwork(n: PepepowNetwork): bitcoin.Network {

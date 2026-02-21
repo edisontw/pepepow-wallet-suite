@@ -1,3 +1,5 @@
+import { parsePepewToAtomic } from "./amount";
+
 export type AtomicValue = string | number | bigint;
 
 type AtomicToNumberOptions = {
@@ -5,7 +7,6 @@ type AtomicToNumberOptions = {
 };
 
 const DECIMAL_INTEGER_RE = /^-?\d+$/;
-const COIN_INPUT_RE = /^\d+(\.\d+)?$/;
 const DIGITS_ONLY_RE = /^\d+$/;
 
 function stripLeadingZeros(value: string) {
@@ -32,22 +33,7 @@ export function normalizeAtomic(value: AtomicValue): string {
 }
 
 export function toAtomicBigInt(input: string, decimals = 8): bigint {
-  const trimmed = input.trim();
-  if (!trimmed) {
-    throw new Error("Invalid decimal amount: empty");
-  }
-  const normalized = trimmed.replace(/,/g, "");
-  if (!COIN_INPUT_RE.test(normalized)) {
-    throw new Error(`Invalid decimal amount: ${input}`);
-  }
-
-  const [wholeRaw, fracRaw = ""] = normalized.split(".");
-  if (fracRaw.length > decimals) {
-    throw new Error(`Invalid decimal amount: exceeds ${decimals} decimals`);
-  }
-  const whole = wholeRaw || "0";
-  const frac = (fracRaw + "0".repeat(decimals)).slice(0, decimals);
-  return BigInt(`${whole}${frac}`);
+  return parsePepewToAtomic(input, decimals);
 }
 
 export function atomicToString(v: bigint): string {

@@ -1,11 +1,11 @@
 import { buildAndSignP2PKH, PEPEPOW, type PepepowNetwork } from "@pepepow/wallet-core";
 import type { Utxo } from "../lib/walletStore";
 import { assertAtomic, atomicToString, validateAtomicRange, type AtomicValue } from "../lib/atomic";
+import { MAX_ATOMIC } from "../lib/amount";
 
 export const MAX_CONSOLIDATE_INPUTS = 80;
-export const MAX_SEND_INPUTS = 120;
+export const MAX_SEND_INPUTS = 80;
 export const MAX_CONSOLIDATE_TX_BYTES = 100000;
-const BUILDER_SATOSHI_MAX = 21n * 10n ** 14n;
 
 export type ConsolidationInput = {
   txid: string;
@@ -48,9 +48,9 @@ export function buildConsolidationTx(params: {
   if (outputAtomic <= 0n) {
     throw new Error("insufficient funds including fee");
   }
-  validateAtomicRange(feeAtomic, "feeAtomic", BUILDER_SATOSHI_MAX);
-  validateAtomicRange(totalInAtomic, "totalInAtomic", BUILDER_SATOSHI_MAX);
-  validateAtomicRange(outputAtomic, "outputAtomic", BUILDER_SATOSHI_MAX);
+  validateAtomicRange(feeAtomic, "feeAtomic", MAX_ATOMIC);
+  validateAtomicRange(totalInAtomic, "totalInAtomic", MAX_ATOMIC);
+  validateAtomicRange(outputAtomic, "outputAtomic", MAX_ATOMIC);
 
   const normalizedInputs = inputs.map((input) => ({
     ...input,

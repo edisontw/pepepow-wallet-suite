@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:amount": "rm -rf ./.tmp-tests && tsc --module NodeNext --moduleResolution NodeNext --target ES2020 --outDir ./.tmp-tests ./src/lib/amount.ts && node ./tests/amount.bigint.test.mjs"
   },
   "dependencies": {
     "@pepepow/wallet-core": "file:../../packages/wallet-core",
