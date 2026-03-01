@@ -226,6 +226,7 @@ const resources = {
           utxoIncomplete: "UTXO 資料不完整：偵測到 {{count}} 筆無效 UTXO（缺少 scriptHex/txid/vout）。請重新整理。",
           txBuildMissingOutput: "建立交易失敗：輸出為空",
           txBuildInvalidHex: "建立交易失敗：HEX 輸出無效",
+          buildOutOfRange: "交易組裝失敗（數值超出範圍）。請降低金額或先合併 UTXO 後再試。",
           consolidateTooLarge: "交易過大，請分批整理。",
           sendTooManyInputs: "本次送出需 {{count}} 筆輸入，超過上限 {{max}}。請先做 UTXO 整理。"
         },
@@ -563,6 +564,7 @@ const resources = {
           utxoIncomplete: "UTXO data incomplete: {{count}} invalid UTXOs detected (missing scriptHex/txid/vout). Please refresh.",
           txBuildMissingOutput: "Failed to build transaction: output is undefined",
           txBuildInvalidHex: "Failed to build transaction: invalid hex output",
+          buildOutOfRange: "Transaction build failed (value out of range). Please reduce amount or consolidate UTXOs, then try again.",
           consolidateTooLarge: "Transaction too large. Try consolidating in smaller batches.",
           sendTooManyInputs: "This send needs {{count}} inputs, above limit {{max}}. Consolidate first."
         },

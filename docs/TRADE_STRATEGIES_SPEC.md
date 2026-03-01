@@ -1,47 +1,58 @@
 # Trading Strategies Specification
 
-This document details the technical implementation and behavior of the three core trading strategies supported by the PepePow Trading Suite: **DCA**, **GRID**, and **Market Maker (MM)**.
+This document describes the current runtime behavior of the three core strategies in PepePow Trading Suite: **DCA**, **GRID**, and **MM**.
+
+`DEVMM` is documented separately in `docs/devmm.md`.
 
 ---
 
 ## 1. Dollar Cost Averaging (DCA)
 
-The DCA strategy aims to reduce the impact of volatility by buying a fixed amount of an asset at regular intervals.
+DCA accumulates a fixed quote amount at a fixed interval.
 
 ### Core Logic
-- **Tick Interval**: User-defined (e.g., every 60 minutes).
-- **Execution Model**: "All-In Buy" - Each tick attempts to execute the full buy order immediately.
-- **Order Flow**:
-    1.  Cancel any existing open BUY orders for this strategy instance.
-    2.  Check for available quote currency (e.g., USDT).
-    3.  Calculate the buy amount based on `quote_per_order`.
-    4.  Attempt a **Market Order** (if supported by the exchange) or a high-priority **Limit Order** (sweep loop) to ensure immediate fill.
-- **Safety Caps**:
-    - `maxTotalSpend`: The strategy automatically disables itself once the cumulative spend exceeds this value.
-    - `runForMinutes`: The strategy automatically disables itself after a set duration.
+- **Interval guard**: Tick executes only when `intervalSec` has elapsed.
+- **Stop caps**:
+  - `maxTotalSpend` auto-stops when cumulative spend reaches cap.
+  - `endsAt` (derived from `runForMinutes`) auto-stops on time limit.
+- **Hard cleanup rule**: Before placing a new buy, runner cancels all existing open DCA BUY orders for this config.
+- **Execution model**: all-in buy attempt per tick.
+  - Dex-Trade uses MARKET-style execution path.
+  - NonKYC/NestEx use aggressive limit/sweep behavior.
+- **Validation and safety**:
+  - API key required in REAL mode.
+  - Minimum notional enforced.
+  - Rate-limit guard (`max orders/hour`, `max quote/day`) applied before order placement.
 
 ---
 
 ## 2. GRID Strategy
 
-The GRID strategy places a series of buy and sell orders at fixed price intervals above and beyond a "base price".
+GRID maintains a ladder of limit BUY/SELL orders around a base price.
 
 ### Core Logic
-- **Initialization**: Sets a `basePrice` (usually current market price) upon start.
-- **Grid Structure**:
-    - **Buy Side**: Multiple limit buy orders below the base price.
-    - **Sell Side**: Multiple limit sell orders above the base price.
-- **Reconciliation ("Gap Filling")**:
-    - Every tick, the runner compares local "tracked" orders with actual exchange open orders.
-    - If a buy order is filled, it places a corresponding sell order one "grid step" higher.
-    - If a sell order is filled, it places a corresponding buy order one "grid step" lower.
-- **Phantom Order Prevention**: Uses redundant checks and local order registries to ensure no "lost" or "ghost" orders remain on the exchange.
+- **Initialization**: If `base_price` is missing, first tick sets it from current market price and returns.
+- **Ladder generation**:
+  - BUY targets below base.
+  - SELL targets above base (`allow_sell=true` by default).
+  - Target count controlled by `grid_levels` and `grid_step_pct`.
+- **Exchange reconciliation**:
+  - Compares tracked open orders with exchange open orders.
+  - Missing exchange orders are synced as closed/filled after propagation buffer.
+  - Removes duplicates and cross-side collisions to prevent self-crossing.
+- **Gap filling**:
+  - Rebuilds desired levels each tick.
+  - Places only missing levels, respecting side room and `refresh_sec`.
+- **Safety checks**:
+  - Key presence and decrypt check.
+  - Minimum notional / minimum quantity checks before placement.
+  - Balance checks prevent creating BUY/SELL legs without inventory.
 
 ---
 
 ## 3. Market Maker (MM)
 
-The Market Maker strategy provides liquidity by simultaneously placing buy and sell orders near the current market price, profiting from the spread.
+MM places quotes around mid-price and refreshes them continuously.
 
 ### Modes
 - **TWO_SIDED**: Maintains both buy and sell orders.
@@ -49,18 +60,23 @@ The Market Maker strategy provides liquidity by simultaneously placing buy and s
 - **ONE_SIDED_SELL**: Only maintains sell orders (useful for distribution).
 
 ### Core Logic
-- **Dynamic Pricing**: Orders are placed at a specified `spread` % distance from the current mid-price.
-- **Inventory Management**:
-    - Checks for sufficient balance before placing each side of the trade.
-    - Automatically skips a side if inventory is below the configured `minNotional`.
-- **Order Refresh**:
-    - Every tick, the runner evaluates if existing orders are still within an acceptable price range.
-    - If the market moves significantly, it cancels old orders and places new ones to stay "on the book".
+- **Quote model**:
+  - Uses `spread_pct` around current mid-price.
+  - Uses `quote_per_order` and `orders_per_side` (1/3/5 from bot wizard).
+- **REAL-mode inventory source**: fetches live balances each tick (fail-closed on balance fetch failure).
+- **Order reconciliation**:
+  - Fetches exchange open orders.
+  - Reconciles local registry with exchange state.
+  - Cancels stale/excess managed orders and re-quotes.
+- **Inventory and notional guards**:
+  - Side can be skipped when inventory is insufficient.
+  - Minimum notional enforcement per exchange/pair.
 
 ---
 
 ## Common Features (All Strategies)
 - **Retry & Backoff**: Automated retries with exponential backoff on exchange errors.
-- **Minimum Notional Enforcement**: Ensures all orders meet the exchange's minimum size requirements (e.g., > 1 USDT).
-- **Error Logging**: Detailed failure reasons are stored in the database and visible via Telegram `/strategy_status`.
-- **REAL Mode Only**: All strategies currently operate in REAL mode to ensure execution certainty.
+- **Auto-stop on severe errors**: Error classifier can auto-disable config and cancel outstanding orders.
+- **Minimum Notional Enforcement**: Orders below exchange minimum are rejected/skipped.
+- **Failure recording**: Failures are aggregated in DB and surfaced in Telegram `/status` as backoff/auto-stopped state.
+- **REAL Mode Only**: Bot/user flow creates and runs DCA/GRID/MM in REAL mode.

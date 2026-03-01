@@ -309,6 +309,7 @@ export default function Send() {
   const [result, setResult] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [rawInternalError, setRawInternalError] = useState<string | null>(null);
+  const [txBuildRawDetail, setTxBuildRawDetail] = useState<string | null>(null);
   const [sendLocked, setSendLocked] = useState(false);
   const [lastTxid, setLastTxid] = useState<string | null>(null);
   const [sendStatusNote, setSendStatusNote] = useState<string | null>(null);
@@ -871,6 +872,7 @@ export default function Send() {
     setErr(null);
     setUtxoLimitErrorDetail(null);
     setRawInternalError(null);
+    setTxBuildRawDetail(null);
     setSendAttempted(false);
     setConsolidating(false);
     setConsolidateOpen(false);
@@ -916,6 +918,16 @@ export default function Send() {
       || message.includes("invalid fee");
   };
 
+  const isTxBuildOutOfRangeLikeError = (err: unknown, detail?: string) => {
+    const name = String((err as any)?.name || "");
+    const message = (detail || "").toLowerCase();
+    return name === "RangeError"
+      || message.includes("rangeerror")
+      || message.includes("value out of range")
+      || message.includes("exceeds max satoshi range")
+      || message.includes("cannot represent satoshi");
+  };
+
   const mapBroadcastError = (detail?: string) => {
     if (!detail) return null;
     const message = detail.toLowerCase();
@@ -935,7 +947,6 @@ export default function Send() {
     if (message.includes("insufficient funds")
       || message.includes("insufficient balance")
       || message.includes("bad-txns-in-belowout")
-      || message.includes("value out of range")
       || message.includes("negative")) {
       return t("send.errors.insufficientBalance");
     }
@@ -2023,8 +2034,18 @@ export default function Send() {
   async function doSend() {
     if (isSending || sendInFlightRef.current) return;
 
+    type SendTraceStage = "CLICK" | "VALIDATED" | "SELECTED" | "BUILT" | "SIGNED" | "BROADCAST_REQUEST";
     const traceId = crypto.randomUUID();
-    console.log("SEND_CLICK", traceId);
+    let sendTraceStage: SendTraceStage = "CLICK";
+    const traceSend = (stage: SendTraceStage, extra?: Record<string, unknown>) => {
+      sendTraceStage = stage;
+      if (extra) {
+        console.info("[SEND_TRACE]", { traceId, stage, ...extra });
+        return;
+      }
+      console.info("[SEND_TRACE]", { traceId, stage });
+    };
+    traceSend("CLICK");
 
     class SendAbortError extends Error {
       constructor(message: string) {
@@ -2048,8 +2069,13 @@ export default function Send() {
     setIsSending(true);
     setErr(null);
     setUtxoLimitErrorDetail(null);
+    setTxBuildRawDetail(null);
 
     let sendBuildUtxoCount = 0;
+    let selectedSumAtomic = 0n;
+    let amountAtomicForDiag: bigint | null = null;
+    let feeAtomicForDiag: bigint | null = null;
+    let totalAtomicForDiag: bigint | null = null;
     sendInFlightRef.current = true;
     try {
       setSendAttempted(true);
@@ -2101,6 +2127,8 @@ export default function Send() {
       }
       const amountSatsBigInt = amountAtomic;
       const feeSatsBigInt = feeAtomic;
+      amountAtomicForDiag = amountSatsBigInt;
+      feeAtomicForDiag = feeSatsBigInt;
       if (feeSatsBigInt < 0n) {
         abortSend(t("send.errors.feeInvalid"));
       }
@@ -2116,6 +2144,7 @@ export default function Send() {
         abortSend(t("send.errors.amountTooLow", { min: 1 }));
       }
       const totalSatsBigInt = subtractFee ? amountSatsBigInt : amountSatsBigInt + feeSatsBigInt;
+      totalAtomicForDiag = totalSatsBigInt;
       if (debugEnabled) {
         console.info("[send] atomic values", {
           amountInput: amount,
@@ -2148,7 +2177,7 @@ export default function Send() {
       if (resolveBlocked) {
         abortSend(t("send.errors.telegramResolveBlocked"));
       }
-      console.log("SEND_VALIDATE_OK", traceId);
+      traceSend("VALIDATED");
       const chosen = usableUtxos.map((u, idx) => ({
         txid: u.txid,
         vout: u.vout,
@@ -2189,7 +2218,8 @@ export default function Send() {
         abortSend(t("send.errors.insufficientUtxo"));
       }
       sendBuildUtxoCount = picked.length;
-      console.log("SEND_SELECT_OK", traceId, {
+      selectedSumAtomic = totalInAtomic;
+      traceSend("SELECTED", {
         count: picked.length,
         sum: totalInAtomic.toString(),
         target: totalSatsBigInt.toString(),
@@ -2308,7 +2338,8 @@ export default function Send() {
         to: sendTo,
         amount: recipientSatsAtomic,
         changeAddress: sendFrom,
-        fee: effectiveFeeAtomic
+        fee: effectiveFeeAtomic,
+        traceId,
       });
 
       if (!raw) {
@@ -2319,8 +2350,8 @@ export default function Send() {
         console.error("[SEND_ASSERT] invalid raw tx hex", { raw });
         abortSend(t("send.errors.txBuildInvalidHex"));
       }
-      console.log("SEND_BUILD_OK", traceId);
-      console.log("SEND_SIGN_OK", traceId);
+      traceSend("BUILT", { rawTxBytes: raw.length / 2 });
+      traceSend("SIGNED");
 
       const rawTxLen = raw.length;
       const rawTxHash = raw ? await sha256HexFromHexString(raw) : null;
@@ -2354,7 +2385,7 @@ export default function Send() {
         abortSend("Broadcast skipped by dedupe guard: pending/cached match");
       }
 
-      console.log("SEND_BROADCAST_REQUEST", traceId);
+      traceSend("BROADCAST_REQUEST");
       const j = await broadcastTx(raw);
       const txid = j.result || j.txid;
       const txidString = typeof txid === "string" ? txid : (localTxid || null);
@@ -2416,12 +2447,41 @@ export default function Send() {
         schedulePostSendRefresh(baseline.utxoSumSats, baseline.utxos.length);
       }
     } catch (e: any) {
-      console.error("SEND_ERROR", traceId, e);
-      if (!(e instanceof SendAbortError)) {
-        setErr(e?.message || String(e));
-      }
       const rawMessage = String(e?.message || e);
-      if (!(e instanceof SendAbortError) && isTypeforceLikeError(rawMessage)) {
+      const isAbort = e instanceof SendAbortError;
+      const isBuildDiagError = !isAbort
+        && (isTxBuildOutOfRangeLikeError(e, rawMessage) || isTypeforceLikeError(rawMessage));
+
+      if (isBuildDiagError) {
+        console.error("[SEND_BUILD_DIAG]", {
+          traceId,
+          stage: sendTraceStage,
+          error: {
+            name: String(e?.name || "Error"),
+            message: rawMessage,
+            stack: typeof e?.stack === "string" ? e.stack : "",
+          },
+          amountAtomic: amountAtomicForDiag?.toString() || null,
+          feeAtomic: feeAtomicForDiag?.toString() || null,
+          totalAtomic: totalAtomicForDiag?.toString() || null,
+          selectedCount: sendBuildUtxoCount,
+          selectedSumAtomic: selectedSumAtomic.toString(),
+        });
+      } else if (!isAbort) {
+        console.error("SEND_ERROR", traceId, e);
+      }
+
+      if (!isAbort) {
+        if (isTxBuildOutOfRangeLikeError(e, rawMessage)) {
+          setErr(t("send.errors.buildOutOfRange"));
+          setTxBuildRawDetail(`Transaction build failed: ${rawMessage}`);
+        } else {
+          setErr(rawMessage);
+          setTxBuildRawDetail(null);
+        }
+      }
+
+      if (isBuildDiagError) {
         setRawInternalError(reportTxBuildError({
           label: "send.build",
           err: e,
@@ -2704,6 +2764,12 @@ export default function Send() {
         </div>
 
         {err && <div className="error" style={{ marginTop: 12 }}>{err}</div>}
+        {err && txBuildRawDetail && err === t("send.errors.buildOutOfRange") && (
+          <details className="details" style={{ marginTop: 8 }}>
+            <summary>Technical detail</summary>
+            <pre style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{txBuildRawDetail}</pre>
+          </details>
+        )}
         {err && utxoLimitErrorDetail && (
           <div className="note" style={{ marginTop: 8 }}>
             <div>

@@ -1,49 +1,79 @@
 # Trade Bot (Telegram Interface) Documentation
 
-The `trade-bot` provides a user-friendly interface for managing the trading suite via Telegram.
+The `trade-bot` is the Telegram control plane for `trade-api`. It provides menu-driven setup and command aliases for DCA, GRID, MM, and DEVMM.
 
-## Bot Commands
+## Main Menu
 
-### Configuration Wizards
-- `/dca`: Start the DCA setup wizard.
-- `/grid`: Start the GRID setup wizard.
-- `/mm`: Start the Market Maker setup wizard.
+After `/start`, the persistent keyboard shows:
 
-### Strategy Control
-- `/dca_start` / `/dca_stop`: Control DCA strategies.
-- `/grid_start` / `/grid_stop`: Control GRID strategies.
-- `/mm_start` / `/mm_stop`: Control MM strategies.
-- `/strategy_status`: View current performance and status of all active strategies.
+- `Status`
+- `Debug`
+- `Price`
+- `Strategy`
+- `Report`
+- `Stop`
+- `API Keys`
+- `Donation`
 
-### Key Management
-- `/keys`: Manage your API keys (Add/View Status/Delete).
-- `/keys_status`: Quick check of which exchanges have keys configured.
+## Supported Commands
 
-### Utilities
-- `/price`: Get the current price of PEPEW/USDT.
-- `/donate`: Show the project's donation address.
-- `/help`: Show command list and usage instructions.
+### Core
+- `/start`: Open main menu.
+- `/help`: Show command help.
+- `/status`: Unified status (strategies + DevMM).
+- `/debug`: DevMM diagnostics.
+- `/report`: Period report across all exchanges.
+- `/stop`: Stop strategies by exchange or all.
+- `/price`: PEPEW price snapshot.
+- `/donate`: Show donation address.
 
-## Implementation Details
+### Strategy Setup and Control
+- `/strategy`: Open strategy menu.
+- `/dca`, `/grid`, `/mm`, `/devmm`: Open setup/control wizards.
+- `/dca_start`, `/dca_stop`, `/dca_status`
+- `/grid_start`, `/grid_stop`
+- `/mm_start`, `/mm_stop`
+- `/devmm_start`, `/devmm_stop`
 
-### Wizard Flow
-The bot uses a **State Machine** approach to guide users through configurations.
-1.  User starts a wizard (e.g., `/dca`).
-2.  The bot stores the user's current "step" in memory.
-3.  The bot uses **Inline Keyboards** for selections (Exchanges, Pairs) and **Text Input** for values (Amounts, Intervals).
-4.  Each input is validated against minimum required amounts (e.g., balance check and minimum notional).
+### API Key Management
+- `/key`: Key shortcuts menu (`Set`, `Status`, `Clear`).
+- `/keys`: Set keys wizard.
+- `/keys_status`: Validate/check key status.
+- `/keys_clear`: Clear keys by exchange.
 
-### Status Reporting
-The `/strategy_status` command is the primary monitoring tool. It aggregates data from the `trade-api`:
-- **Current Balances**: Fetched fresh from the exchange.
-- **Strategy State**: Enabled/Disabled status and last action time.
-- **Order Stats**: Count of open orders and recent fills (e.g., "Filled 5000 PEPEW in last 24h").
-- **Failure Monitoring**: Displays any recent errors with a "Backoff" timer if applicable.
+### Legacy Aliases (Still Accepted)
+- `/strategy_status` -> integrated into `/status`
+- `/devmm_status` -> integrated into `/status`
+- `/devmm_report` -> integrated into `/report`
+
+## Wizard Behavior
+
+- User flows are stateful (in-memory per Telegram user, about 15 minute TTL).
+- Exchange/pair and discrete options use inline keyboards.
+- Some steps accept text input:
+  - DCA: quote per order, interval, budget cap, duration cap.
+  - Keys: API key and API secret.
+  - GRID/MM: optional numeric text input for some steps.
+- Strategy creation is REAL mode only, with key checks and funds guards before activation.
+
+## Monitoring and Reporting
+
+- `/status` is the primary monitoring command.
+  - Exchange balances (healthy/degraded state)
+  - Active REAL strategies and runtime params
+  - DevMM per-exchange summary and degraded flags
+  - last update time
+- `/report` asks for period (`daily`, `weekly`, `monthly`) and returns all exchanges in one report.
+  - Compact mode hides zero-trade exchanges.
+  - "Show all exchanges" expands hidden rows.
 
 ## Connectivity
-The bot communicates with the `trade-api` via HTTP REST.
-- `TRADE_API_BASE`: Must point to the reachable URL of the `trade-api` service.
-- **Health Check**: On startup, the bot performs a `/healthz` check to ensure the backend is responsive.
+
+The bot communicates with `trade-api` via HTTP REST.
+
+- `TRADE_API_BASE`: must point to a reachable `trade-api` endpoint.
+- Startup health check: bot calls `/healthz` and logs the result.
 
 ## Configuration
-See [services/trade-bot/.env.example](file:///home/ubuntu/pepepow-wallet-suite/services/trade-bot/.env.example) for required environment variables.
+
+See [services/trade-bot/.env.example](../services/trade-bot/.env.example) for required environment variables.

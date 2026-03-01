@@ -7,20 +7,17 @@ bitcoin.initEccLib(secp);
 const ECPair = ECPairFactory(secp);
 
 const SATOSHI_MAX = 9223372036854775807n;
+const UINT32_MAX = 0xffffffff;
 
-type AtomicLike = string | number | bigint;
+type AtomicLike = string | bigint;
 
 export type UTXO = { txid: string; vout: number; value: AtomicLike; nonWitnessUtxo: string };
 
 function normalizeAtomic(value: AtomicLike, label: string) {
   if (typeof value === "bigint") return value.toString();
-  if (typeof value === "number") {
-    if (!Number.isFinite(value) || !Number.isInteger(value) || !Number.isSafeInteger(value)) {
-      throw new Error(`Invalid ${label}: non-integer or unsafe number`);
-    }
-    return value.toString();
+  if (typeof value !== "string") {
+    throw new Error(`Invalid ${label}: numbers are not allowed in atomic core`);
   }
-
   const trimmed = value.trim();
   if (!/^\d+$/.test(trimmed)) {
     throw new Error(`Invalid ${label}: expected decimal integer string`);
@@ -28,7 +25,7 @@ function normalizeAtomic(value: AtomicLike, label: string) {
   return trimmed.replace(/^0+(?=\d)/, "") || "0";
 }
 
-function toSafeSatoshiNumber(value: AtomicLike, label: string) {
+function toSatoshiBigInt(value: AtomicLike, label: string) {
   const normalized = normalizeAtomic(value, label);
   const satoshi = BigInt(normalized);
 
@@ -38,14 +35,14 @@ function toSafeSatoshiNumber(value: AtomicLike, label: string) {
   if (satoshi > SATOSHI_MAX) {
     throw new Error(`Invalid ${label}: exceeds max satoshi range`);
   }
-  const asNumber = Number(satoshi);
-  if (!Number.isFinite(asNumber) || !Number.isInteger(asNumber)) {
-    throw new Error(`Invalid ${label}: cannot represent satoshi value as number`);
+  return satoshi;
+}
+
+function assertUInt32(value: number, label: string) {
+  if (!Number.isInteger(value) || value < 0 || value > UINT32_MAX) {
+    throw new Error(`Invalid ${label}: expected uint32`);
   }
-  if (BigInt(asNumber) !== satoshi) {
-    throw new Error(`Invalid ${label}: cannot represent satoshi value precisely`);
-  }
-  return asNumber;
+  return value;
 }
 
 export function toBitcoinNetwork(n: PepepowNetwork): bitcoin.Network {
@@ -59,17 +56,24 @@ export function toBitcoinNetwork(n: PepepowNetwork): bitcoin.Network {
   };
 }
 
-export function selectUtxos(utxos: UTXO[], target: number) {
+export function selectUtxos(utxos: UTXO[], target: AtomicLike) {
+  const targetAtomic = toSatoshiBigInt(target, "target");
   // simple largest-first
-  const sorted = [...utxos].sort((a, b) => toSafeSatoshiNumber(b.value, "utxo.value") - toSafeSatoshiNumber(a.value, "utxo.value"));
+  const sorted = [...utxos].sort((a, b) => {
+    const bValue = toSatoshiBigInt(b.value, "utxo.value");
+    const aValue = toSatoshiBigInt(a.value, "utxo.value");
+    if (bValue > aValue) return 1;
+    if (bValue < aValue) return -1;
+    return 0;
+  });
   const picked: UTXO[] = [];
-  let sum = 0;
+  let sum = 0n;
   for (const u of sorted) {
     picked.push(u);
-    sum += toSafeSatoshiNumber(u.value, "utxo.value");
-    if (sum >= target) break;
+    sum += toSatoshiBigInt(u.value, "utxo.value");
+    if (sum >= targetAtomic) break;
   }
-  if (sum < target) throw new Error("insufficient funds");
+  if (sum < targetAtomic) throw new Error("insufficient funds");
   return { picked, total: sum };
 }
 
@@ -81,32 +85,49 @@ export function buildAndSignP2PKH(params: {
   amount: AtomicLike;  // satoshis
   changeAddress: string;
   fee: AtomicLike;     // satoshis
+  traceId?: string;
 }) {
-  const { network, utxos, wif, to, amount, changeAddress, fee } = params;
+  const { network, utxos, wif, to, amount, changeAddress, fee, traceId } = params;
+  const trace = (stage: "BUILT" | "SIGNED", extra: Record<string, unknown>) => {
+    if (!traceId) return;
+    console.info("[wallet-core][txbuilder]", { traceId, stage, ...extra });
+  };
+
   const net = toBitcoinNetwork(network);
   const keyPair = ECPair.fromWIF(wif, net);
   const psbt = new bitcoin.Psbt({ network: net });
 
-  let totalIn = 0;
+  let totalIn = 0n;
   utxos.forEach(u => {
     psbt.addInput({
       hash: u.txid,
-      index: u.vout,
-      nonWitnessUtxo: Buffer.from(u.nonWitnessUtxo, 'hex')
+      index: assertUInt32(u.vout, `utxo[${u.txid}:${u.vout}].vout`),
+      nonWitnessUtxo: Buffer.from(u.nonWitnessUtxo, "hex")
     });
-    totalIn += toSafeSatoshiNumber(u.value, "utxo.value");
+    totalIn += toSatoshiBigInt(u.value, "utxo.value");
   });
 
-  const amountSats = toSafeSatoshiNumber(amount, "amount");
-  const feeSats = toSafeSatoshiNumber(fee, "fee");
+  const amountSats = toSatoshiBigInt(amount, "amount");
+  const feeSats = toSatoshiBigInt(fee, "fee");
 
   psbt.addOutput({ address: to, value: amountSats });
   const change = totalIn - amountSats - feeSats;
   if (change < 0) throw new Error("Insufficient funds including fee");
   if (change > 0) psbt.addOutput({ address: changeAddress, value: change });
+  trace("BUILT", {
+    inputs: utxos.length,
+    totalInAtomic: totalIn.toString(),
+    amountAtomic: amountSats.toString(),
+    feeAtomic: feeSats.toString(),
+    changeAtomic: change.toString(),
+    outputs: change > 0n ? 2 : 1,
+  });
 
   utxos.forEach((_, i) => psbt.signInput(i, keyPair));
   psbt.finalizeAllInputs();
   const rawTx = psbt.extractTransaction().toHex();
+  trace("SIGNED", {
+    rawTxBytes: rawTx.length / 2,
+  });
   return rawTx;
 }

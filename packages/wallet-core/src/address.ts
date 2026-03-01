@@ -3,7 +3,7 @@ import { PepepowNetwork } from "./network";
 import * as bitcoin from "bitcoinjs-lib";
 
 export function hash160(buffer: Buffer) {
-  return bitcoin.crypto.hash160(buffer);
+  return Buffer.from(bitcoin.crypto.hash160(buffer));
 }
 
 export function pubkeyToP2PKH(pubkey: Buffer, network: PepepowNetwork) {
@@ -42,12 +42,12 @@ export function addressToScript(address: string, network: PepepowNetwork): Addre
     if (decoded.version === network.pubKeyHash) {
       const payment = bitcoin.payments.p2pkh({ hash: decoded.hash, network: net });
       if (!payment.output) throw new Error("missing p2pkh output");
-      return { type: "p2pkh", script: payment.output };
+      return { type: "p2pkh", script: Buffer.from(payment.output) };
     }
     if (decoded.version === network.scriptHash) {
       const payment = bitcoin.payments.p2sh({ hash: decoded.hash, network: net });
       if (!payment.output) throw new Error("missing p2sh output");
-      return { type: "p2sh", script: payment.output };
+      return { type: "p2sh", script: Buffer.from(payment.output) };
     }
     throw new Error("base58 version mismatch");
   } catch (err: any) {
@@ -63,17 +63,17 @@ export function addressToScript(address: string, network: PepepowNetwork): Addre
     if (decoded.version === 0 && decoded.data.length === 20) {
       const payment = bitcoin.payments.p2wpkh({ hash: decoded.data, network: net });
       if (!payment.output) throw new Error("missing p2wpkh output");
-      return { type: "p2wpkh", script: payment.output };
+      return { type: "p2wpkh", script: Buffer.from(payment.output) };
     }
     if (decoded.version === 0 && decoded.data.length === 32) {
       const payment = bitcoin.payments.p2wsh({ hash: decoded.data, network: net });
       if (!payment.output) throw new Error("missing p2wsh output");
-      return { type: "p2wsh", script: payment.output };
+      return { type: "p2wsh", script: Buffer.from(payment.output) };
     }
     if (decoded.version === 1 && decoded.data.length === 32) {
       const payment = bitcoin.payments.p2tr({ pubkey: decoded.data, network: net });
       if (!payment.output) throw new Error("missing p2tr output");
-      return { type: "p2tr", script: payment.output };
+      return { type: "p2tr", script: Buffer.from(payment.output) };
     }
     throw new Error("unsupported bech32 address");
   } catch (err: any) {

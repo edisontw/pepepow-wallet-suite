@@ -7,7 +7,8 @@
   "types": "dist/index.d.ts",
   "private": true,
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test:uint64": "node ./tests/uint64.bigint.test.mjs"
   },
   "dependencies": {
     "bip39": "^3.1.0",
@@ -15,7 +16,7 @@
     "bs58check": "^2.1.2",
     "ecpair": "^2.1.0",
     "tiny-secp256k1": "^2.2.3",
-    "bitcoinjs-lib": "^6.1.5"
+    "bitcoinjs-lib": "^7.0.1"
   },
   "devDependencies": {
     "@types/bs58check": "^2.1.1",

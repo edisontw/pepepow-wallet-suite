@@ -1,12 +1,21 @@
-import { getEnabledDevmmConfigs, getEnabledStrategyConfigs } from "./db.js";
+import {
+    cancelOpenStrategyOrders,
+    getEnabledDevmmConfigs,
+    getEnabledStrategyConfigs,
+    insertTradeAudit,
+    setStrategyDisabledWithReason,
+} from "./db.js";
 import { devmmRunner } from "./strategies/devmmRunner.js";
 import { DevmmIssueCode, DEVMM_SCHEDULER_REASON_DEVMM_OWNS_PAIR } from "./strategies/devmmCodes.js";
 import { getStrategyRunner } from "./strategies/runner.js";
 import { normalizeExchangeId } from "./registry/exchanges.js";
 import { toCanonicalPair } from "./registry/pairs.js";
 import { tradeLog } from "./lib/tradeLogger.js";
+import { cancelOutstandingOrders } from "./strategies/strategyHelper.js";
 
 const SCHEDULER_INTERVAL_MS = 10_000; // 10 seconds
+const MM_DEVMM_COLLISION_REASON = `${DEVMM_SCHEDULER_REASON_DEVMM_OWNS_PAIR}:${DevmmIssueCode.F04_MM_DEVMM_COLLISION}`;
+const MM_DEVMM_COLLISION_AUDIT_REASON = `SCHEDULER:${MM_DEVMM_COLLISION_REASON}`;
 
 function buildOccupancyKey(tgUserId: string, exchange: string, pair: string): string {
     return `${tgUserId}|${exchange}|${pair}`;
@@ -63,6 +72,61 @@ async function runSchedulerTick(): Promise<void> {
                             level: "warn",
                             message: `skip strategy=MM config=${config.id} reason=${DEVMM_SCHEDULER_REASON_DEVMM_OWNS_PAIR} issueCode=${DevmmIssueCode.F04_MM_DEVMM_COLLISION} exchange=${normalizedExchange} pair=${canonicalPair}`,
                             throttleKey: `scheduler:mm-collision:${config.id}`,
+                            throttleSec: 30,
+                        });
+                        insertTradeAudit({
+                            ts: now,
+                            strategyId: config.id,
+                            strategyType: "MM",
+                            exchange: config.exchange,
+                            pair: config.pair,
+                            action: "skip",
+                            reason: MM_DEVMM_COLLISION_AUDIT_REASON,
+                        });
+
+                        const disabled = setStrategyDisabledWithReason(config.id, config.tg_user_id, MM_DEVMM_COLLISION_REASON);
+                        let cancelled = 0;
+                        let failed = 0;
+                        let alreadyClosed = 0;
+
+                        try {
+                            const cancelResult = await cancelOutstandingOrders(config.id);
+                            cancelled = cancelResult.cancelled;
+                            failed = cancelResult.failed;
+                            alreadyClosed = cancelResult.alreadyClosed;
+                        } catch (err: any) {
+                            tradeLog({
+                                scope: "scheduler",
+                                level: "error",
+                                strategyId: config.id,
+                                exchange: config.exchange,
+                                message: `mm-collision cancelOutstandingOrders failed config=${config.id} err=${err?.message || String(err)}`,
+                                throttleKey: `scheduler:mm-collision-cancel-fail:${config.id}`,
+                                throttleSec: 20,
+                            });
+                        }
+
+                        try {
+                            cancelOpenStrategyOrders(config.id);
+                        } catch (err: any) {
+                            tradeLog({
+                                scope: "scheduler",
+                                level: "error",
+                                strategyId: config.id,
+                                exchange: config.exchange,
+                                message: `mm-collision cancelOpenStrategyOrders failed config=${config.id} err=${err?.message || String(err)}`,
+                                throttleKey: `scheduler:mm-collision-local-cancel-fail:${config.id}`,
+                                throttleSec: 20,
+                            });
+                        }
+
+                        tradeLog({
+                            scope: "scheduler",
+                            level: "info",
+                            strategyId: config.id,
+                            exchange: config.exchange,
+                            message: `mm-collision-resolved config=${config.id} disabled=${disabled} cancelled=${cancelled} alreadyClosed=${alreadyClosed} failed=${failed}`,
+                            throttleKey: `scheduler:mm-collision-resolved:${config.id}`,
                             throttleSec: 30,
                         });
                         continue;
@@ -130,6 +194,10 @@ async function runSchedulerTick(): Promise<void> {
             throttleSec: 20,
         });
     }
+}
+
+export async function runSchedulerTickOnce(): Promise<void> {
+    await runSchedulerTick();
 }
 
 let schedulerInterval: NodeJS.Timeout | null = null;
