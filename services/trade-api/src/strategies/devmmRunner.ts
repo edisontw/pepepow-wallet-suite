@@ -77,6 +77,10 @@ const DEVMM_VISIBILITY_GRACE_MS_NESTEX = Math.max(
     Number(process.env.DEVMM_VISIBILITY_GRACE_MS_NESTEX || 600_000)
 );
 const DEVMM_MAX_OPEN_ORDERS_SOFT = Math.max(1, Number(process.env.DEVMM_MAX_OPEN_ORDERS_SOFT || 4));
+const DEVMM_DEXTRADE_STALE_REFRESH_MS = Math.max(
+    60_000,
+    Number(process.env.DEVMM_DEXTRADE_STALE_REFRESH_MS || 600_000)
+);
 const DEVMM_BOOTSTRAP_ENABLED = process.env.DEVMM_BOOTSTRAP_ENABLED !== "0" && process.env.DEVMM_BOOTSTRAP_ENABLED !== "false";
 const DEVMM_BOOTSTRAP_WINDOW_MS = Math.max(1_000, Number(process.env.DEVMM_BOOTSTRAP_WINDOW_MS || 120_000));
 const DEVMM_BOOTSTRAP_ORDERS_PER_SIDE = 1;
@@ -619,6 +623,17 @@ interface OrderbookTop {
     bookSource?: "orderbook" | "ticker_fallback" | "ticker_primary" | "ticker" | "mid_fallback";
 }
 
+type ManagedOpenOrder = {
+    id: string;
+    side: "BUY" | "SELL" | "UNKNOWN";
+    clientOrderId?: string;
+    price?: number | null;
+    quantity?: number | null;
+    filledQuantity?: number | null;
+    createdAt?: number | null;
+    status?: string | null;
+};
+
 interface BalanceResult {
     ok: boolean;
     usdt: number;
@@ -644,6 +659,66 @@ interface MarketRules {
     minQty: number;
     qtyStep: number;
     priceTick: number;
+}
+
+interface DevmmQuotePlan {
+    quoteMid: number;
+    quoteAnchor: string;
+    buyPrice: number;
+    sellPrice: number;
+    buyQty: number;
+    sellQty: number;
+    adjustedBuyNotional: number;
+    adjustedSellNotional: number;
+    priceTickUsed: number;
+    forceSpreadMode: boolean;
+    forceSpreadTicks: number;
+    invalidQuotes: boolean;
+    crossSelf: boolean;
+}
+
+type DexTradeStaleRefreshDeps = {
+    cancelOrder: (orderId: string) => Promise<{ ok: boolean; error?: string | null }>;
+    listOpenOrders: () => Promise<{ ok: boolean; orders: ManagedOpenOrder[]; error?: string | null }>;
+    getFreshOrderbook: () => Promise<OrderbookTop>;
+    placeOrder: (side: "BUY" | "SELL", price: number, qty: number, clientOrderId: string) => Promise<OrderResult>;
+    buildQuotePlan?: (ob: OrderbookTop) => Promise<DevmmQuotePlan>;
+    sleep?: (ms: number) => Promise<void>;
+    onPendingAdd?: (orderId: string, clientOrderId: string, side: PendingOrderSide) => void;
+    onPendingRemove?: (orderId: string) => void;
+    onLocalPlacedAdd?: (orderId: string) => void;
+    onLocalPlacedRemove?: (orderId: string) => void;
+    onTrackedOrderChange?: (side: PendingOrderSide, orderId: string | null) => void;
+    onLastPlacedSide?: (side: PendingOrderSide) => void;
+    isStrategyEnabled?: () => boolean;
+    audit?: (params: {
+        action: "cancel" | "place" | "skip" | "error";
+        side: PendingOrderSide;
+        orderId?: string | null;
+        price?: number | null;
+        qty?: number | null;
+        reason: string;
+    }) => void;
+    log?: (level: "info" | "debug" | "error", message: string) => void;
+};
+
+export interface DexTradeStaleRefreshResult {
+    checked: boolean;
+    shouldRefresh: boolean;
+    suppressPlacement: boolean;
+    rawOpenOrders: ManagedOpenOrder[];
+    ageSec: number | null;
+    outcome:
+    | "not_applicable"
+    | "not_stale"
+    | "cancel_failed"
+    | "cancel_not_confirmed"
+    | "cancel_confirmed"
+    | "repost_skipped"
+    | "repost_placed"
+    | "repost_pending_not_visible";
+    reason: string;
+    newOrderId?: string;
 }
 
 async function getOrderbook(exchange: DevmmExchange, accessKey: string, secretKey: string): Promise<OrderbookTop> {
@@ -757,6 +832,592 @@ function getMarketRulesSync(exchange: DevmmExchange): MarketRules {
             return { minNotional: 0.0015, minQty: 1, qtyStep: 1, priceTick: 1e-8 };
         }
     }
+}
+
+function isPostOnlyReject(error: string | undefined): boolean {
+    const errLower = String(error || "").toLowerCase();
+    return errLower.includes("post") || errLower.includes("maker") || errLower.includes("crossing");
+}
+
+async function buildDevmmQuotePlan(
+    exchange: DevmmExchange,
+    config: DevmmConfig,
+    ob: OrderbookTop,
+    rules: MarketRules
+): Promise<DevmmQuotePlan> {
+    const priceTickUsed = resolvePriceTick(rules.priceTick, [ob.bid, ob.ask]);
+    const forceSpreadTicks = DEVMM_FORCE_SPREAD_TICKS;
+    const spreadAbs = (ob.ask || 0) - (ob.bid || 0);
+    const forceSpreadMode = !!ob.forcedMid || !Number.isFinite(spreadAbs) || spreadAbs <= 0;
+    const buyOffsetPct = normalizePercentRatio(config.buy_offset_pct, 0.02);
+    const sellOffsetPct = normalizePercentRatio(config.sell_offset_pct, 0.01);
+
+    let quoteMid = (ob.bid || 0) > 0 && (ob.ask || 0) > 0 ? ((ob.bid as number) + (ob.ask as number)) / 2 : Math.max(ob.bid || 0, ob.ask || 0);
+    let quoteAnchor = "ORDERBOOK_MID";
+    const anchorFromExchange = await fetchExchangePrice(exchange as ExchangeName, "PEPEW/USDT").catch(() => null);
+    if (anchorFromExchange?.price && anchorFromExchange.price > 0) {
+        quoteMid = anchorFromExchange.price;
+        quoteAnchor = `EXCHANGE_${anchorFromExchange.source}`;
+    }
+    if ((!anchorFromExchange || !anchorFromExchange.price || anchorFromExchange.price <= 0) && (forceSpreadMode || ob.bookSource !== "orderbook")) {
+        const anchorFromAgg = await fetchAggregatedPrice("PEPEW/USDT").catch(() => null);
+        if (anchorFromAgg?.price && anchorFromAgg.price > 0) {
+            quoteMid = anchorFromAgg.price;
+            quoteAnchor = "AGG";
+        }
+    }
+
+    let buyPrice = floorToTick(quoteMid * (1 - buyOffsetPct), priceTickUsed);
+    let sellPrice = ceilToTick(quoteMid * (1 + sellOffsetPct), priceTickUsed);
+    if (forceSpreadMode) {
+        buyPrice = floorToTick(quoteMid - forceSpreadTicks * priceTickUsed, priceTickUsed);
+        sellPrice = ceilToTick(quoteMid + forceSpreadTicks * priceTickUsed, priceTickUsed);
+    }
+
+    const maxBuy = ob.ask && ob.ask > 0 ? floorToTick(ob.ask - priceTickUsed, priceTickUsed) : null;
+    const minSell = ob.bid && ob.bid > 0 ? ceilToTick(ob.bid + priceTickUsed, priceTickUsed) : null;
+    if (Number.isFinite(maxBuy as number) && (maxBuy as number) > 0 && ob.ask && buyPrice >= ob.ask) {
+        buyPrice = maxBuy as number;
+    }
+    if (Number.isFinite(minSell as number) && (minSell as number) > 0 && ob.bid && sellPrice <= ob.bid) {
+        sellPrice = minSell as number;
+    }
+
+    const invalidQuotes =
+        !Number.isFinite(quoteMid) ||
+        quoteMid <= 0 ||
+        !Number.isFinite(buyPrice) ||
+        !Number.isFinite(sellPrice) ||
+        buyPrice <= 0 ||
+        sellPrice <= 0;
+    const crossSelf = !invalidQuotes && buyPrice >= sellPrice;
+
+    const orderQuote = resolveOrderQuote(exchange, config.order_quote_usdt);
+    let buyQty = invalidQuotes ? 0 : roundToStep(orderQuote / buyPrice, rules.qtyStep);
+    let sellQty = invalidQuotes ? 0 : roundToStep(orderQuote / sellPrice, rules.qtyStep);
+    if (!invalidQuotes && buyPrice * buyQty < rules.minNotional) {
+        buyQty = Math.ceil(rules.minNotional * 1.05 / buyPrice / rules.qtyStep) * rules.qtyStep;
+    }
+    if (!invalidQuotes && sellPrice * sellQty < rules.minNotional) {
+        sellQty = Math.ceil(rules.minNotional * 1.05 / sellPrice / rules.qtyStep) * rules.qtyStep;
+    }
+
+    return {
+        quoteMid,
+        quoteAnchor,
+        buyPrice,
+        sellPrice,
+        buyQty,
+        sellQty,
+        adjustedBuyNotional: buyPrice * buyQty,
+        adjustedSellNotional: sellPrice * sellQty,
+        priceTickUsed,
+        forceSpreadMode,
+        forceSpreadTicks,
+        invalidQuotes,
+        crossSelf,
+    };
+}
+
+function evaluateDexTradeStaleCandidate(
+    order: ManagedOpenOrder,
+    now: number,
+    rules: MarketRules
+): {
+    shouldRefresh: boolean;
+    ageSec: number | null;
+    reason: string;
+    remainingQty: number;
+    isPartial: boolean;
+} {
+    const createdAt = Number.isFinite(order.createdAt as number) ? Number(order.createdAt) : null;
+    if (!createdAt || createdAt <= 0) {
+        return { shouldRefresh: false, ageSec: null, reason: "missing_created_at", remainingQty: 0, isPartial: false };
+    }
+
+    const ageMs = Math.max(0, now - createdAt);
+    const ageSec = Math.floor(ageMs / 1000);
+    const totalQty = Math.max(0, toNumber(order.quantity) || 0);
+    const filledQty = Math.max(0, toNumber(order.filledQuantity) || 0);
+    const remainingQty = roundToStep(Math.max(0, totalQty - filledQty), rules.qtyStep);
+    const isPartial = filledQty > 0;
+
+    if (ageMs < DEVMM_DEXTRADE_STALE_REFRESH_MS) {
+        return { shouldRefresh: false, ageSec, reason: "age_below_threshold", remainingQty, isPartial };
+    }
+    if (isPartial && remainingQty < rules.minQty) {
+        return { shouldRefresh: false, ageSec, reason: "remaining_below_min_qty", remainingQty, isPartial };
+    }
+    return { shouldRefresh: true, ageSec, reason: "stale_refresh", remainingQty, isPartial };
+}
+
+export async function maybeRefreshDexTradeStaleOrder(params: {
+    config: DevmmConfig;
+    exchange: DevmmExchange;
+    symbol: string;
+    side: PendingOrderSide;
+    order: ManagedOpenOrder | null | undefined;
+    now: number;
+    rules: MarketRules;
+    rawOpenOrders: ManagedOpenOrder[];
+}, deps: DexTradeStaleRefreshDeps): Promise<DexTradeStaleRefreshResult> {
+    const order = params.order;
+    const logger = deps.log || (() => { });
+    const audit = deps.audit || (() => { });
+    const sleep = deps.sleep || (async (ms: number) => {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+    });
+
+    if (params.exchange !== "dextrade" || !order || order.side !== params.side) {
+        return {
+            checked: false,
+            shouldRefresh: false,
+            suppressPlacement: false,
+            rawOpenOrders: params.rawOpenOrders,
+            ageSec: null,
+            outcome: "not_applicable",
+            reason: "not_dextrade_or_missing_order",
+        };
+    }
+
+    const evaluation = evaluateDexTradeStaleCandidate(order, params.now, params.rules);
+    logger(
+        "info",
+        `stale_check strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} ageSec=${evaluation.ageSec ?? "n/a"} status=${order.status || "OPEN"} decision=${evaluation.shouldRefresh ? "yes" : "no"} reason=${evaluation.reason}`
+    );
+
+    if (!evaluation.shouldRefresh) {
+        return {
+            checked: true,
+            shouldRefresh: false,
+            suppressPlacement: false,
+            rawOpenOrders: params.rawOpenOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "not_stale",
+            reason: evaluation.reason,
+        };
+    }
+
+    logger(
+        "info",
+        `stale_cancel_requested strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} price=${order.price ?? "n/a"} qty=${order.quantity ?? "n/a"} ageSec=${evaluation.ageSec ?? "n/a"} trigger=stale_refresh`
+    );
+    audit({
+        action: "cancel",
+        side: params.side,
+        orderId: order.id,
+        price: order.price ?? null,
+        qty: order.quantity ?? null,
+        reason: "STALE_CANCEL_REQUESTED",
+    });
+
+    const cancelResult = await deps.cancelOrder(order.id);
+    if (!cancelResult.ok) {
+        logger(
+            "error",
+            `stale_cancel_failed strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=${cancelResult.error || "cancel_failed"}`
+        );
+        audit({
+            action: "error",
+            side: params.side,
+            orderId: order.id,
+            price: order.price ?? null,
+            qty: order.quantity ?? null,
+            reason: "STALE_CANCEL_FAILED",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: params.rawOpenOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "cancel_failed",
+            reason: cancelResult.error || "cancel_failed",
+        };
+    }
+
+    const confirmResult = await deps.listOpenOrders();
+    if (!confirmResult.ok) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=cancel_not_confirmed`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: order.price ?? null,
+            qty: order.quantity ?? null,
+            reason: "STALE_REPOST_SKIPPED_CONFIRM_FAILED",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: params.rawOpenOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "cancel_not_confirmed",
+            reason: "cancel_not_confirmed",
+        };
+    }
+
+    const refreshedOrders = confirmResult.orders;
+    if (refreshedOrders.some((entry) => entry.id === order.id)) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=cancel_not_confirmed_still_live`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: order.price ?? null,
+            qty: order.quantity ?? null,
+            reason: "STALE_REPOST_SKIPPED_STILL_LIVE",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "cancel_not_confirmed",
+            reason: "cancel_not_confirmed_still_live",
+        };
+    }
+
+    deps.onPendingRemove?.(order.id);
+    deps.onLocalPlacedRemove?.(order.id);
+    deps.onTrackedOrderChange?.(params.side, null);
+    logger(
+        "info",
+        `stale_cancel_confirmed strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id}`
+    );
+
+    if (deps.isStrategyEnabled && !deps.isStrategyEnabled()) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=strategy_disabled`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: order.price ?? null,
+            qty: order.quantity ?? null,
+            reason: "STALE_REPOST_SKIPPED_STRATEGY_DISABLED",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "strategy_disabled",
+        };
+    }
+
+    if (refreshedOrders.some((entry) => entry.side === params.side)) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=same_side_order_visible`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: order.price ?? null,
+            qty: order.quantity ?? null,
+            reason: "STALE_REPOST_SKIPPED_SAME_SIDE_VISIBLE",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "same_side_order_visible",
+        };
+    }
+
+    const freshOb = await deps.getFreshOrderbook();
+    if (!freshOb.bid || !freshOb.ask || freshOb.bid <= 0 || freshOb.ask <= 0) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=orderbook_unavailable`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: order.price ?? null,
+            qty: order.quantity ?? null,
+            reason: "STALE_REPOST_SKIPPED_NO_BOOK",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "orderbook_unavailable",
+        };
+    }
+
+    const quotePlan = deps.buildQuotePlan
+        ? await deps.buildQuotePlan(freshOb)
+        : await buildDevmmQuotePlan(params.exchange, params.config, freshOb, params.rules);
+    if (quotePlan.invalidQuotes) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=invalid_quote`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            reason: "STALE_REPOST_SKIPPED_INVALID_QUOTE",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "invalid_quote",
+        };
+    }
+    if (quotePlan.crossSelf) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=anti_cross_self`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            reason: "STALE_REPOST_SKIPPED_ANTI_CROSS",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "anti_cross_self",
+        };
+    }
+
+    let repostPrice = params.side === "BUY" ? quotePlan.buyPrice : quotePlan.sellPrice;
+    let repostQty = params.side === "BUY" ? quotePlan.buyQty : quotePlan.sellQty;
+    if (evaluation.isPartial) {
+        repostQty = evaluation.remainingQty;
+    }
+
+    if (!Number.isFinite(repostQty) || repostQty < params.rules.minQty) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=remaining_too_small`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: repostPrice,
+            qty: repostQty,
+            reason: "STALE_REPOST_SKIPPED_REMAINING_TOO_SMALL",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "remaining_too_small",
+        };
+    }
+
+    const notional = repostPrice * repostQty;
+    if (!Number.isFinite(notional) || notional < params.rules.minNotional) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=min_notional_invalid`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: repostPrice,
+            qty: repostQty,
+            reason: "STALE_REPOST_SKIPPED_MIN_NOTIONAL",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "min_notional_invalid",
+        };
+    }
+
+    if ((params.side === "BUY" && repostPrice >= freshOb.ask) || (params.side === "SELL" && repostPrice <= freshOb.bid)) {
+        logger(
+            "info",
+            `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=anti_cross_blocked`
+        );
+        audit({
+            action: "skip",
+            side: params.side,
+            orderId: order.id,
+            price: repostPrice,
+            qty: repostQty,
+            reason: "STALE_REPOST_SKIPPED_ANTI_CROSS",
+        });
+        return {
+            checked: true,
+            shouldRefresh: true,
+            suppressPlacement: true,
+            rawOpenOrders: refreshedOrders,
+            ageSec: evaluation.ageSec,
+            outcome: "repost_skipped",
+            reason: "anti_cross_blocked",
+        };
+    }
+
+    let placedOrderId: string | undefined;
+    let verifyOrders = refreshedOrders;
+    let currentPrice = repostPrice;
+    for (let retries = 0; retries < 3; retries++) {
+        const clientOrderId = buildDevmmClientOrderId(params.config.id);
+        const placeResult = await deps.placeOrder(params.side, currentPrice, repostQty, clientOrderId);
+        if (placeResult.ok && placeResult.orderId) {
+            placedOrderId = placeResult.orderId;
+            deps.onLocalPlacedAdd?.(placeResult.orderId);
+            deps.onLastPlacedSide?.(params.side);
+            deps.onPendingAdd?.(placeResult.orderId, clientOrderId, params.side);
+            deps.onTrackedOrderChange?.(params.side, placeResult.orderId);
+            audit({
+                action: "place",
+                side: params.side,
+                orderId: placeResult.orderId,
+                price: currentPrice,
+                qty: repostQty,
+                reason: "STALE_REPOST_PLACED",
+            });
+
+            let visible = false;
+            for (let verifyAttempt = 0; verifyAttempt < 3; verifyAttempt++) {
+                if (verifyAttempt > 0) {
+                    await sleep(1000);
+                }
+                const verifyResult = await deps.listOpenOrders();
+                if (!verifyResult.ok) continue;
+                verifyOrders = verifyResult.orders;
+                if (verifyOrders.some((entry) => entry.id === placeResult.orderId)) {
+                    visible = true;
+                    break;
+                }
+            }
+
+            if (visible) {
+                deps.onPendingRemove?.(placeResult.orderId);
+                logger(
+                    "info",
+                    `stale_repost_placed strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} oldOrderId=${order.id} newOrderId=${placeResult.orderId} price=${currentPrice} qty=${repostQty} ageSec=${evaluation.ageSec ?? "n/a"}`
+                );
+                return {
+                    checked: true,
+                    shouldRefresh: true,
+                    suppressPlacement: true,
+                    rawOpenOrders: verifyOrders,
+                    ageSec: evaluation.ageSec,
+                    outcome: "repost_placed",
+                    reason: "repost_placed",
+                    newOrderId: placeResult.orderId,
+                };
+            }
+
+            logger(
+                "info",
+                `stale_repost_placed strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} oldOrderId=${order.id} newOrderId=${placeResult.orderId} price=${currentPrice} qty=${repostQty} visibility=pending_not_visible`
+            );
+            return {
+                checked: true,
+                shouldRefresh: true,
+                suppressPlacement: true,
+                rawOpenOrders: verifyOrders,
+                ageSec: evaluation.ageSec,
+                outcome: "repost_pending_not_visible",
+                reason: "pending_not_visible",
+                newOrderId: placeResult.orderId,
+            };
+        }
+
+        if (!isPostOnlyReject(placeResult.error)) {
+            logger(
+                "info",
+                `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=${placeResult.error || "place_failed"}`
+            );
+            audit({
+                action: "error",
+                side: params.side,
+                orderId: order.id,
+                price: currentPrice,
+                qty: repostQty,
+                reason: "STALE_REPOST_PLACE_FAILED",
+            });
+            return {
+                checked: true,
+                shouldRefresh: true,
+                suppressPlacement: true,
+                rawOpenOrders: refreshedOrders,
+                ageSec: evaluation.ageSec,
+                outcome: "repost_skipped",
+                reason: placeResult.error || "place_failed",
+            };
+        }
+
+        currentPrice = params.side === "BUY"
+            ? floorToTick(currentPrice - quotePlan.priceTickUsed, quotePlan.priceTickUsed)
+            : ceilToTick(currentPrice + quotePlan.priceTickUsed, quotePlan.priceTickUsed);
+        if (
+            currentPrice <= 0 ||
+            (params.side === "BUY" && currentPrice >= freshOb.ask) ||
+            (params.side === "SELL" && currentPrice <= freshOb.bid)
+        ) {
+            break;
+        }
+    }
+
+    logger(
+        "info",
+        `stale_repost_skipped strategyId=${params.config.id} exchange=${params.exchange} symbol=${params.symbol} side=${params.side} orderId=${order.id} reason=post_only_retry_exhausted`
+    );
+    audit({
+        action: "error",
+        side: params.side,
+        orderId: order.id,
+        price: repostPrice,
+        qty: repostQty,
+        reason: "STALE_REPOST_POST_ONLY_RETRY_EXHAUSTED",
+    });
+    return {
+        checked: true,
+        shouldRefresh: true,
+        suppressPlacement: true,
+        rawOpenOrders: refreshedOrders,
+        ageSec: evaluation.ageSec,
+        outcome: "repost_skipped",
+        reason: "post_only_retry_exhausted",
+    };
 }
 
 function transitionDevmmState(
@@ -885,7 +1546,7 @@ async function listOpenOrders(
     accessKey: string,
     secretKey: string,
     rateLimitKey: string
-): Promise<Array<{ id: string; side: string; clientOrderId?: string }>> {
+): Promise<ManagedOpenOrder[]> {
     try {
         if (exchange === "nonkyc") {
             const res = await listNonKycOpenOrders(accessKey, secretKey, "PEPEW_USDT");
@@ -896,7 +1557,12 @@ async function listOpenOrders(
             return rawOrders.map((o: any) => ({
                 id: normalizeOrderId(o.order_id || o.id),
                 side: normalizeOrderSide(o.side),
-                clientOrderId: o.userProvidedId || o.clientOrderId || undefined
+                clientOrderId: o.userProvidedId || o.clientOrderId || undefined,
+                price: toNumber(o.price),
+                quantity: toNumber(o.quantity),
+                filledQuantity: toNumber(o.filled_quantity) ?? toNumber(o.executedQty),
+                createdAt: toNumber(o.created_at),
+                status: String(o.status || "OPEN"),
             }));
         } else if (exchange === "dextrade") {
             const res = await listDexTradeOpenOrders(accessKey, secretKey, "PEPEWUSDT");
@@ -904,7 +1570,12 @@ async function listOpenOrders(
             return res.orders.map((o: any) => ({
                 id: normalizeOrderId(o.id || o.order_id),
                 side: normalizeOrderSide(o.side ?? o.type),
-                clientOrderId: undefined // DexTrade might not return it in list
+                clientOrderId: undefined,
+                price: toNumber(o.price),
+                quantity: toNumber(o.quantity),
+                filledQuantity: toNumber(o.filled_quantity),
+                createdAt: toNumber(o.created_at),
+                status: String(o.status || "OPEN"),
             }));
         } else if (exchange === "nestex") {
             const res = await listNestExOpenOrders(accessKey, secretKey, "PEPEW/USDT", rateLimitKey, { exhaustive: true });
@@ -912,7 +1583,12 @@ async function listOpenOrders(
             return res.orders.map((o: any) => ({
                 id: normalizeOrderId(o.order_id || o.id),
                 side: normalizeOrderSide(o.side ?? o.type ?? o.order_type),
-                clientOrderId: o.client_order_id || o.clientOrderId || undefined
+                clientOrderId: o.client_order_id || o.clientOrderId || undefined,
+                price: toNumber(o.price),
+                quantity: toNumber(o.qty ?? o.quantity ?? o.volume),
+                filledQuantity: toNumber(o.filled_qty ?? o.filled_quantity ?? o.executedQty),
+                createdAt: toNumber(o.created_at ?? o.timestamp),
+                status: String(o.status || "OPEN"),
             }));
         }
         return [];
@@ -1260,47 +1936,21 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             log("debug", exchange, `Inventory guard: skip SELL, usdt_share ${(usdtShare * 100).toFixed(1)}% > max ${(config.inventory_max_usdt_share * 100).toFixed(0)}%`);
         }
 
-        const buyOffsetPct = normalizePercentRatio(config.buy_offset_pct, 0.02);
-        const sellOffsetPct = normalizePercentRatio(config.sell_offset_pct, 0.01);
-
-        // Calculate order prices
-        let quoteMid = mid;
-        let quoteAnchor = "ORDERBOOK_MID";
-        const anchorFromExchange = await fetchExchangePrice(exchange as ExchangeName, "PEPEW/USDT").catch(() => null);
-        if (anchorFromExchange?.price && anchorFromExchange.price > 0) {
-            quoteMid = anchorFromExchange.price;
-            quoteAnchor = `EXCHANGE_${anchorFromExchange.source}`;
-        }
-        if ((!anchorFromExchange || !anchorFromExchange.price || anchorFromExchange.price <= 0) && (forceSpreadMode || ob.bookSource !== "orderbook")) {
-            const anchorFromAgg = await fetchAggregatedPrice("PEPEW/USDT").catch(() => null);
-            if (anchorFromAgg?.price && anchorFromAgg.price > 0) {
-                quoteMid = anchorFromAgg.price;
-                quoteAnchor = "AGG";
-            }
-        }
-
-        let buyPrice = floorToTick(quoteMid * (1 - buyOffsetPct), priceTickUsed);
-        let sellPrice = ceilToTick(quoteMid * (1 + sellOffsetPct), priceTickUsed);
-        if (forceSpreadMode) {
-            buyPrice = floorToTick(quoteMid - forceSpreadTicks * priceTickUsed, priceTickUsed);
-            sellPrice = ceilToTick(quoteMid + forceSpreadTicks * priceTickUsed, priceTickUsed);
+        const quotePlan = await buildDevmmQuotePlan(exchange, config, ob, rules);
+        let buyPrice = quotePlan.buyPrice;
+        let sellPrice = quotePlan.sellPrice;
+        let buyQty = quotePlan.buyQty;
+        let sellQty = quotePlan.sellQty;
+        let adjustedBuyNotional = quotePlan.adjustedBuyNotional;
+        let adjustedSellNotional = quotePlan.adjustedSellNotional;
+        if (quotePlan.forceSpreadMode) {
             log(
                 "info",
                 exchange,
-                `FORCE_SPREAD quotes bid=${buyPrice} ask=${sellPrice} quoteMid=${quoteMid} anchor=${quoteAnchor} forceSpreadTicks=${forceSpreadTicks} priceTickUsed=${priceTickUsed}`
+                `FORCE_SPREAD quotes bid=${buyPrice} ask=${sellPrice} quoteMid=${quotePlan.quoteMid} anchor=${quotePlan.quoteAnchor} forceSpreadTicks=${quotePlan.forceSpreadTicks} priceTickUsed=${quotePlan.priceTickUsed}`
             );
         }
-
-        // No-crossing guard against top-of-book
-        const maxBuy = floorToTick(ob.ask - priceTickUsed, priceTickUsed);
-        const minSell = ceilToTick(ob.bid + priceTickUsed, priceTickUsed);
-        if (Number.isFinite(maxBuy) && maxBuy > 0 && buyPrice >= ob.ask) {
-            buyPrice = maxBuy;
-        }
-        if (Number.isFinite(minSell) && minSell > 0 && sellPrice <= ob.bid) {
-            sellPrice = minSell;
-        }
-        if (!Number.isFinite(buyPrice) || !Number.isFinite(sellPrice) || buyPrice <= 0 || sellPrice <= 0) {
+        if (quotePlan.invalidQuotes) {
             guardHits.push(DevmmSkipReason.NO_CROSSING);
             skipBuy = true;
             skipSell = true;
@@ -1309,40 +1959,22 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
         }
 
         // 5. Cross-Self Guard
-        if (!skipReasons.has(DevmmSkipReason.NO_CROSSING) && buyPrice >= sellPrice) {
+        if (!skipReasons.has(DevmmSkipReason.NO_CROSSING) && quotePlan.crossSelf) {
             guardHits.push(DevmmSkipReason.NO_CROSSING);
             skipBuy = true;
             skipSell = true;
             skipReasons.add(DevmmSkipReason.NO_CROSSING);
             log("error", exchange, `SKIP_TICK:${DevmmSkipReason.NO_CROSSING} cross-self guard buy=${buyPrice} sell=${sellPrice}`);
         }
-
-        // Calculate quantities
         const orderQuote = resolveOrderQuote(exchange, config.order_quote_usdt);
-        const rawBuyQty = orderQuote / buyPrice;
-        const rawSellQty = orderQuote / sellPrice;
-        let buyQty = roundToStep(rawBuyQty, rules.qtyStep);
-        let sellQty = roundToStep(rawSellQty, rules.qtyStep);
 
         if (exchange === "nestex") {
-            const buyNotionalSized = buyPrice * buyQty;
-            const sellNotionalSized = sellPrice * sellQty;
-            log("info", exchange, `[NestEx sizing] side=BUY price=${buyPrice} targetNotional=1 calculatedQty=${rawBuyQty} finalQtyAfterPrecision=${buyQty} notional=${buyNotionalSized}`);
-            log("info", exchange, `[NestEx sizing] side=SELL price=${sellPrice} targetNotional=1 calculatedQty=${rawSellQty} finalQtyAfterPrecision=${sellQty} notional=${sellNotionalSized}`);
+            const rawBuyQty = buyPrice > 0 ? (orderQuote / buyPrice) : 0;
+            const rawSellQty = sellPrice > 0 ? (orderQuote / sellPrice) : 0;
+            log("info", exchange, `[NestEx sizing] side=BUY price=${buyPrice} targetNotional=1 calculatedQty=${rawBuyQty} finalQtyAfterPrecision=${buyQty} notional=${adjustedBuyNotional}`);
+            log("info", exchange, `[NestEx sizing] side=SELL price=${sellPrice} targetNotional=1 calculatedQty=${rawSellQty} finalQtyAfterPrecision=${sellQty} notional=${adjustedSellNotional}`);
         }
 
-        // Verify minimum notional
-        const buyNotional = buyPrice * buyQty;
-        const sellNotional = sellPrice * sellQty;
-
-        if (buyNotional < rules.minNotional) {
-            buyQty = Math.ceil(rules.minNotional * 1.05 / buyPrice / rules.qtyStep) * rules.qtyStep;
-        }
-        if (sellNotional < rules.minNotional) {
-            sellQty = Math.ceil(rules.minNotional * 1.05 / sellPrice / rules.qtyStep) * rules.qtyStep;
-        }
-        const adjustedBuyNotional = buyPrice * buyQty;
-        const adjustedSellNotional = sellPrice * sellQty;
         if (!Number.isFinite(adjustedBuyNotional) || adjustedBuyNotional < rules.minNotional) {
             skipBuy = true;
             skipReasons.add(DevmmSkipReason.MIN_NOTIONAL);
@@ -1661,8 +2293,97 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
         pendingOrders = pruneAndGetPendingOrders(exchange, now);
         const pendingCount = pendingOrders.length;
 
-        const currentBuyOrder = openOrders.find(o => o.side === "BUY");
-        const currentSellOrder = openOrders.find(o => o.side === "SELL");
+        let currentBuyOrder = openOrders.find(o => o.side === "BUY");
+        let currentSellOrder = openOrders.find(o => o.side === "SELL");
+
+        let staleSuppressedBuy = false;
+        let staleSuppressedSell = false;
+        if (exchange === "dextrade") {
+            const listDexTradeOrdersDetailed = async (): Promise<{ ok: boolean; orders: ManagedOpenOrder[]; error?: string | null }> => {
+                const res = await listDexTradeOpenOrders(accessKey, secretKey, "PEPEWUSDT");
+                if (!res.ok || !Array.isArray(res.orders)) {
+                    return { ok: false, orders: [], error: res.error || "LIST_OPEN_ORDERS_FAILED" };
+                }
+                return {
+                    ok: true,
+                    orders: res.orders.map((o: any) => ({
+                        id: normalizeOrderId(o.id || o.order_id),
+                        side: normalizeOrderSide(o.side ?? o.type),
+                        clientOrderId: undefined,
+                        price: toNumber(o.price),
+                        quantity: toNumber(o.quantity),
+                        filledQuantity: toNumber(o.filled_quantity),
+                        createdAt: toNumber(o.created_at),
+                        status: String(o.status || "OPEN"),
+                    })),
+                };
+            };
+            const refreshTrackedOrder = async (side: PendingOrderSide, trackedOrderId: string | null | undefined): Promise<void> => {
+                if (!trackedOrderId) return;
+                const trackedOrder = rawOpenOrders.find((entry) => entry.id === trackedOrderId && entry.side === side);
+                const result = await maybeRefreshDexTradeStaleOrder(
+                    {
+                        config,
+                        exchange,
+                        symbol: config.symbol,
+                        side,
+                        order: trackedOrder,
+                        now,
+                        rules,
+                        rawOpenOrders,
+                    },
+                    {
+                        cancelOrder: async (orderId: string) => {
+                            const res = await cancelDexTradeOrder(accessKey, secretKey, orderId, "PEPEWUSDT");
+                            return { ok: res.ok, error: res.error || null };
+                        },
+                        listOpenOrders: listDexTradeOrdersDetailed,
+                        getFreshOrderbook: async () => getOrderbook(exchange, accessKey, secretKey),
+                        placeOrder: async (placeSide, price, qty, clientOrderId) =>
+                            placeOrder(exchange, accessKey, secretKey, rateLimitKey, placeSide, price, qty, clientOrderId),
+                        onPendingAdd: (orderId, clientOrderId, pendingSide) => addPendingOrder(exchange, { orderId, clientOrderId, side: pendingSide }, now),
+                        onPendingRemove: (orderId) => removePendingOrders(exchange, orderId),
+                        onLocalPlacedAdd: (orderId) => markLocallyPlacedOrder(exchange, orderId),
+                        onLocalPlacedRemove: (orderId) => clearLocallyPlacedOrder(exchange, orderId),
+                        onTrackedOrderChange: (trackedSide, orderId) => {
+                            if (trackedSide === "BUY") {
+                                upsertDevmmState(exchange, config.symbol, { open_buy_order_id: orderId });
+                            } else {
+                                upsertDevmmState(exchange, config.symbol, { open_sell_order_id: orderId });
+                            }
+                        },
+                        onLastPlacedSide: (placedSide) => lastPlacedSideByExchange.set(exchange, placedSide),
+                        isStrategyEnabled: () => (getDevmmConfigById(config.id)?.is_enabled || 0) === 1,
+                        audit: ({ action, side: auditSide, orderId, price, qty, reason }) => {
+                            insertTradeAudit({
+                                strategyId: config.id,
+                                strategyType: "DEVMM",
+                                exchange,
+                                pair: config.symbol,
+                                action,
+                                side: auditSide,
+                                orderId,
+                                price,
+                                qty,
+                                reason,
+                            });
+                        },
+                        log: (level, message) => log(level, exchange, message),
+                    }
+                );
+                rawOpenOrders = result.rawOpenOrders;
+                state = getDevmmState(exchange, config.symbol)!;
+                openOrders = rawOpenOrders.filter(isManagedOrder);
+                pendingOrders = reconcilePendingWithVisibleOrders(exchange, now, rawOpenOrders);
+                currentBuyOrder = openOrders.find((entry) => entry.side === "BUY");
+                currentSellOrder = openOrders.find((entry) => entry.side === "SELL");
+                if (side === "BUY") staleSuppressedBuy = result.suppressPlacement;
+                if (side === "SELL") staleSuppressedSell = result.suppressPlacement;
+            };
+
+            await refreshTrackedOrder("BUY", state.open_buy_order_id);
+            await refreshTrackedOrder("SELL", state.open_sell_order_id);
+        }
 
         // Hard cap for new placements: use all visible orders (not only tracked/prefixed) to avoid over-placement.
         const unknownSideCount = rawOpenOrders.filter(o => o.side === "UNKNOWN").length;
@@ -1707,6 +2428,12 @@ async function tickDevmm(config: DevmmConfig, now: number): Promise<void> {
             if (!state.open_sell_order_id && pendingSellId) {
                 upsertDevmmState(exchange, config.symbol, { open_sell_order_id: pendingSellId });
             }
+        }
+        if (staleSuppressedBuy) {
+            skipBuy = true;
+        }
+        if (staleSuppressedSell) {
+            skipSell = true;
         }
 
         // If one side exists but the opposite side is missing, relax inventory guard once to restore 2-sided quoting.

@@ -4,8 +4,9 @@
 
 Nginx vhosts live in `ops/nginx/` and proxy to local services:
 
-- `api.pepepow.net` -> `http://127.0.0.1:9193` (default)
-- `api.pepepow.net/wallet/` and `api.pepepow.net/auth/telegram` -> `http://127.0.0.1:9194`
+- `api.pepepow.net` is a path-split host
+- public chain-read routes go to `http://127.0.0.1:9193` (`pepew-api`)
+- wallet-domain routes go to `http://127.0.0.1:9194` (`wallet-api`)
 
 Each vhost includes:
 
@@ -14,6 +15,14 @@ Each vhost includes:
 - `Host` / `X-Real-IP` / `X-Forwarded-For` / `X-Forwarded-Proto`
 - sane proxy timeouts
 - `/healthz` and `/readyz` passthrough
+
+For `api.pepepow.net`, the split is intentional:
+
+- root `/health`, `/healthz`, `/readyz`, `/docs`, and selected chain-read `/v1/*` paths belong to `pepew-api`
+- `/wallet/*`, `/api/*`, `/tg/*`, and wallet compatibility `/v1/*` paths belong to `wallet-api`
+- `POST /v1/history` remains on `wallet-api` for compatibility
+
+Do not simplify this back into a single default upstream for all `/v1/*` traffic.
 
 ## Install / enable
 
@@ -62,6 +71,10 @@ curl -I http://api.pepepow.net
 ```bash
 curl -fsS https://api.pepepow.net/healthz
 curl -fsS https://api.pepepow.net/readyz
+curl -fsS https://api.pepepow.net/docs
+curl -fsS https://api.pepepow.net/v1/chain/height
+curl -fsS https://api.pepepow.net/v1/mempool/info
 curl -fsS https://api.pepepow.net/wallet/healthz
 curl -fsS https://api.pepepow.net/wallet/readyz
+curl -fsS https://api.pepepow.net/v1/price
 ```

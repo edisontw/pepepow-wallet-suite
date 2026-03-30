@@ -47,6 +47,8 @@
 | POST | `/v1/history` | Batch history proxy (addresses[]) | No |
 | GET | `/v1/price` | PEPEW price (CoinMarketCap) | No |
 
+`POST /v1/history` intentionally remains on `wallet-api` on the public host for compatibility with the existing web wallet flow. It should not be reassigned to the public `pepew-api` route set.
+
 ## /wallet and /api Endpoints (Read/Broadcast)
 
 | Method | Path | Purpose | JWT Required |

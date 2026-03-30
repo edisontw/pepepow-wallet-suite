@@ -31,11 +31,13 @@ Not used:
 - MongoDB (no Mongo client or config in this repo)
 
 ## Nginx reverse proxy considerations
-- Proxy `api.pepepow.net` -> `http://127.0.0.1:9193` (default)
-- Proxy `api.pepepow.net/wallet/` and `api.pepepow.net/auth/telegram` -> `http://127.0.0.1:9194`
+- `api.pepepow.net` is path-split, not single-upstream
+- Route root `/health`, `/healthz`, `/readyz`, `/docs`, and selected public chain-read `/v1/*` paths to `http://127.0.0.1:9193`
+- Route `/wallet/*`, `/api/*`, `/tg/*`, and wallet compatibility `/v1/*` paths to `http://127.0.0.1:9194`
+- Keep `POST /v1/history` on `wallet-api` for public compatibility
 - Preserve `Host`/`X-Forwarded-*` headers and sane proxy timeouts
 - Allow `/.well-known/acme-challenge/` for certbot
-- Pass through `/healthz` and `/readyz`
+- Pass through `/healthz` and `/readyz` to `pepew-api`
 - Serve the web UI from `/srv/wallet`
 
 See `docs/nginx.md` and `ops/nginx/` for reference configs.
@@ -52,18 +54,23 @@ Local:
 Via nginx:
 - `GET https://api.pepepow.net/healthz`
 - `GET https://api.pepepow.net/readyz`
+- `GET https://api.pepepow.net/docs`
+- `GET https://api.pepepow.net/v1/chain/height`
 - `GET https://api.pepepow.net/wallet/healthz`
 - `GET https://api.pepepow.net/wallet/readyz`
 
 Expected JSON shapes:
 - `GET /healthz`
   - `{ "ok": true, "service": "pepew-api", "uptimeSec": 123 }`
-  - `pepepow-wallet-api` adds `{ "version": "2024.03.29", "gitSha": "abcdef1234567890" }` when set
+- `GET /wallet/healthz`
+  - `pepepow-wallet-api` returns `{ "ok": true, "service": "wallet-api", "uptimeSec": 123 }`
 - `GET /readyz` (healthy)
   - `pepew-api`: `{ "ok": true, "service": "pepew-api", "uptimeSec": 123, "deps": { "rpc": { "ok": true, "height": 123 }, "redis": { "ok": true, "detail": "PONG" } } }`
-  - `pepepow-wallet-api`: `{ "ok": true, "service": "wallet-api", "uptimeSec": 123, "deps": { "pepewApi": { "ok": true }, "coreRpc": { "ok": true, "height": 123 }, "telegram": { "ok": true } } }`
+  - `GET /wallet/readyz` on the public host returns wallet readiness from `wallet-api`
 - `GET /readyz` (unhealthy, `503`)
-  - `{ "ok": false, "service": "wallet-api", "deps": { ... }, "error": "core-rpc: RPC auth failed (401). Check CORE_RPC_URL credentials or pepepowd rpcuser/rpcpassword." }`
+  - `pepew-api` returns `{ "ok": false, "service": "pepew-api", "deps": { ... }, "error": "rpc: ..." }`
+- `GET /wallet/readyz` (unhealthy, `503`)
+  - `wallet-api` returns `{ "ok": false, "service": "wallet-api", "deps": { ... }, "error": "core-rpc: ..." }`
 
 ## Quick verification
 Systemd:
@@ -84,6 +91,7 @@ curl -sS http://127.0.0.1:9194/readyz | jq .
 Health (via nginx):
 ```bash
 curl -fsS https://api.pepepow.net/readyz | jq .
+curl -fsS https://api.pepepow.net/v1/chain/height | jq .
 curl -fsS https://api.pepepow.net/wallet/readyz | jq .
 ```
 
@@ -119,7 +127,7 @@ Expected JSON:
 - ZMQ start failed
   - Confirm `pepepowd` has `-zmqpubrawblock=<tcp://host:port>` and matches `ZMQ_BLOCK`.
 - `PEPEW_API_BASE not set` or upstream readiness fails
-  - Set `PEPEW_API_BASE` (usually `https://api.pepepow.net/v1`) and ensure the upstream API is reachable.
+  - Set `PEPEW_API_BASE` to the `pepew-api` base host (usually `https://api.pepepow.net`) and ensure the upstream API is reachable.
 - Telegram webhook returns `403`
   - Make sure `BOT_SECRET_TOKEN` matches the Telegram webhook secret.
 - Telegram bot failures (`getMe`)
