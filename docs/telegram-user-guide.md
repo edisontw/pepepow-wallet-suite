@@ -1,30 +1,112 @@
-# PEPEPOW Wallet (Telegram) - User Guide
+# 🐸 PEPEPOW Telegram Wallet – Simple Guide + How It Works
 
-This is a non-custodial wallet. Your keys stay on your device.
+This is a **non-custodial wallet**
+👉 You fully control your funds (no recovery service)
 
-## Get Started
-1. Open Telegram.
-2. Search for `@pepepow_walletbot`.
-3. Tap **Start** or type `/start`.
-4. Tap **Open Wallet** to launch the wallet.
+---
 
-## Check Balance
-- Use `/balance` in the bot, or open the wallet and view the balance screen.
+## 🚀 Getting Started
 
-## Receive PEPEW
-1. Open the wallet.
-2. Tap **Receive** or **Deposit**.
-3. Copy your address and share it with the sender.
+1. Open Telegram
+2. Search `@pepepow_walletbot`
+3. Tap **Start** or type `/start`
+4. Tap **Open Wallet**
 
-## Send PEPEW
-1. Open the wallet.
-2. Tap **Send**.
-3. Paste the recipient address and enter the amount.
-4. Confirm and send.
+---
 
-## Important Security Notes
-- This is a **non-custodial** wallet. Only you control the funds.
-- **Save your mnemonic phrase**. If you lose it, no one can recover your wallet.
-- Telegram is only the entry point. It is **not** a bank and cannot restore your wallet.
+## 🧠 What Happens When You Create a Wallet?
 
-If you are unsure, ask for help before sending large amounts.
+### 🔹 “Generate mnemonic & address”
+
+When you click this:
+
+* The wallet **creates a random set of words** (called a *mnemonic phrase*)
+* Example: `apple river ...` (12 or 24 words)
+* These words are used to **mathematically generate your private key**
+* Your private key then creates your **wallet address**
+
+👉 In simple terms:
+**Mnemonic → Private Key → Wallet Address**
+
+✔ All of this happens **locally in your browser/device**
+✔ Nothing is stored on a server
+
+---
+
+### 🔹 “Import mnemonic to derive address”
+
+When you click this:
+
+* You enter an existing mnemonic phrase
+* The wallet **recreates the exact same wallet**
+
+👉 Same words = same wallet = same funds
+
+---
+
+## 🔐 Why the Mnemonic Is Critical
+
+* The mnemonic is your **only backup**
+* It is **not a password** — it *is* the wallet
+
+⚠️ Anyone with your mnemonic can:
+
+* Access your wallet
+* Transfer your funds
+
+---
+
+## 💰 Check Balance
+
+* Use `/balance` in Telegram
+* Or open the wallet UI
+
+---
+
+## 📥 Receive PEPEW
+
+1. Open wallet
+2. Tap **Receive / Deposit**
+3. Copy your address
+
+👉 Like sharing your bank account number
+
+---
+
+## 📤 Send PEPEW
+
+1. Open wallet
+2. Tap **Send**
+3. Paste address + enter amount
+4. Confirm
+
+---
+
+## ⚠️ Important Security Notes
+
+### 1️⃣ Save your mnemonic offline
+
+* Write it down (paper recommended)
+* Do NOT store only on your phone or screenshots
+
+---
+
+### 2️⃣ No recovery possible
+
+* If you lose the mnemonic → funds are lost forever
+* No support can help
+
+---
+
+### 3️⃣ Telegram is just an interface
+
+* It does NOT store your wallet
+* It cannot restore access
+
+---
+
+## 🧠 One-line summary
+
+👉 **Your mnemonic = your wallet. Keep it safe or lose everything.**
+
+---
