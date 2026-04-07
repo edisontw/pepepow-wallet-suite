@@ -1,6 +1,7 @@
 {
   "scripts": {
-    "build": "npm --prefix packages/wallet-core run build && npm --prefix services/wallet-api run build && npm --prefix services/trade-api run build && npm --prefix services/trade-bot run build && npm --prefix pepew-api/pepew-api run build && npm --prefix apps/web run build"
+    "build": "npm --prefix packages/wallet-core run build && npm --prefix services/wallet-api run build && npm --prefix services/trade-api run build && npm --prefix services/trade-bot run build && npm --prefix pepew-api/pepew-api run build && npm --prefix apps/web run build",
+    "test:ops": "bash ops/tests/pepepowd-reindex-monitor.test.sh"
   },
   "devDependencies": {
     "@types/node": "^25.0.3"
