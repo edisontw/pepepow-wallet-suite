@@ -20,9 +20,9 @@ function getTgUserId(ctx: Context): string {
     return String(ctx.from?.id || "");
 }
 
-function exchangeLabel(exchange: ExchangeName): string {
+function exchangeLabel(exchange: ExchangeName | string): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
+    if (exchange === "dextrade" || exchange === "dex-trade") return "Dex-Trade (Unavailable)";
     return "NestEx";
 }
 

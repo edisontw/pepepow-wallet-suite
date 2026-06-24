@@ -33,6 +33,12 @@ export async function cancelOutstandingOrders(configId: number): Promise<{ cance
     const exchange = config.exchange;
     const tgUserId = config.tg_user_id;
 
+    if (exchange === "dextrade" || exchange === "dex-trade") {
+        console.log(`[strategyHelper] Exchange ${exchange} is disabled. Bypassing remote cancel, marking local orders as CANCELLED.`);
+        const localCount = cancelLocalStrategyOrdersRegistry(strategyId);
+        return { cancelled: localCount, failed: 0, total: localCount, alreadyClosed: 0, remaining: 0 };
+    }
+
     // Load API keys
     const keyRecord = getExchangeKey(tgUserId, exchange);
     if (!keyRecord) {

@@ -43,12 +43,13 @@ function normalizeDevmmExchange(value: string | undefined): ExchangeName | null 
 }
 
 function exchangeLabel(exchange: string): string {
+    const clean = exchange === "dex-trade" ? "dextrade" : exchange;
     const labels: Record<ExchangeName, string> = {
         nonkyc: "NonKYC",
         dextrade: "Dex-Trade (Unavailable)",
         nestex: "NestEx",
     };
-    return labels[exchange as ExchangeName] || exchange;
+    return labels[clean as ExchangeName] || exchange;
 }
 
 function formatDateTime(ts: number | null | undefined): string {

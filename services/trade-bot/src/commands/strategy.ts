@@ -22,7 +22,7 @@ type NumericFormatOptions = {
 
 function exchangeLabel(exchange: string): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
+    if (exchange === "dextrade" || exchange === "dex-trade") return "Dex-Trade (Unavailable)";
     if (exchange === "nestex") return "NestEX";
     return exchange;
 }

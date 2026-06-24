@@ -43,9 +43,9 @@ function isExpired(state: GridWizardState): boolean {
     return Date.now() - state.updatedAt > GRID_STATE_TTL_MS;
 }
 
-function exchangeLabel(exchange: ExchangeName): string {
+function exchangeLabel(exchange: ExchangeName | string): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
+    if (exchange === "dextrade" || exchange === "dex-trade") return "Dex-Trade (Unavailable)";
     return "NestEx";
 }
 

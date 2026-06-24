@@ -28,9 +28,9 @@ function isExpired(state: ReportState): boolean {
     return Date.now() - state.updatedAt > REPORT_STATE_TTL_MS;
 }
 
-function exchangeLabel(exchange: ReportExchange): string {
+function exchangeLabel(exchange: ReportExchange | string): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
+    if (exchange === "dextrade" || exchange === "dex-trade") return "Dex-Trade (Unavailable)";
     return "NestEx";
 }
 

@@ -464,6 +464,46 @@ function migratePaperToReal(): void {
 
 migratePaperToReal();
 
+function disableLegacyDexTradeStrategies(): void {
+    const now = Date.now();
+    const reason = "Exchange dextrade is unavailable because PEPEPOW was delisted.";
+
+    try {
+        // 1. Update trade_strategy_config
+        const resStrategy = db.prepare(`
+            UPDATE trade_strategy_config
+            SET enabled = 0,
+                disabled_reason = ?,
+                updated_at = ?
+            WHERE (exchange = 'dextrade' OR exchange = 'dex-trade') AND enabled = 1
+        `).run(reason, now);
+
+        // 2. Update trade_dca_config
+        const resDca = db.prepare(`
+            UPDATE trade_dca_config
+            SET enabled = 0,
+                updated_at = ?
+            WHERE (exchange = 'dextrade' OR exchange = 'dex-trade') AND enabled = 1
+        `).run(now);
+
+        // 3. Update devmm_config
+        const resDevmm = db.prepare(`
+            UPDATE devmm_config
+            SET is_enabled = 0,
+                updated_at = ?
+            WHERE (exchange = 'dextrade' OR exchange = 'dex-trade') AND is_enabled = 1
+        `).run(now);
+
+        if (resStrategy.changes > 0 || resDca.changes > 0 || resDevmm.changes > 0) {
+            console.log(`[db] Disabled legacy Dex-Trade strategies: trade_strategy_config=${resStrategy.changes}, trade_dca_config=${resDca.changes}, devmm_config=${resDevmm.changes}`);
+        }
+    } catch (err: any) {
+        console.error("[db] Failed to disable legacy Dex-Trade strategies:", err);
+    }
+}
+
+disableLegacyDexTradeStrategies();
+
 export function getDbPath(): string {
     return dbPath;
 }

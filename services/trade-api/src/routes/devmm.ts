@@ -192,6 +192,9 @@ async function listOpenOrdersForDevmm(
     accessKey: string,
     secretKey: string
 ): Promise<DevmmOpenOrder[]> {
+    if (exchange === "dextrade" || (exchange as string) === "dex-trade") {
+        return [];
+    }
     const rateLimitKey = `devmm:${exchange}`;
     if (exchange === "nonkyc") {
         const res = await listNonKycOpenOrders(accessKey, secretKey, "PEPEW_USDT");
@@ -205,7 +208,7 @@ async function listOpenOrdersForDevmm(
             .filter((o) => !!o.id);
     }
 
-    if (exchange === "dextrade") {
+    if ((exchange as string) === "dextrade") {
         const res = await listDexTradeOpenOrders(accessKey, secretKey, "PEPEWUSDT");
         if (!res.ok || !Array.isArray(res.orders)) return [];
         return res.orders
@@ -256,6 +259,26 @@ async function cancelAllDevmmOrders(
         mode?: ManagedOrderScope;
     }
 ): Promise<{ attempted: number; visibleBefore: number; unknownVisible: number; cancelled: number; alreadyClosed: number; failed: number }> {
+    if (exchange === "dextrade" || (exchange as string) === "dex-trade") {
+        console.log(`[devmm] Bypassing cancelAllDevmmOrders remote call for dextrade.`);
+        const trackedSet = new Set<string>();
+        const trackedOrderIds = options?.trackedOrderIds || [];
+        for (const id of trackedOrderIds) {
+            const normalized = normalizeOrderId(id);
+            if (normalized) trackedSet.add(normalized);
+        }
+        const state = getDevmmState(exchange, "PEPEW/USDT");
+        if (state?.open_buy_order_id) trackedSet.add(normalizeOrderId(state.open_buy_order_id));
+        if (state?.open_sell_order_id) trackedSet.add(normalizeOrderId(state.open_sell_order_id));
+        return {
+            attempted: trackedSet.size,
+            visibleBefore: 0,
+            unknownVisible: 0,
+            cancelled: trackedSet.size,
+            alreadyClosed: 0,
+            failed: 0
+        };
+    }
     const rateLimitKey = `devmm:${exchange}`;
     const mode = options?.mode || "managed_only";
     const trackedOrderIds = options?.trackedOrderIds || [];
@@ -316,7 +339,7 @@ async function cancelAllDevmmOrders(
                     } else if (isIdempotentCancelError((res as any).error || (res as any).reason)) {
                         outcome = "ALREADY_CLOSED";
                     }
-                } else if (exchange === "dextrade") {
+                } else if ((exchange as string) === "dextrade") {
                     const res = await cancelDexTradeOrder(accessKey, secretKey, orderId, "PEPEWUSDT");
                     if (res.ok) {
                         outcome = "CANCELLED";
