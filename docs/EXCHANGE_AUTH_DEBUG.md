@@ -9,7 +9,7 @@ Enable debug mode for each exchange:
 | Exchange | Environment Variable | Description |
 |----------|---------------------|-------------|
 | NonKYC | `NONKYC_DEBUG=1` | Log full request/response details |
-| Dex-Trade | `DEXTRADE_DEBUG=1` | Log signature components |
+| Dex-Trade | `DEXTRADE_DEBUG=1` | Log signature components (Legacy/Delisted) |
 | NestEx | `NESTEX_DEBUG=1` | Log request body (secrets masked) |
 
 ## What Gets Logged
@@ -32,7 +32,7 @@ When debug mode is enabled, the following information is logged (secrets are **a
 [nonkyc:debug] canonical (masked): abcd...wxyz + https://api.nonkyc.io/api/v2/createorder + {"symbol"...} + 1706419234567
 ```
 
-### Dex-Trade
+### Dex-Trade (Delisted)
 ```
 [dextrade:debug] signature values: ["PEPEW_USDT", "0", "10000", ...]
 [dextrade:debug] sign payload (masked): PEPEW_USDT01000... + abcd...wxyz
@@ -102,7 +102,7 @@ curl -X GET 'https://api.nonkyc.io/api/v2/balances' \
 3. **Check permissions**: Ensure the key has "trade" permission enabled
 4. **Check nonce**: Nonce must be increasing (we use Unix timestamp in ms)
 
-### Dex-Trade Auth Issues
+### Dex-Trade Auth Issues (Legacy/Delisted)
 
 1. **Check login-token**: This is different from the API key
 2. **Check request_id**: Must be incrementing (we use microsecond timestamp)

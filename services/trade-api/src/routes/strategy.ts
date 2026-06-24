@@ -222,6 +222,13 @@ router.post("/v1/strategy/config/upsert", (req, res) => {
             const requestedExchangeId = parsed.exchange;
             normalizedExchangeId = normalizeExchangeId(requestedExchangeId);
             const resolvedSpec = getExchangeSpec(normalizedExchangeId);
+            if (resolvedSpec.disabled) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "EXCHANGE_DISABLED",
+                    message: `Exchange ${resolvedSpec.displayName} is currently unavailable/disabled.`,
+                });
+            }
             if (requestedExchangeId !== normalizedExchangeId || resolvedSpec.adapterKey !== normalizedExchangeId) {
                 return res.status(400).json({
                     ok: false,
@@ -307,6 +314,16 @@ router.post("/v1/strategy/config/:id/enable", (req, res) => {
         const config = getStrategyConfigById(configId);
         if (!config || config.tg_user_id !== parsed.tgUserId) {
             return res.status(404).json({ ok: false, error: "Strategy config not found" });
+        }
+
+        // Guard exchange disabled
+        const resolvedSpec = getExchangeSpec(config.exchange);
+        if (resolvedSpec.disabled) {
+            return res.status(400).json({
+                ok: false,
+                error: "EXCHANGE_DISABLED",
+                message: `Exchange ${resolvedSpec.displayName} is currently unavailable/disabled.`,
+            });
         }
 
         // REAL mode guard: check if keys are configured
@@ -866,6 +883,7 @@ router.get("/v1/registry/exchanges", (_req, res) => {
         symbolMapping: spec.symbolMapping,
         limits: spec.limits,
         precision: spec.precision,
+        disabled: spec.disabled ?? false,
     }));
     res.json({ ok: true, exchanges });
 });

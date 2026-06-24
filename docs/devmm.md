@@ -12,7 +12,7 @@ DevMM (Dev Fee Market Making) is a lightweight market-making strategy designed t
 | Exchange | minNotional | Status |
 |----------|-------------|--------|
 | NonKYC | 1 USDT | Supported |
-| Dex-Trade | 5 USDT | Supported |
+| Dex-Trade | 5 USDT | Delisted (Unsupported) |
 | NestEx | 0.001 USDT | Supported |
 
 ## Commands
@@ -24,7 +24,7 @@ Opens the DevMM menu with options to Start, Stop, view Status, or Reports.
 Starts DevMM on the specified exchange. If no exchange is provided, shows a selection menu.
 
 **Parameters:**
-- `exchange`: `nonkyc`, `dextrade`, or `nestex` (optional)
+- `exchange`: `nonkyc` or `nestex` (optional)
 
 ### `/devmm_stop [exchange]`
 Stops DevMM on the specified exchange and cancels all open orders.

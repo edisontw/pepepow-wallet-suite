@@ -30,7 +30,7 @@
 
 * Trade API / Trade Bot 使用的是：
 
-  * **中心化交易所 API Key**（NonKYC / Dex-Trade / NestEx等）
+  * **中心化交易所 API Key**（NonKYC / Dex-Trade (Delisted) / NestEx等）
 * Trade 系統不得：
 
   * 接觸 wallet 助記詞 / 私鑰
@@ -101,12 +101,12 @@ Telegram Trade Bot (grammY)
 Trade API (Node.js :9195)
         │
         ├── Strategy Runner / Scheduler
-        ├── Exchange Adapter（NonKYC / Dex-Trade）
+        ├── Exchange Adapter（NonKYC / Dex-Trade (Delisted)）
         ├── Risk & Limit Guards
         └── SQLite trade.db（state only）
         │
 Centralized Exchanges
-(NonKYC / Dex-Trade ...)
+(NonKYC / Dex-Trade (Delisted) ...)
 ```
 
 📌 關鍵限制（必須記住）
@@ -242,7 +242,7 @@ Centralized Exchanges
 * trade-bot：Node.js + grammY（指令導向）
 * trade-api：Node.js + Express（或同級框架）
 * DB：SQLite（trade.db，狀態/快取用途）
-* Exchange：NonKYC / Dex-Trade（以 adapter 層隔離）
+* Exchange：NonKYC / Dex-Trade (Delisted/Legacy)（以 adapter 層隔離）
 
 ---
 

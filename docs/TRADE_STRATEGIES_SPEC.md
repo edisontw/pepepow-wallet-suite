@@ -17,7 +17,7 @@ DCA accumulates a fixed quote amount at a fixed interval.
   - `endsAt` (derived from `runForMinutes`) auto-stops on time limit.
 - **Hard cleanup rule**: Before placing a new buy, runner cancels all existing open DCA BUY orders for this config.
 - **Execution model**: all-in buy attempt per tick.
-  - Dex-Trade uses MARKET-style execution path.
+  - Dex-Trade (Delisted/Disabled) used MARKET-style execution path.
   - NonKYC/NestEx use aggressive limit/sweep behavior.
 - **Validation and safety**:
   - API key required in REAL mode.

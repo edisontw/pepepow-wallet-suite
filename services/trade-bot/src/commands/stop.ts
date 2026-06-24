@@ -34,14 +34,13 @@ function getTgUserId(ctx: Context): string {
 
 function exchangeLabel(exchange: ExchangeName): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade";
+    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
     return "NestEx";
 }
 
 function buildStopKeyboard(): InlineKeyboard {
     return withMenuNav(new InlineKeyboard()
         .text("NonKYC", "stop:exchange:nonkyc")
-        .text("Dex-Trade", "stop:exchange:dextrade")
         .text("NestEx", "stop:exchange:nestex")
         .row()
         .text("Stop All", "stop:exchange:all"));

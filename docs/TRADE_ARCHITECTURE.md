@@ -17,7 +17,7 @@ graph TD
     Telegram <--> Bot[trade-bot Service]
     Bot <--> API[trade-api Service]
     API <--> DB[(SQLite Database)]
-    API <--> Exchange[Exchanges: NonKYC, DEXTrade, NestEx]
+    API <--> Exchange[Exchanges: NonKYC, NestEx, DEXTrade - Delisted]
 ```
 
 ### 1. `trade-api` (Backend)
@@ -26,7 +26,7 @@ graph TD
 - **Database**: SQLite (via `better-sqlite3`) for strategy configs, orders, and logs.
 - **Scheduler**: Orchestrates strategy "ticks" every 10 seconds.
 - **Strategy Runners**: Core logic for DCA, GRID, and MM strategies.
-- **Exchanges**: Custom adapters for NonKYC, DEXTrade, and NestEx APIs.
+- **Exchanges**: Custom adapters for NonKYC and NestEx APIs (DEXTrade is delisted/unsupported).
 
 ### 2. `trade-bot` (Frontend)
 - **Language**: TypeScript/Node.js

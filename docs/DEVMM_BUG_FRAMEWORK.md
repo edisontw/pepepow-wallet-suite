@@ -18,7 +18,7 @@ Applies to:
 - `services/trade-api/src/strategies/devmmCodes.ts`
 - `services/trade-api/src/routes/devmm.ts`
 - `services/trade-api/src/exchanges/nestex.ts`
-- `services/trade-api/src/exchanges/dextrade.ts`
+- `services/trade-api/src/exchanges/dextrade.ts` (Legacy/Delisted)
 - `services/trade-api/src/exchanges/nonkyc.ts`
 - `services/trade-api/src/scheduler.ts`
 

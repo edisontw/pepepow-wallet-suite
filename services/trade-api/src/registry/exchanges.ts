@@ -40,6 +40,7 @@ const REGISTRY: Record<ExchangeId, ExchangeSpec> = {
         exchangeId: "dextrade",
         displayName: "Dex-Trade",
         adapterKey: "dextrade",
+        disabled: true,
         pairs: ["PEPEW/USDT"],
         symbolMapping: {
             "PEPEW/USDT": "PEPEWUSDT",

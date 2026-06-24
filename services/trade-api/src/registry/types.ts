@@ -42,6 +42,7 @@ export type ExchangeSpec = {
     precision: PrecisionPolicy;
     limits: LimitsPolicy;
     balancePolicy: BalancePolicy;
+    disabled?: boolean;
 };
 
 export type ParsedPair = {

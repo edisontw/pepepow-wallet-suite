@@ -21,7 +21,7 @@ Before you start:
 
 Supported exchanges:
 - NonKYC
-- Dex-Trade
+- Dex-Trade (Delisted/Legacy)
 - NestEx
 
 ## Step 0: Open the Bot
@@ -77,7 +77,7 @@ The config is created and started in REAL mode.
 
 Default quote buttons (USDT pairs):
 - NonKYC: `1.05 3 5 10 20 35 50 100`
-- Dex-Trade: `5.1 7 10 15 20 35 50 100`
+- Dex-Trade: (Delisted/Legacy - not configurable)
 - NestEx: `0.5 1 3 5 10 20 35 50 100`
 
 ### GRID flow
@@ -119,7 +119,6 @@ Tap `Report` (or run `/report`):
 
 Tap `Stop` (or run `/stop`):
 - NonKYC
-- Dex-Trade
 - NestEx
 - Stop All
 

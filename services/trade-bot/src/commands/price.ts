@@ -45,7 +45,7 @@ export async function handlePrice(ctx: Context): Promise<void> {
             "--------------------",
             `• NonKYC (PEPEW/BNB): ${formatPriceDecimal(nonKycBnb?.price ?? null)} BNB`,
             `• NonKYC: ${formatPriceDecimal(nonKycUsdt?.price ?? null)} USD`,
-            `• Dex-Trade: ${formatPriceDecimal(dexTrade?.price ?? null)} USD`,
+            `• Dex-Trade: Not Available (PEPEPOW is currently not available on Dex-Trade. Please check the official website or community channels for updated exchange information.)`,
             `• NestEx: ${formatPriceDecimal(nestEx?.price ?? null)} USD`,
         ].join("\n");
 

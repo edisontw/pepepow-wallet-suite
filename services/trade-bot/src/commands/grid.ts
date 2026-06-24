@@ -45,7 +45,7 @@ function isExpired(state: GridWizardState): boolean {
 
 function exchangeLabel(exchange: ExchangeName): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade";
+    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
     return "NestEx";
 }
 
@@ -191,12 +191,11 @@ export async function handleGrid(ctx: Context): Promise<void> {
 
     const keyboard = new InlineKeyboard()
         .text("NonKYC", buildCallbackData("exchange", "nonkyc"))
-        .text("Dex-Trade", buildCallbackData("exchange", "dextrade"))
         .text("NestEx", buildCallbackData("exchange", "nestex"));
 
     await safeSend(ctx, {
         step: "grid.exchange",
-        text: renderMenu("🏦 Select Exchange", "GRID setup\nNonKYC / Dex-Trade / NestEx"),
+        text: renderMenu("🏦 Select Exchange", "GRID setup\nNonKYC / NestEx"),
         replyMarkup: keyboard,
     });
 }

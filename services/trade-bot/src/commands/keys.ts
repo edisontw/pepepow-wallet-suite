@@ -22,7 +22,7 @@ function getTgUserId(ctx: Context): string {
 
 function exchangeLabel(exchange: ExchangeName): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade";
+    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
     return "NestEx";
 }
 
@@ -42,7 +42,6 @@ export async function handleKeys(ctx: Context): Promise<void> {
 
     const keyboard = withMenuNav(new InlineKeyboard()
         .text("NonKYC", "keys:exchange:nonkyc")
-        .text("Dex-Trade", "keys:exchange:dextrade")
         .text("NestEx", "keys:exchange:nestex"));
 
     await safeSend(ctx, {
@@ -124,7 +123,7 @@ export async function handleKeysClear(ctx: Context): Promise<void> {
 
     const keyboard = withMenuNav(new InlineKeyboard()
         .text("NonKYC", "keys:clear:nonkyc")
-        .text("Dex-Trade", "keys:clear:dextrade")
+        .text("Dex-Trade (Unavailable)", "keys:clear:dextrade")
         .text("NestEx", "keys:clear:nestex"));
 
     await safeSend(ctx, {

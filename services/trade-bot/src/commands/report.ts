@@ -30,7 +30,7 @@ function isExpired(state: ReportState): boolean {
 
 function exchangeLabel(exchange: ReportExchange): string {
     if (exchange === "nonkyc") return "NonKYC";
-    if (exchange === "dextrade") return "Dex-Trade";
+    if (exchange === "dextrade") return "Dex-Trade (Unavailable)";
     return "NestEx";
 }
 
