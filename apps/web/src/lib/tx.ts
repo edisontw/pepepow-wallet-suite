@@ -117,13 +117,14 @@ const BROADCAST_MAX_ATTEMPTS = 2;
 const BROADCAST_RETRY_BACKOFF_MS = 800;
 
 function sleep(ms: number) {
-  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
 function normalizeFetchError(err: unknown, timedOut: boolean, attempt: number) {
   if (err instanceof TxApiError) return err;
   const rawMessage = err instanceof Error ? err.message : String(err || "");
-  const isAbort = err instanceof DOMException && err.name === "AbortError";
+  const isDomAbort = typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError";
+  const isAbort = isDomAbort || (err instanceof Error && err.name === "AbortError");
   const detail = timedOut || isAbort
     ? `broadcast request timed out after ${BROADCAST_TIMEOUT_MS}ms`
     : rawMessage || "network request failed";
@@ -135,9 +136,9 @@ function normalizeFetchError(err: unknown, timedOut: boolean, attempt: number) {
 }
 
 function shouldRetryBroadcastError(err: TxApiError) {
-  if (err.status === 0 || err.status === 502 || err.status === 503 || err.status === 504) return true;
   const code = err.code || "";
   if (code === "UPSTREAM_BUSY" || err.status === 429) return false;
+  if (err.status === 0 || err.status === 502 || err.status === 503 || err.status === 504) return true;
   return code.includes("TIMEOUT")
     || code.includes("NETWORK")
     || code === "RPC_UNAVAILABLE"
@@ -147,7 +148,7 @@ function shouldRetryBroadcastError(err: TxApiError) {
 async function broadcastFetchOnce(rawTx: string, attempt: number) {
   const controller = new AbortController();
   let timedOut = false;
-  const timeoutId = window.setTimeout(() => {
+  const timeoutId = globalThis.setTimeout(() => {
     timedOut = true;
     controller.abort();
   }, BROADCAST_TIMEOUT_MS);
@@ -175,7 +176,7 @@ async function broadcastFetchOnce(rawTx: string, attempt: number) {
   } catch (err) {
     throw normalizeFetchError(err, timedOut, attempt);
   } finally {
-    window.clearTimeout(timeoutId);
+    globalThis.clearTimeout(timeoutId);
   }
 }
 
