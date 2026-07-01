@@ -112,31 +112,97 @@ export async function fetchRawTxBatchApi(txids: string[]): Promise<RawTxBatchRes
   };
 }
 
-export async function broadcastTx(rawTx: string): Promise<any> {
-  const r = await apiFetch(API_ENDPOINTS.wallet.txBroadcast, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ rawTx }),
-  });
-  const payload = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const detail = typeof payload?.message === "string"
-      ? payload.message
-      : typeof payload?.error === "string"
-        ? payload.error
-        : undefined;
-    const code = typeof payload?.code === "string" ? payload.code : undefined;
-    const requestId = r.headers.get("x-request-id")
-      || (typeof payload?.requestId === "string" ? payload.requestId : undefined);
-    throw new TxApiError(`broadcastTx failed: ${r.status}`, r.status, detail, { code, requestId });
+const BROADCAST_TIMEOUT_MS = 25000;
+const BROADCAST_MAX_ATTEMPTS = 2;
+const BROADCAST_RETRY_BACKOFF_MS = 800;
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
+function normalizeFetchError(err: unknown, timedOut: boolean, attempt: number) {
+  if (err instanceof TxApiError) return err;
+  const rawMessage = err instanceof Error ? err.message : String(err || "");
+  const isAbort = err instanceof DOMException && err.name === "AbortError";
+  const detail = timedOut || isAbort
+    ? `broadcast request timed out after ${BROADCAST_TIMEOUT_MS}ms`
+    : rawMessage || "network request failed";
+  const code = timedOut || isAbort ? "BROADCAST_TIMEOUT" : "NETWORK_ERROR";
+  const message = timedOut || isAbort
+    ? "Broadcast request timed out. The transaction may still have reached the node; retrying the same transaction is safe."
+    : "Network error while broadcasting transaction. Please retry; duplicate raw transactions are safely deduplicated by the node/API.";
+  return new TxApiError(message, timedOut || isAbort ? 504 : 0, detail, { code: `${code}_ATTEMPT_${attempt}` });
+}
+
+function shouldRetryBroadcastError(err: TxApiError) {
+  if (err.status === 0 || err.status === 502 || err.status === 503 || err.status === 504) return true;
+  const code = err.code || "";
+  if (code === "UPSTREAM_BUSY" || err.status === 429) return false;
+  return code.includes("TIMEOUT")
+    || code.includes("NETWORK")
+    || code === "RPC_UNAVAILABLE"
+    || code === "UPSTREAM_ERROR";
+}
+
+async function broadcastFetchOnce(rawTx: string, attempt: number) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, BROADCAST_TIMEOUT_MS);
+
+  try {
+    const r = await apiFetch(API_ENDPOINTS.wallet.txBroadcast, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rawTx }),
+      signal: controller.signal,
+    });
+    const payload = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const detail = typeof payload?.message === "string"
+        ? payload.message
+        : typeof payload?.error === "string"
+          ? payload.error
+          : undefined;
+      const code = typeof payload?.code === "string" ? payload.code : undefined;
+      const requestId = r.headers.get("x-request-id")
+        || (typeof payload?.requestId === "string" ? payload.requestId : undefined);
+      throw new TxApiError(`broadcastTx failed: ${r.status}`, r.status, detail, { code, requestId });
+    }
+    return payload;
+  } catch (err) {
+    throw normalizeFetchError(err, timedOut, attempt);
+  } finally {
+    window.clearTimeout(timeoutId);
   }
-  return payload;
+}
+
+export async function broadcastTx(rawTx: string): Promise<any> {
+  let lastError: TxApiError | null = null;
+  for (let attempt = 1; attempt <= BROADCAST_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await broadcastFetchOnce(rawTx, attempt);
+    } catch (err) {
+      const txErr = normalizeFetchError(err, false, attempt);
+      lastError = txErr;
+      const canRetry = attempt < BROADCAST_MAX_ATTEMPTS && shouldRetryBroadcastError(txErr);
+      if (!canRetry) throw txErr;
+      await sleep(BROADCAST_RETRY_BACKOFF_MS);
+    }
+  }
+  throw lastError || new TxApiError("broadcastTx failed", 0, "unknown broadcast failure", { code: "BROADCAST_UNKNOWN" });
 }
 
 export function isTransientRawTxError(err: unknown) {
   if (err instanceof TxApiError) {
-    if (err.status === 504) return true;
-    if (err.code === "UPSTREAM_TIMEOUT" || err.code === "RPC_TIMEOUT" || err.code === "INDEXER_TIMEOUT") return true;
+    if (err.status === 0 || err.status === 504) return true;
+    if (err.code === "UPSTREAM_TIMEOUT"
+      || err.code === "RPC_TIMEOUT"
+      || err.code === "INDEXER_TIMEOUT"
+      || err.code?.includes("NETWORK")
+      || err.code?.includes("TIMEOUT")) return true;
     if ((err.detail || "").toLowerCase().includes("timeout")) return true;
     return false;
   }
