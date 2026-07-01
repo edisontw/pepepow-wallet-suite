@@ -120,6 +120,10 @@ function sleep(ms: number) {
   return new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
+function isMissingInputsDetail(detail?: string) {
+  return /missing[-\s]?inputs|already spent/i.test(detail || "");
+}
+
 function normalizeFetchError(err: unknown, timedOut: boolean, attempt: number) {
   if (err instanceof TxApiError) return err;
   const rawMessage = err instanceof Error ? err.message : String(err || "");
@@ -138,6 +142,7 @@ function normalizeFetchError(err: unknown, timedOut: boolean, attempt: number) {
 function shouldRetryBroadcastError(err: TxApiError) {
   const code = err.code || "";
   if (code === "UPSTREAM_BUSY" || err.status === 429) return false;
+  if (isMissingInputsDetail(err.detail)) return false;
   if (err.status === 0 || err.status === 502 || err.status === 503 || err.status === 504) return true;
   return code.includes("TIMEOUT")
     || code.includes("NETWORK")
@@ -170,7 +175,10 @@ async function broadcastFetchOnce(rawTx: string, attempt: number) {
       const code = typeof payload?.code === "string" ? payload.code : undefined;
       const requestId = r.headers.get("x-request-id")
         || (typeof payload?.requestId === "string" ? payload.requestId : undefined);
-      throw new TxApiError(`broadcastTx failed: ${r.status}`, r.status, detail, { code, requestId });
+      const message = isMissingInputsDetail(detail)
+        ? "Missing inputs: selected UTXO is already spent or not yet indexed. Refresh the wallet and try again after the pending transaction updates."
+        : `broadcastTx failed: ${r.status}`;
+      throw new TxApiError(message, r.status, detail, { code, requestId });
     }
     return payload;
   } catch (err) {
@@ -198,6 +206,7 @@ export async function broadcastTx(rawTx: string): Promise<any> {
 
 export function isTransientRawTxError(err: unknown) {
   if (err instanceof TxApiError) {
+    if (isMissingInputsDetail(err.detail) || isMissingInputsDetail(err.message)) return false;
     if (err.status === 0 || err.status === 504) return true;
     if (err.code === "UPSTREAM_TIMEOUT"
       || err.code === "RPC_TIMEOUT"
