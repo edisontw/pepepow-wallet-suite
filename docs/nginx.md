@@ -67,8 +67,10 @@ The production `api.pepepow.net` vhost is intended to use these shared zones:
 - `wallet_auth_ip`: `6r/m`
 - `wallet_resolve_ip`: `20r/m`
 - `wallet_request_ip`: `15r/m`
-- `wallet_tx_ip`: `2r/m`
+- `wallet_tx_ip`: `6r/m`, with `burst=12` on transaction broadcast paths
 - `api_per_ip_conn`: `20` concurrent connections per IP at the server block
+
+Wallet transaction broadcasts are user-initiated and may happen in short bursts when users test small sends or retry after pending UTXO/indexer updates. The `wallet_tx_ip` limit should allow normal short bursts while still blocking sustained automated sends.
 
 Heavy public read paths:
 
