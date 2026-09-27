@@ -87,7 +87,7 @@ M1 does not change any production call site and does not delete legacy API code.
 
 ## M2 — Mini App read migration
 
-Status: **NEXT**
+Status: **COMPLETE**
 
 Switch these Mini App/Web Wallet functions to the Light API client:
 
@@ -110,13 +110,26 @@ Requirements:
 - refresh UTXO before send preparation;
 - do not overuse `fresh=1`.
 
+Implementation:
+
+- Wallet balance/address summary uses PEPEW Light API.
+- Wallet UTXO state uses `GET /api/wallet/utxo/{address}`.
+- The client derives the active P2PKH script locally from the public sender address; the Light UTXO contract does not carry `scriptHex`.
+- Send/consolidation refresh spend-sensitive UTXOs with `fresh=1`.
+- Previous raw transactions use `GET /api/wallet/tx/{txid}?raw=1` with client-side concurrency capped at 6.
+- History uses PEPEW Light API for the active wallet address. The previous 40-address browser fan-out was intentionally not reproduced because it would turn one batch request into 40 public API calls. The current transaction builder returns change to the active sender address. If multi-address HD discovery is required later, add a bounded Light API batch/discovery contract instead of browser fan-out.
+- Legacy fee estimation remains on `/wallet/fee/estimate`.
+- Legacy signed broadcast remains on `/wallet/tx/broadcast` until M4.
+
 Acceptance:
 
-- Mini App read operations still work when `pepew-api :9193` is unavailable to the Wallet client path.
+- Mini App balance/history/UTXO/raw-tx reads no longer call Wallet Suite legacy chain proxy endpoints.
+- Fresh UTXO lookup occurs immediately before send selection.
+- Fee estimation and broadcast remain unchanged for rollback isolation.
 
 ## M3 — Telegram Bot read migration
 
-Status: planned
+Status: **NEXT**
 
 Change Bot command flow:
 

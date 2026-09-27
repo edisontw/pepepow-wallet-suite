@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { Buffer } from "buffer";
 import { useTranslation } from "react-i18next";
 import { addressToScript, buildAndSignP2PKH, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
-import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS, withAddress } from "../lib/api";
+import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS } from "../lib/api";
 import { broadcastTx, fetchRawTxBatchApi, TxApiError } from "../lib/tx";
 import { fmtPEPEWFromSats } from "../lib/format";
 import {
@@ -393,7 +393,7 @@ export default function Send() {
     postSendRefreshTimersRef.current = [];
   }, []);
   const refreshBalanceOnce = useCallback(async () => {
-    await walletStore.fetch();
+    await walletStore.fetch({ fresh: true });
     walletStore.updatePending();
   }, []);
   const schedulePostSendRefresh = useCallback((baselineUtxoSum: number | null, baselineUtxoCount: number) => {
@@ -987,14 +987,14 @@ export default function Send() {
 
   const isTransientBatchItemFailure = (item: RawTxBatchFailure) => {
     if (item.status === 502 || item.status === 503 || item.status === 504) return true;
-    if (item.code === "UPSTREAM_TIMEOUT" || item.code === "RPC_TIMEOUT" || item.code === "UPSTREAM_ERROR") return true;
+    if (item.code === "UPSTREAM_TIMEOUT" || item.code === "RPC_TIMEOUT" || item.code === "UPSTREAM_ERROR" || item.code === "timeout" || item.code === "network_error" || item.code === "electrumx_error" || item.code === "api_unavailable") return true;
     return /timeout|econnreset/i.test(item.error || "");
   };
 
   const isTransientBatchRequestError = (err: unknown) => {
     if (!(err instanceof TxApiError)) return false;
     if (err.status === 502 || err.status === 503 || err.status === 504) return true;
-    if (err.code === "UPSTREAM_TIMEOUT" || err.code === "RPC_TIMEOUT" || err.code === "UPSTREAM_ERROR") return true;
+    if (err.code === "UPSTREAM_TIMEOUT" || err.code === "RPC_TIMEOUT" || err.code === "UPSTREAM_ERROR" || err.code === "timeout" || err.code === "network_error" || err.code === "electrumx_error" || err.code === "api_unavailable") return true;
     return /timeout|econnreset/i.test(err.detail || "");
   };
 
@@ -1347,7 +1347,7 @@ export default function Send() {
     if (cancelRequestedRef.current) return { status: "cancelled" as const };
     if (backgroundPauseRef.current) return { status: "paused" as const };
 
-    await walletStore.fetch();
+    await walletStore.fetch({ fresh: true, includeBalance: false });
     const latest = walletStore.getState().utxos;
     const remaining = Array.isArray(latest) ? latest.length : 0;
 
@@ -1996,9 +1996,9 @@ export default function Send() {
     setConsolidationPhase("refreshing");
     setSendStatusNote(t("send.consolidateRefreshing"));
     try {
-      await walletStore.fetch();
+      await walletStore.fetch({ fresh: true, includeBalance: false });
       await sleep(CONSOLIDATION_REFRESH_DELAY_MS);
-      await walletStore.fetch();
+      await walletStore.fetch({ fresh: true, includeBalance: false });
       const preview = prepareConsolidationPreview((consolidationProgress?.currentRound || 0) + 1);
       if (!preview) {
         setConsolidationPhase("paused");
@@ -2095,6 +2095,7 @@ export default function Send() {
         abortSend("Broadcast skipped by dedupe guard: send is locked from prior broadcast");
       }
 
+      await walletStore.fetch({ fresh: true, includeBalance: false });
       const st = walletStore.getState();
       const utxosForCheck = st.utxos;
       if (!utxosForCheck || utxosForCheck.length === 0) {

@@ -207,7 +207,7 @@ export const ru = {
         utxoLoading: "Данные UTXO еще загружаются...",
         utxoFetchFailed: "Не удалось получить UTXO: {{error}}",
         utxoEmpty: "Нет доступных UTXO (баланс 0 или API вернул пустой ответ)",
-        utxoIncomplete: "Данные UTXO неполные: обнаружено {{count}} некорректных UTXO (нет scriptHex/txid/vout). Обновите страницу.",
+        utxoIncomplete: "Данные UTXO неполные: обнаружено {{count}} некорректных UTXO (нет txid/vout/value). Обновите страницу.",
         txBuildMissingOutput: "Не удалось собрать транзакцию: выход не задан",
         txBuildInvalidHex: "Не удалось собрать транзакцию: неверный hex вывод",
         buildOutOfRange: "Не удалось собрать транзакцию (значение вне диапазона). Уменьшите сумму или сначала выполните консолидацию UTXO и попробуйте снова.",

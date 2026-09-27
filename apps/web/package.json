@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:amount": "rm -rf ./.tmp-tests && tsc --module NodeNext --moduleResolution NodeNext --target ES2020 --outDir ./.tmp-tests ./src/lib/amount.ts && node ./tests/amount.bigint.test.mjs",
-    "test:light-client": "rm -rf ./.tmp-tests && tsc --module ES2022 --moduleResolution Bundler --target ES2022 --lib ES2022,DOM --skipLibCheck --outDir ./.tmp-tests ./src/lib/pepewLightClient.ts && node ./tests/pepew-light-client.test.mjs"
+    "test:light-client": "rm -rf ./.tmp-tests && tsc --module ES2022 --moduleResolution Bundler --target ES2022 --lib ES2022,DOM --skipLibCheck --outDir ./.tmp-tests ./src/lib/pepewLightClient.ts && node ./tests/pepew-light-client.test.mjs",
+    "test:m2-light-reads": "node ./tests/m2-light-read-boundary.test.mjs"
   },
   "dependencies": {
     "@pepepow/wallet-core": "file:../../packages/wallet-core",
