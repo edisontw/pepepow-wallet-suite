@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M2 COMPLETE — Mini App/Web Wallet chain reads use PEPEW Light API; fee estimation and signed broadcast remain legacy until M4/M5. M3 Telegram Bot read migration is next.**
+> Migration status: **M3 COMPLETE — Mini App/Web Wallet and Telegram Bot chain reads use PEPEW Light API. Signed broadcast and fee estimation remain legacy until M4/M5.**
 
 ## 1. Core design principles
 

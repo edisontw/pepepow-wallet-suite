@@ -32,8 +32,9 @@ sudo systemctl status pepepow-wallet-api.service --no-pager
 ## Wallet API required/important variables
 Required for production:
 - `PORT` (default: `9194`)
-- `PEPEW_API_BASE` (pepew-api base URL)
-- `CORE_RPC_URL` (RPC URL, may include user/pass)
+- `PEPEW_LIGHT_API_BASE` (Telegram Bot chain-read base; default: `https://light.pepepow.net`)
+- `PEPEW_API_BASE` (legacy pepew-api base URL while compatibility endpoints remain)
+- `CORE_RPC_URL` (temporary RPC URL for fee estimate/broadcast until M4/M5; may include user/pass)
 - `JWT_SECRET` (JWT signing secret)
 - `CORS_ORIGINS` (comma-separated)
 - `WALLET_BASE_URL` (for paylinks)
@@ -67,7 +68,7 @@ Rate limiting (per IP + per JWT subject):
 - `VITE_API_BASE` (legacy wallet-api/product API base; default: `https://api.pepepow.net`)
 - `VITE_PEPEW_LIGHT_API_BASE_URL` (PEPEW Light chain API base; default: `https://light.pepepow.net`)
 
-M1 only introduces the Light API client adapter. Production balance/history/UTXO call sites remain on the legacy path until M2.
+M2 moved Mini App/Web Wallet chain reads to Light API. M3 moves Telegram Bot `/balance` and `/history` to the server-side `PEPEW_LIGHT_API_BASE`.
 
 These values are baked at build time (Vite). Changing them requires a rebuild.
 
@@ -75,6 +76,7 @@ These values are baked at build time (Vite). Changing them requires a rebuild.
 ```
 PORT=9194
 NODE_ENV=production
+PEPEW_LIGHT_API_BASE=https://light.pepepow.net
 PEPEW_API_BASE=https://api.pepepow.net
 CORE_RPC_URL=http://127.0.0.1:8093
 JWT_SECRET=replace-with-strong-secret

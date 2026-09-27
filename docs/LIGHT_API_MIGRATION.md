@@ -129,7 +129,7 @@ Acceptance:
 
 ## M3 — Telegram Bot read migration
 
-Status: **NEXT**
+Status: **COMPLETE**
 
 Change Bot command flow:
 
@@ -150,15 +150,26 @@ Do not change:
 - payment request logic;
 - Mini App signing.
 
+Implementation:
+
+- Telegram `/balance` and its callback still resolve the user's default public address through `wallet-api /v1/address/default`, then query `PEPEW_LIGHT_API_BASE/api/wallet/address/{address}`.
+- Telegram `/history` and its callback query `PEPEW_LIGHT_API_BASE/api/wallet/history/{address}?limit=10&verbose=true&detail_limit=10`.
+- Light balance atomic values are converted to PEPEW at the display boundary; internal arithmetic stays atomic.
+- History uses Light API address-relative delta fields when available.
+- Bot Light reads use bounded one-retry handling for 429/502/503/504 and transient network failures.
+- Deposit/default-address/payment-request flows remain on wallet-api.
+- Fee estimate and signed broadcast remain legacy for M4/M5 isolation.
+
 Acceptance:
 
 - Bot balance/history no longer call `wallet-api /wallet/balance` or `/wallet/history`;
+- Bot default-address resolution remains on `wallet-api /v1/address/default`;
 - failures are user-safe;
 - Bot never receives private-key material.
 
 ## M4 — Signed broadcast migration
 
-Status: planned
+Status: **NEXT**
 
 Move Mini App broadcast to:
 

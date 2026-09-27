@@ -39,6 +39,7 @@ const {
   BOT_SECRET_TOKEN,
   JWT_SECRET,
   PEPEW_API_BASE,
+  PEPEW_LIGHT_API_BASE,
   CORE_RPC_URL,
   CORS_ORIGINS,
   CMC_API_KEY,
@@ -1512,8 +1513,65 @@ function truncateTxid(txid: string): string {
   return `${txid.slice(0, 8)}...${txid.slice(-8)}`;
 }
 
-function formatSats(sats: number): string {
-  return sats.toLocaleString("en-US");
+const PEPEW_ATOMIC_FACTOR = 100000000n;
+
+function formatPepewAtomic(value: bigint): string {
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  const wholeRaw = (abs / PEPEW_ATOMIC_FACTOR).toString();
+  const whole = wholeRaw.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const fraction = (abs % PEPEW_ATOMIC_FACTOR).toString().padStart(8, "0").replace(/0+$/, "");
+  return `${negative ? "-" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
+}
+
+function parsePepewDecimalToAtomic(value: unknown): bigint | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const match = trimmed.match(/^(-?)(\d+)(?:\.(\d{1,8}))?$/);
+  if (!match) return null;
+  const sign = match[1] === "-" ? -1n : 1n;
+  const whole = BigInt(match[2]);
+  const fraction = BigInt((match[3] || "").padEnd(8, "0"));
+  return sign * (whole * PEPEW_ATOMIC_FACTOR + fraction);
+}
+
+function readLightBalanceAtomic(balance: any, field: "confirmed" | "unconfirmed"): bigint {
+  const fromPepew = parsePepewDecimalToAtomic(balance?.[`${field}_pepew`]);
+  if (fromPepew !== null) return fromPepew;
+  const raw = balance?.[field];
+  if (typeof raw === "number" && Number.isSafeInteger(raw)) return BigInt(raw);
+  if (typeof raw === "string" && /^-?\d+$/.test(raw.trim())) return BigInt(raw.trim());
+  throw new Error(`invalid Light API balance field: ${field}`);
+}
+
+function getLightHistoryRows(data: any): any[] {
+  const mempool = Array.isArray(data?.mempool) ? data.mempool : [];
+  const confirmed = Array.isArray(data?.history) ? data.history : [];
+  return [...mempool, ...confirmed];
+}
+
+function formatLightHistoryAmount(tx: any): string {
+  const delta = typeof tx?.address_delta_pepew === "string" ? tx.address_delta_pepew.trim() : "";
+  if (/^-?\d+(?:\.\d{1,8})?$/.test(delta)) {
+    const prefixed = delta.startsWith("-") || delta === "0" ? delta : `+${delta}`;
+    return `${prefixed} PEPEW`;
+  }
+  const amount = typeof tx?.amount_pepew === "string" ? tx.amount_pepew.trim() : "";
+  if (!/^\d+(?:\.\d{1,8})?$/.test(amount)) return "";
+  if (tx?.direction === "sent") return `-${amount} PEPEW`;
+  if (tx?.direction === "received") return `+${amount} PEPEW`;
+  return `${amount} PEPEW`;
+}
+
+function formatLightHistoryTime(tx: any): string {
+  const raw = tx?.timestamp ?? tx?.time ?? tx?.blocktime;
+  const numeric = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "";
+  try {
+    return new Date(numeric > 1e12 ? numeric : numeric * 1000).toISOString().slice(0, 16).replace("T", " ");
+  } catch {
+    return "";
+  }
 }
 
 function getExplorerUrl(addressOrTxid: string, type: "address" | "tx"): string {
@@ -1532,6 +1590,23 @@ async function botFetchJson(url: string, options: any = {}, timeoutMs = 8000): P
   } finally {
     clearTimeout(timer);
   }
+}
+
+function getBotLightApiBase(): string {
+  return (PEPEW_LIGHT_API_BASE || "https://light.pepepow.net").trim().replace(/\/+$/, "");
+}
+
+async function botFetchLightJson(path: string, label: string): Promise<any> {
+  const url = `${getBotLightApiBase()}${path.startsWith("/") ? path : `/${path}`}`;
+  return fetchJson(
+    url,
+    { method: "GET", headers: { Accept: "application/json" } },
+    8000,
+    {
+      label,
+      retry: { maxRetries: 1, backoffMs: [250], retryOnStatuses: [429, 502, 503, 504] },
+    },
+  );
 }
 
 function getHelpMessage(): string {
@@ -1637,7 +1712,7 @@ if (process.env.BOT_TOKEN) {
       const masked = maskAddress(address);
 
       // Get balance
-      const balRes = await botFetchJson(`http://127.0.0.1:9194/wallet/balance?address=${address}`);
+      const balRes = await botFetchLightJson(`/api/wallet/address/${encodeURIComponent(address)}`, "telegram.light.balance");
       if (!balRes.res.ok) {
         await ctx.reply("Unable to fetch balance. Please try again later.");
         console.warn(`[telegram] /balance command=balance_error tg_user_id=${fromId} status=${balRes.res.status}`);
@@ -1645,8 +1720,8 @@ if (process.env.BOT_TOKEN) {
       }
 
       const balData = balRes.data;
-      const confirmed = balData.confirmed ?? balData.balance ?? 0;
-      const unconfirmed = balData.unconfirmed ?? 0;
+      const confirmed = readLightBalanceAtomic(balData?.balance, "confirmed");
+      const unconfirmed = readLightBalanceAtomic(balData?.balance, "unconfirmed");
       const total = confirmed + unconfirmed;
 
       const webAppUrl = "https://wallet.pepepow.net/mini";
@@ -1657,13 +1732,13 @@ if (process.env.BOT_TOKEN) {
         .text("History", "history");
 
       await ctx.reply(
-        `**Your Balance**\n\nAddress: \`${masked}\`\nConfirmed: ${formatSats(confirmed)} PEPEW\nUnconfirmed: ${formatSats(unconfirmed)} PEPEW\nTotal: ${formatSats(total)} PEPEW`,
+        `**Your Balance**\n\nAddress: \`${masked}\`\nConfirmed: ${formatPepewAtomic(confirmed)} PEPEW\nUnconfirmed: ${formatPepewAtomic(unconfirmed)} PEPEW\nTotal: ${formatPepewAtomic(total)} PEPEW`,
         {
           reply_markup: keyboard,
           parse_mode: "Markdown"
         }
       );
-      console.info(`[telegram] /balance command=success tg_user_id=${fromId} total=${total}`);
+      console.info(`[telegram] /balance command=success tg_user_id=${fromId} total_atomic=${total.toString()} source=light`);
     } catch (err: any) {
       await ctx.reply("An error occurred. Please try again later.");
       console.error(`[telegram] /balance command=error tg_user_id=${fromId} error=${err.message}`);
@@ -1774,7 +1849,7 @@ if (process.env.BOT_TOKEN) {
       const address = addrRes.data.address;
 
       // Get history
-      const histRes = await botFetchJson(`http://127.0.0.1:9194/wallet/history?address=${address}`);
+      const histRes = await botFetchLightJson(`/api/wallet/history/${encodeURIComponent(address)}?limit=10&offset=0&verbose=true&detail_limit=10`, "telegram.light.history");
       if (!histRes.res.ok) {
         await ctx.reply("Unable to fetch transaction history. Please try again later.");
         console.warn(`[telegram] /history command=history_error tg_user_id=${fromId} status=${histRes.res.status}`);
@@ -1782,7 +1857,7 @@ if (process.env.BOT_TOKEN) {
       }
 
       const histData = histRes.data;
-      const txs = Array.isArray(histData.txs) ? histData.txs : [];
+      const txs = getLightHistoryRows(histData);
 
       if (txs.length === 0) {
         const webAppUrl = "https://wallet.pepepow.net/mini";
@@ -1800,8 +1875,8 @@ if (process.env.BOT_TOKEN) {
       const lines = recent.map((tx: any, idx: number) => {
         const txid = tx.txid || tx.hash || "unknown";
         const truncated = truncateTxid(txid);
-        const amount = typeof tx.value === "number" ? `${tx.value > 0 ? "+" : ""}${formatSats(tx.value)} PEPEW` : "";
-        const time = tx.time ? new Date(tx.time * 1000).toISOString().slice(0, 16).replace("T", " ") : "";
+        const amount = formatLightHistoryAmount(tx);
+        const time = formatLightHistoryTime(tx);
         return `${idx + 1}. \`${truncated}\`${amount ? ` ${amount}` : ""}${time ? `\n   ${time}` : ""}`;
       });
 
@@ -1817,7 +1892,7 @@ if (process.env.BOT_TOKEN) {
           parse_mode: "Markdown"
         }
       );
-      console.info(`[telegram] /history command=success tg_user_id=${fromId} txs=${recent.length}`);
+      console.info(`[telegram] /history command=success tg_user_id=${fromId} txs=${recent.length} source=light`);
     } catch (err: any) {
       await ctx.reply("An error occurred. Please try again later.");
       console.error(`[telegram] /history command=error tg_user_id=${fromId} error=${err.message}`);
@@ -1903,7 +1978,7 @@ if (process.env.BOT_TOKEN) {
         const address = addrRes.data.address;
         const masked = maskAddress(address);
 
-        const balRes = await botFetchJson(`http://127.0.0.1:9194/wallet/balance?address=${address}`);
+        const balRes = await botFetchLightJson(`/api/wallet/address/${encodeURIComponent(address)}`, "telegram.light.balance");
         if (!balRes.res.ok) {
           await ctx.answerCallbackQuery({ text: "Unable to fetch balance" });
           console.warn(`[telegram] callback_query callback=balance result=error tg_user_id=${fromId}`);
@@ -1911,8 +1986,8 @@ if (process.env.BOT_TOKEN) {
         }
 
         const balData = balRes.data;
-        const confirmed = balData.confirmed ?? balData.balance ?? 0;
-        const unconfirmed = balData.unconfirmed ?? 0;
+        const confirmed = readLightBalanceAtomic(balData?.balance, "confirmed");
+        const unconfirmed = readLightBalanceAtomic(balData?.balance, "unconfirmed");
         const total = confirmed + unconfirmed;
 
         const webAppUrl = "https://wallet.pepepow.net/mini";
@@ -1923,14 +1998,14 @@ if (process.env.BOT_TOKEN) {
           .text("History", "history");
 
         await ctx.editMessageText(
-          `**Your Balance**\n\nAddress: \`${masked}\`\nConfirmed: ${formatSats(confirmed)} PEPEW\nUnconfirmed: ${formatSats(unconfirmed)} PEPEW\nTotal: ${formatSats(total)} PEPEW`,
+          `**Your Balance**\n\nAddress: \`${masked}\`\nConfirmed: ${formatPepewAtomic(confirmed)} PEPEW\nUnconfirmed: ${formatPepewAtomic(unconfirmed)} PEPEW\nTotal: ${formatPepewAtomic(total)} PEPEW`,
           {
             reply_markup: keyboard,
             parse_mode: "Markdown"
           }
         );
         await ctx.answerCallbackQuery();
-        console.info(`[telegram] callback_query callback=balance result=success tg_user_id=${fromId}`);
+        console.info(`[telegram] callback_query callback=balance result=success tg_user_id=${fromId} source=light`);
       } catch (err: any) {
         await ctx.answerCallbackQuery({ text: "An error occurred" });
         console.error(`[telegram] callback_query callback=balance result=error tg_user_id=${fromId} error=${err.message}`);
@@ -2018,7 +2093,7 @@ if (process.env.BOT_TOKEN) {
 
         const address = addrRes.data.address;
 
-        const histRes = await botFetchJson(`http://127.0.0.1:9194/wallet/history?address=${address}`);
+        const histRes = await botFetchLightJson(`/api/wallet/history/${encodeURIComponent(address)}?limit=10&offset=0&verbose=true&detail_limit=10`, "telegram.light.history");
         if (!histRes.res.ok) {
           await ctx.answerCallbackQuery({ text: "Unable to fetch history" });
           console.warn(`[telegram] callback_query callback=history result=error tg_user_id=${fromId}`);
@@ -2026,7 +2101,7 @@ if (process.env.BOT_TOKEN) {
         }
 
         const histData = histRes.data;
-        const txs = Array.isArray(histData.txs) ? histData.txs : [];
+        const txs = getLightHistoryRows(histData);
 
         if (txs.length === 0) {
           const webAppUrl = "https://wallet.pepepow.net/mini";
@@ -2044,8 +2119,8 @@ if (process.env.BOT_TOKEN) {
         const lines = recent.map((tx: any, idx: number) => {
           const txid = tx.txid || tx.hash || "unknown";
           const truncated = truncateTxid(txid);
-          const amount = typeof tx.value === "number" ? `${tx.value > 0 ? "+" : ""}${formatSats(tx.value)} PEPEW` : "";
-          const time = tx.time ? new Date(tx.time * 1000).toISOString().slice(0, 16).replace("T", " ") : "";
+          const amount = formatLightHistoryAmount(tx);
+          const time = formatLightHistoryTime(tx);
           return `${idx + 1}. \`${truncated}\`${amount ? ` ${amount}` : ""}${time ? `\n   ${time}` : ""}`;
         });
 
@@ -2062,7 +2137,7 @@ if (process.env.BOT_TOKEN) {
           }
         );
         await ctx.answerCallbackQuery();
-        console.info(`[telegram] callback_query callback=history result=success tg_user_id=${fromId}`);
+        console.info(`[telegram] callback_query callback=history result=success tg_user_id=${fromId} source=light`);
       } catch (err: any) {
         await ctx.answerCallbackQuery({ text: "An error occurred" });
         console.error(`[telegram] callback_query callback=history result=error tg_user_id=${fromId} error=${err.message}`);

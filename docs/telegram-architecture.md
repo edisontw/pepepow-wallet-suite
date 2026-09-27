@@ -108,7 +108,7 @@ Bot
 
 ### /balance
 
-Target:
+Current after M3:
 
 ```text
 Bot
@@ -118,11 +118,11 @@ Bot
  -> format balance
 ```
 
-Do not route the new implementation through `wallet-api /wallet/balance`.
+M3 follows this flow and no longer routes Bot balance through `wallet-api /wallet/balance`.
 
 ### /history
 
-Target:
+Current after M3:
 
 ```text
 Bot
@@ -131,7 +131,7 @@ Bot
  -> format recent transactions
 ```
 
-Do not route the new implementation through `wallet-api /wallet/history`.
+M3 follows this flow and no longer routes Bot history through `wallet-api /wallet/history`.
 
 ### /send
 

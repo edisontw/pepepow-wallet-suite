@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
-    "build": "tsc"
+    "build": "tsc",
+    "test:m3-bot-light-reads": "node ./tests/m3-bot-light-read-boundary.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.6.0",
