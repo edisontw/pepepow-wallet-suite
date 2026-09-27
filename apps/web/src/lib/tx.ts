@@ -1,41 +1,13 @@
-import { apiFetch, API_ENDPOINTS, withTxid } from "./api";
+import { apiFetch, API_ENDPOINTS } from "./api";
+import { PepewLightApiError, pepewLightClient } from "./pepewLightClient";
 
-type ErrorLikePayload = {
-  error?: string;
-  message?: string;
-  code?: string;
-  requestId?: string;
-};
-
-type RawTxBatchSuccessItem = {
-  txid: string;
-  ok: true;
-  rawTx: string;
-  source?: "cache" | "upstream";
-};
-
-type RawTxBatchFailedItem = {
-  txid: string;
-  ok: false;
-  code?: string;
-  error?: string;
-  requestId?: string;
-  source?: "upstream";
-};
-
+type RawTxBatchSuccessItem = { txid: string; ok: true; rawTx: string; source?: "cache" | "upstream"; };
+type RawTxBatchFailedItem = { txid: string; ok: false; code?: string; error?: string; requestId?: string; source?: "upstream"; };
 export type RawTxBatchItem = RawTxBatchSuccessItem | RawTxBatchFailedItem;
-
 export type RawTxBatchResponse = {
   requestId?: string;
   results: RawTxBatchItem[];
-  summary?: {
-    total?: number;
-    ok?: number;
-    failed?: number;
-    cacheHit?: number;
-    cacheMiss?: number;
-    timingMs?: number;
-  };
+  summary?: { total?: number; ok?: number; failed?: number; cacheHit?: number; cacheMiss?: number; timingMs?: number; };
 };
 
 export class TxApiError extends Error {
@@ -44,13 +16,7 @@ export class TxApiError extends Error {
   code?: string;
   requestId?: string;
   txid?: string;
-
-  constructor(
-    message: string,
-    status: number,
-    detail?: string,
-    extras?: { code?: string; requestId?: string; txid?: string }
-  ) {
+  constructor(message: string, status: number, detail?: string, extras?: { code?: string; requestId?: string; txid?: string }) {
     super(message);
     this.name = "TxApiError";
     this.status = status;
@@ -61,54 +27,73 @@ export class TxApiError extends Error {
   }
 }
 
-function parseErrorPayload(raw: string): ErrorLikePayload | null {
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as ErrorLikePayload;
-  } catch {
-    return null;
+function mapLightTxError(error: unknown, txid?: string) {
+  if (error instanceof TxApiError) return error;
+  if (error instanceof PepewLightApiError) {
+    return new TxApiError(error.message, error.status ?? 0, error.message, { code: error.code, txid });
   }
+  const detail = error instanceof Error ? error.message : String(error || "PEPEW Light API request failed");
+  return new TxApiError("PEPEW Light API transaction lookup failed", 0, detail, { code: "NETWORK_ERROR", txid });
+}
+
+function extractRawTx(payload: any): string | null {
+  const data = payload?.data ?? payload?.tx ?? payload;
+  if (typeof data === "string" && /^[0-9a-fA-F]+$/.test(data)) return data;
+  if (data && typeof data === "object") {
+    const hex = data.hex ?? data.raw ?? data.rawTx;
+    if (typeof hex === "string" && /^[0-9a-fA-F]+$/.test(hex)) return hex;
+  }
+  return null;
 }
 
 export async function fetchRawTx(txid: string): Promise<string> {
-  const r = await apiFetch(withTxid(API_ENDPOINTS.wallet.txRaw, txid), {
-    headers: {
-      Accept: "text/plain",
-    },
-  });
-  const text = await r.text();
-  if (!r.ok) {
-    const payload = parseErrorPayload(text);
-    const detail = payload?.error || payload?.message || text || undefined;
-    const requestId = r.headers.get("x-request-id") || payload?.requestId || undefined;
-    const code = payload?.code || undefined;
-    throw new TxApiError(`fetchRawTx failed: ${r.status}`, r.status, detail, { requestId, code, txid });
+  try {
+    const payload = await pepewLightClient.getTx(txid, true);
+    const rawTx = extractRawTx(payload);
+    if (!rawTx) {
+      throw new TxApiError("Previous transaction raw hex is not available yet.", 502, "raw transaction hex missing from PEPEW Light API response", { code: "RAW_TX_UNAVAILABLE", txid });
+    }
+    return rawTx;
+  } catch (error) {
+    throw mapLightTxError(error, txid);
   }
-  return text;
 }
 
+const RAW_TX_LOOKUP_CONCURRENCY = 6;
+
 export async function fetchRawTxBatchApi(txids: string[]): Promise<RawTxBatchResponse> {
-  const r = await apiFetch(API_ENDPOINTS.wallet.txRawBatch, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ txids }),
-  });
-  const payload = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const detail = typeof payload?.error === "string" ? payload.error : `HTTP ${r.status}`;
-    const code = typeof payload?.code === "string" ? payload.code : undefined;
-    const requestId = r.headers.get("x-request-id")
-      || (typeof payload?.requestId === "string" ? payload.requestId : undefined);
-    throw new TxApiError(`fetchRawTxBatchApi failed: ${r.status}`, r.status, detail, { code, requestId });
+  const uniqueTxids = Array.from(new Set(txids.filter(Boolean)));
+  const startedAt = Date.now();
+  const results: RawTxBatchItem[] = new Array(uniqueTxids.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < uniqueTxids.length) {
+      const index = nextIndex++;
+      const txid = uniqueTxids[index];
+      try {
+        const rawTx = await fetchRawTx(txid);
+        results[index] = { txid, ok: true, rawTx, source: "upstream" };
+      } catch (error) {
+        const mapped = mapLightTxError(error, txid);
+        results[index] = { txid, ok: false, code: mapped.code, error: mapped.detail || mapped.message, source: "upstream" };
+      }
+    }
   }
 
-  const results = Array.isArray(payload?.results) ? payload.results : [];
+  const workerCount = Math.min(RAW_TX_LOOKUP_CONCURRENCY, uniqueTxids.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  const ok = results.filter((item) => item?.ok === true).length;
   return {
-    requestId: typeof payload?.requestId === "string" ? payload.requestId : (r.headers.get("x-request-id") || undefined),
     results,
-    summary: payload?.summary,
+    summary: {
+      total: results.length,
+      ok,
+      failed: results.length - ok,
+      cacheHit: 0,
+      cacheMiss: results.length,
+      timingMs: Date.now() - startedAt,
+    },
   };
 }
 
