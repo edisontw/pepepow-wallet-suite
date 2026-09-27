@@ -1,6 +1,8 @@
 # wallet-api
 
-`wallet-api` is the **wallet control plane**. It authenticates Telegram users, issues short-lived JWTs, proxies read calls to `pepew-api`, and broadcasts raw transactions to the core node. It is **not** a wallet and **not** a custodian.
+> **Migration status:** this document describes the current legacy-compatible runtime. The approved target is for `wallet-api` to become the Telegram/product control plane only, while PEPEW Light API handles Wallet chain reads and signed broadcast. Do not add new consumers of the legacy chain proxy/RPC endpoints. See `docs/LIGHT_API_MIGRATION.md`.
+
+`wallet-api` is the **wallet control plane**. In the current transitional runtime it still authenticates Telegram users, issues short-lived JWTs, proxies some read calls to `pepew-api`, and broadcasts raw transactions to the core node. These chain-access responsibilities are legacy migration paths, not the target architecture. It is **not** a wallet and **not** a custodian.
 
 ## Positioning and Non-Goals
 
@@ -8,8 +10,8 @@
 - Telegram identity verification (WebApp `initData`).
 - JWT issuance and rotation.
 - Minimal, wallet-specific state (Telegram user <-> default address, payment requests).
-- Read proxies to `pepew-api`.
-- Raw transaction broadcast to core RPC.
+- Transitional read proxies to `pepew-api` (scheduled for removal after Light API cutover).
+- Transitional raw transaction broadcast to core RPC (scheduled for removal after Light API broadcast cutover).
 
 **What it is NOT:**
 - A key store (no mnemonics, no private keys).
@@ -47,7 +49,7 @@
 | POST | `/v1/history` | Batch history proxy (addresses[]) | No |
 | GET | `/v1/price` | PEPEW price (CoinMarketCap) | No |
 
-`POST /v1/history` intentionally remains on `wallet-api` on the public host for compatibility with the existing web wallet flow. It should not be reassigned to the public `pepew-api` route set.
+`POST /v1/history` currently remains on `wallet-api` for compatibility. New Wallet chain-read code should use the PEPEW Light API contract defined by the migration roadmap rather than expanding this compatibility route.
 
 ## /wallet and /api Endpoints (Read/Broadcast)
 

@@ -1,5 +1,7 @@
 # pepew-api
 
+> **Wallet migration note:** `pepew-api` remains an operational/public chain service and may continue serving other consumers, but it is no longer the approved target chain-access layer for Telegram Wallet. New Wallet integration must use PEPEW Light API / ElectrumX. See `docs/LIGHT_API_MIGRATION.md`.
+
 `pepew-api` is the public chain-read service for the PEPEPOW ecosystem. It sits in front of the core node and exposes a small HTTP interface for blockchain lookups that are safe to share publicly.
 
 It is designed for:
@@ -109,7 +111,7 @@ Example:
 - `GET /v1/addr/:address/utxos` returns spendable outputs for one address.
 - `GET /v1/addr/:address/txs` returns recent address history.
 
-These routes are the public read-chain contract expected by the wallet architecture.
+These routes are the legacy/public `pepew-api` read contract. Existing callers may continue to use them during migration, but new Telegram Wallet code must not adopt them as its chain contract.
 
 ### Transaction lookup and broadcast
 
@@ -161,8 +163,9 @@ Allowed origins are intended for the official web wallet and related public prop
 
 The two services serve different roles:
 
-- `pepew-api` is the public blockchain read layer
-- `wallet-api` is the wallet control plane for Telegram auth, wallet bindings, payment requests, and broadcast-related compatibility routes
+- `pepew-api` is an existing public blockchain API and remains available for compatible/other consumers
+- `wallet-api` is the Telegram/product control plane, with temporary legacy chain compatibility routes during migration
+- PEPEW Light API is the approved target Wallet blockchain data plane
 
 The web wallet and Telegram wallet do not rely on direct access to every `pepew-api` route. They intentionally keep using `wallet-api` for wallet-domain flows such as:
 

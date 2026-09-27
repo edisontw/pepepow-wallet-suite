@@ -1,92 +1,99 @@
 # PEPEPOW (PEPEW) Wallet Suite
 
-A comprehensive, non-custodial wallet ecosystem for the PEPEPOW (PEPEW) blockchain. 
+Non-custodial PEPEPOW wallet and Telegram integration, plus an isolated centralized-exchange Trade subsystem.
 
-## Features
+## Security model
 
-- **Web Wallet**: Modern, responsive React/Vite-based web interface.
-- **Telegram Mini App**: Integrated wallet experience for Telegram users.
-- **Wallet API**: Backend service for fee estimation, transaction broadcasting, and user UX helpers.
-- **PEPEW API**: Indexer and chain data proxy for fast, read-only chain queries.
-- **Trading Bot Suite**: A powerful collection of services for automated trading (DCA, GRID, Market Making) on centralized exchanges.
+The Wallet subsystem is non-custodial.
 
-## ⚠️ Critical Security Warning: Non-Custodial
+- Mnemonics and private keys stay on the client.
+- Address derivation, transaction construction, and signing are client-side.
+- Backend services never store wallet secrets and never sign for users.
+- Only public wallet data and already-signed raw transactions may cross the chain API boundary.
 
-This project is **non-custodial**. Mnemonics and private keys are **NEVER** sent to or stored on the server. They remain exclusively in the client's browser or Telegram environment.
+Trade is a separate security domain and must not access wallet keys, wallet signing, or wallet chain RPC.
 
-> [!WARNING]
-> **PHISHING ATTACK WARNING**: If you enter your mnemonic on a non-official website, your funds will be lost immediately. Always verify the domain name (`wallet.pepepow.org` or `wallet.pepepow.net`) and ensure you are using the official release.
+## Wallet architecture direction
 
-## Architecture
-
-This project follows a client-side signing model:
+The approved target architecture uses the existing PEPEW Light API / ElectrumX stack for Wallet blockchain access:
 
 ```text
-[ Client (Web/Mini App) ] --(Auth/UX)--> [ Wallet API ]
-           |                                  |
-    (Sign Transaction)                (Broadcast Raw Tx)
-           |                                  |
-           v                                  v
-[   Local Browser    ]                [  pepepowd RPC   ]
-                                              |
-[     PEPEW API      ] <--(Indexed Data)-- [ Blockchain ]
+Telegram Bot
+   |-- wallet-api :9194 -> Telegram identity / address binding / payment requests
+   '-- PEPEW Light API -> balance / history
+
+Telegram Mini App / Web Wallet
+   |-- wallet-core -> derive / select / build / sign locally
+   |-- wallet-api :9194 -> Telegram product/control-plane features
+   '-- PEPEW Light API -> address / history / UTXO / tx / signed rawTx broadcast
+                              |
+                              v
+                    pepepow-electrumx-service
+                              |
+                           ElectrumX
+                              |
+                           pepepowd
 ```
 
-1. **Client**: Generates mnemonics and signs transactions locally.
-2. **Wallet API**: Provides business logic, fee estimation, and broadcasts signed raw transactions.
-3. **PEPEW API**: High-performance indexer for checking balances, UTXOs, and history.
+Migration is staged. Current production code still contains legacy `wallet-api -> pepew-api` proxies and direct core-RPC paths until the relevant milestones are completed.
 
-## Repository Structure
+See:
 
-- `apps/web`: React-based web wallet.
-- `services/wallet-api`: Node.js backend for the wallet.
-- `packages/wallet-core`: Shared logic for coin operations (BIP39/32/44).
-- `pepew-api`: Chain indexer service.
-- `services/trade-api`: Backend for automated trading strategies.
-- `services/trade-bot`: Telegram bot for managing trading strategies.
-- `docs/`: Technical documentation and runbooks.
-- `scripts/`: Deployment and maintenance scripts.
+- [Architecture](docs/architecture.md)
+- [Light API Migration Roadmap](docs/LIGHT_API_MIGRATION.md)
+- [Development Compass](docs/DEV_COMPASS.md)
 
-## Getting Started
+## Repository structure
 
-### Prerequisites
-
-- Node.js 20 LTS
-- `pepepowd` node with `txindex=1` and `addressindex=1` (requires `-reindex` if newly enabled).
-- PostgreSQL (optional, used for UX cache and Telegram identity).
-
-### Installation
-
-```bash
-# Install dependencies for the workspace
-npm install
-
-# Build all packages
-npm run build
-```
-
-### Configuration
-
-Copy `.env.example` to `.env` and fill in the required values. See [Environment Rules](docs/ENV_RULES.md) for details.
-
-```bash
-cp .env.example .env
-```
-
-## Documentation
-
-- [Architecture Overview](docs/architecture.md)
-- [Security Statement](docs/security.md)
-- [Deployment Layout](docs/deploy_layout.md)
-- [API Reference](docs/pepew-api.md)
-- [Trading Suite Architecture](docs/TRADE_ARCHITECTURE.md)
-- [Trading Strategy Specifications](docs/TRADE_STRATEGIES_SPEC.md)
-- [Trade API Documentation](docs/trade-api.md)
-- [Trade Bot Documentation](docs/trade-bot.md)
-- [Trading Quick Start Guide](docs/TRADE_USER_QUICK_START.md)
-- [Nginx Hardening](docs/nginx-hardening-minimal.md)
-- [Publishing to GitHub](docs/publishing-to-github.md)
+- `apps/web`: React/Vite Web Wallet and Telegram Mini App.
+- `services/wallet-api`: Telegram/product control plane; currently also contains transitional legacy chain routes.
+- `packages/wallet-core`: client-side PEPEPOW wallet primitives.
+- `pepew-api`: legacy/public chain API that may continue serving non-Wallet consumers; no new Telegram Wallet chain dependency should be added.
+- `services/trade-api`: centralized-exchange strategy backend.
+- `services/trade-bot`: Telegram control surface for Trade.
+- `docs`: architecture, migration, security, deployment, and runbooks.
 
 ## Development
 
-See [DEV_COMPASS.md](docs/DEV_COMPASS.md) for a guide to the codebase and internal dependencies.
+Requirements:
+
+- Node.js 20 LTS or newer
+- npm
+
+Install and build:
+
+```bash
+npm install
+npm run build
+```
+
+Environment rules:
+
+```text
+docs/ENV_RULES.md
+```
+
+The current production deployment may still require local pepepowd/pepew-api dependencies while the Light API migration is incomplete. Do not remove a runtime dependency until its migration milestone passes acceptance.
+
+## Documentation
+
+Start with:
+
+1. [Development Compass](docs/DEV_COMPASS.md)
+2. [Light API Migration Roadmap](docs/LIGHT_API_MIGRATION.md)
+3. [Architecture](docs/architecture.md)
+4. [Telegram Architecture](docs/telegram-architecture.md)
+5. [Security](docs/security.md)
+6. [Current wallet-api endpoints](docs/wallet-api.md)
+7. [Runtime](docs/runtime.md)
+
+Trade references:
+
+- [Trade Architecture](docs/TRADE_ARCHITECTURE.md)
+- [Trade Strategy Specifications](docs/TRADE_STRATEGIES_SPEC.md)
+- [Trade API](docs/trade-api.md)
+- [Trade Bot](docs/trade-bot.md)
+
+## Migration rule
+
+Do not perform a big-bang replacement. Migrate one coherent layer at a time, preserve rollback, verify old/new response parity, and keep signing strictly client-side.
