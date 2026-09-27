@@ -1,241 +1,256 @@
 # Architecture: PEPEPOW Wallet Suite
 
-The **PEPEPOW Wallet Suite** is a modular, non-custodial wallet system designed for **Web**, **Telegram Mini App**, and **Telegram Bot** usage.
+> Status: **approved target architecture** for the PEPEW Light migration.
+>
+> M0 is documentation-only. Production runtime may still use legacy `wallet-api -> pepew-api -> pepepowd` and direct RPC paths until M1-M6 in `docs/LIGHT_API_MIGRATION.md` are completed.
 
-The architecture strictly enforces **key sovereignty**, **minimal trust**, and **clear security boundaries** by separating blockchain read access, wallet coordination, and client-side key management.
+## Core principles
 
----
+The Wallet Suite is non-custodial.
 
-## Core Principles (Non-Negotiable)
+- Mnemonic phrases and private keys stay on the client.
+- Transaction construction and signing happen on the client.
+- Backend services never derive keys or sign transactions.
+- Only public addresses, txids, read options, product metadata, and already-signed raw transactions may cross the wallet API boundary.
+- Telegram identity/product functions and blockchain chain-access functions are separate domains.
 
-- **Mnemonic phrases and private keys exist only on the client**
-- The backend:
-  - never stores mnemonics
-  - never stores private keys
-  - never signs transactions
-- All transactions are **constructed and signed locally**
-- The backend only performs:
-  - blockchain reads
-  - fee estimation
-  - raw transaction broadcasting
-  - minimal public user bindings and caches
-
----
-
-## System Components
-
-The system is composed of four primary components:
-
----
-
-### 1. Web Wallet / Telegram Mini App (Client)
-
-**Role:**  
-Non-custodial wallet frontend (single shared codebase).
-
-**Tech Stack:**
-- React
-- Vite
-- Custom PEPEPOW wallet core (BIP-39 / BIP-44 derivation)
-
-**Responsibilities:**
-- Mnemonic generation and import
-- HD address derivation (BIP-44, coin type 5)
-- UTXO selection
-- Transaction construction
-- **Local transaction signing**
-- UI / UX rendering
-
-**Security Model:**
-- Private keys and mnemonics exist **only** in:
-  - browser memory
-  - localStorage (encrypted)
-  - optional Telegram Cloud Storage
-- No secret material is ever sent to the backend
-
----
-
-### 2. Wallet API (`wallet-api`, :9194)
-
-**Role:**  
-Authenticated wallet backend coordinator (control plane).  
-**This is not a wallet and not a custodian.**
-
-**Tech Stack:**
-- Node.js (Express / Fastify)
-- JWT
-- SQLite / PostgreSQL (minimal state)
-
-**Responsibilities:**
-- Verify Telegram WebApp `initData`
-- Issue short-lived JWTs
-- Provide wallet-specific backend services:
-  - fee estimation
-  - raw transaction broadcasting
-  - transaction / request caching
-  - Telegram user ↔ address binding
-  - payment request / claim flows
-
-**Typical Endpoints (examples):**
-- `POST /v1/profile/upsert`
-- `GET  /v1/resolve`
-- `POST /v1/requests`
-- `POST /v1/requests/:id/claim`
-- `GET  /v1/requests/:id`
-- `POST /v1/broadcast`
-
-**Security Model:**
-- Authenticated (Telegram identity)
-- Authorized (JWT)
-- Stateful only for **public or cache data**
-- **Never stores private keys or mnemonics**
-- **Never signs transactions**
-
----
-
-### 3. PEPEW API (`pepew-api`, :9193)
-
-**Role:**  
-Public, read-only blockchain data service (indexer / query layer).
-
-**Tech Stack:**
-- Node.js (Fastify)
-- Connected to `pepepowd` via RPC / ZMQ / indexes
-
-**Responsibilities:**
-- Provide efficient read access to blockchain data:
-  - chain height
-  - address balance
-  - UTXOs
-  - transaction history
-  - block / tx queries
-- Serve multiple consumers:
-  - Web Wallet
-  - Telegram Mini App
-  - Explorer
-  - third-party services
-
-**Security Model:**
-- No user identity
-- No JWT
-- No database of users
-- **Read-only access**
-- No blockchain write capability
-
-> Even if scanned or DoS-attacked, impact is limited to data queries only.
-
----
-
-### 4. PEPEPOWD (Core Node)
-
-**Role:**  
-Canonical source of truth for the PEPEPOW blockchain.
-
-**Responsibilities:**
-- Block validation
-- Transaction validation
-- Mempool management
-- JSON-RPC interface
-- ZMQ event streaming
-
----
-
-## Why `wallet-api` and `pepew-api` Are Separate
-
-This separation is **intentional and required**, not historical.
-
-### 1. Security Boundary Enforcement
-
-- `pepew-api`: public, read-only, large attack surface, low risk
-- `wallet-api`: authenticated, write-capable (broadcast), high sensitivity
-
-Mixing them would:
-- expand the attack surface
-- complicate rate limiting and WAF rules
-- risk wallet availability under external traffic
-
----
-
-### 2. Clean Domain Separation
-
-- `pepew-api` = **blockchain domain API**
-- `wallet-api` = **wallet product domain API**
-
-Keeping them separate:
-- avoids endpoint contamination
-- simplifies debugging
-- keeps blockchain infrastructure reusable
-- allows wallet features to evolve independently
-
----
-
-### 3. Scalability and Reuse
-
-With separation:
-- `pepew-api` can serve explorers, wallets, and third-party apps
-- `wallet-api` evolves for product needs:
-  - Telegram tipping
-  - request / claim flows
-  - anti-abuse logic
-  - caching and session policies
-
----
-
-## Data Flow (Simplified)
+## Target architecture
 
 ```mermaid
 graph TD
-    User([User]) <--> WebApp[Web Wallet / Mini App]
+    User([User]) <--> Client[Web Wallet / Telegram Mini App]
+    TG([Telegram Bot]) --> Control[wallet-api :9194]
 
-    WebApp -- "1. Balance / UTXO / Fee" --> WalletAPI[wallet-api :9194]
-    WalletAPI -- "2. Read Proxy" --> PepewAPI[pepew-api :9193]
-    PepewAPI -- "3. Query Index" --> Node[(PEPEPOWD)]
+    Client -- "Telegram auth / bindings / requests" --> Control
+    Client -- "address / history / UTXO / tx / signed rawTx" --> Light[PEPEW Light API]
+    TG -- "default public address" --> Control
+    TG -- "balance / history" --> Light
 
-    WebApp -- "4. Build & Sign Tx (Local)" --> WebApp
+    Light --> EX[ElectrumX]
+    EX --> Node[(pepepowd)]
 
-    WebApp -- "5. Broadcast rawTx" --> WalletAPI
-    WalletAPI -- "6. sendrawtransaction" --> Node
-````
+    Client -- "Build + sign locally" --> Client
+```
 
----
+### Security boundary
 
-## Backend Data Storage Policy
+```text
+CLIENT SECRET DOMAIN
+- mnemonic
+- private keys
+- WIF / seed / xprv
+- transaction signing
 
-**Forbidden:**
+PUBLIC/CONTROL DATA
+- Telegram identity
+- public wallet address
+- payment-request metadata
 
-* private keys
-* mnemonic phrases
-* signing material
-* any data that can reconstruct keys
+CHAIN DATA PLANE
+- PEPEW Light API
+- ElectrumX
+- pepepowd
+```
 
-**Allowed (minimal):**
+ElectrumX and pepepowd must not be exposed directly to browser clients.
 
-* Telegram user metadata
-* user ↔ address bindings (public)
-* transaction / request caches
+## Components
 
----
+### Web Wallet / Telegram Mini App
 
-## Deployment Model
+Single non-custodial wallet client.
 
-* `pepew-api` → `127.0.0.1:9193`
-* `wallet-api` → `127.0.0.1:9194`
-* `nginx` → public HTTPS entry point
+Responsibilities:
 
-**Design Choice:**
+- create/import mnemonic;
+- derive PEPEPOW addresses;
+- UTXO selection;
+- fetch previous transaction material needed to construct P2PKH spends;
+- construct and sign transactions locally;
+- submit signed raw transaction only;
+- balance/history/receive/send UI;
+- stale-UTXO and recent-spent reconciliation.
 
-* No Docker by default
-* Direct Linux deployment
-* Local loopback or UNIX socket communication
-* Reduced overhead and simpler observability
+The Light Wallet repository is the reference implementation for Light API integration and send resilience.
 
----
+### wallet-core
 
-## Non-Custodial Guarantee
+Client-side wallet primitives only.
 
-The non-custodial nature of PEPEPOW Wallet Suite is guaranteed by design:
+Canonical PEPEPOW parameters:
 
-* Keys never leave the client
-* Transactions are signed client-side
-* Backend only accepts **already-signed raw transactions**
-* Backend cannot control or reconstruct user funds
+```text
+P2PKH  0x37
+P2SH   0x10
+WIF    0xCC
+HD     m/44'/5'/0'/0/x
+PEPEW  8 decimal places
+```
+
+### wallet-api :9194
+
+Target role: authenticated **control plane** for Telegram/product features.
+
+Responsibilities:
+
+- verify Telegram WebApp `initData`;
+- issue short-lived JWTs;
+- Telegram user/profile metadata;
+- default public address binding;
+- username / user-id resolution;
+- payment request and claim flows;
+- Telegram bot webhook;
+- other product-specific state that does not require wallet secrets.
+
+The target wallet-api does **not**:
+
+- index chain data;
+- proxy balance/UTXO/history;
+- look up raw transactions for wallet signing;
+- broadcast by direct pepepowd RPC;
+- hold a raw-tx hot cache;
+- sign transactions.
+
+### PEPEW Light API
+
+Implemented by `edisontw/pepepow-electrumx-service`.
+
+Approved wallet chain contract:
+
+```text
+GET  /api/wallet/address/{address}
+GET  /api/wallet/history/{address}
+GET  /api/wallet/utxo/{address}
+GET  /api/wallet/tx/{txid}
+POST /api/wallet/broadcast
+```
+
+Responsibilities:
+
+- validate public wallet query inputs;
+- provide ElectrumX-backed balance/history/UTXO/tx data;
+- accept only an already-signed raw transaction for broadcast;
+- enforce safe errors, request-size limits, and rate limits.
+
+It must not receive or process mnemonic/private-key/signing requests.
+
+### ElectrumX
+
+Private indexed chain interface used by PEPEW Light API.
+
+### pepepowd
+
+Canonical blockchain authority.
+
+PEPEW Light API / ElectrumX may ultimately communicate with pepepowd, but Wallet Suite product services must not create parallel direct-RPC chain access after migration.
+
+## Telegram data flows
+
+### Mini App authentication
+
+```text
+Telegram WebApp initData
+ -> wallet-api /auth/telegram
+ -> verified Telegram identity
+ -> short-lived JWT
+```
+
+JWT is for Telegram/product endpoints. Public Light API chain reads do not become custodial or identity-dependent.
+
+### Bot balance/history
+
+```text
+Telegram command
+ -> wallet-api: resolve user's default public address
+ -> PEPEW Light API: address/history query
+ -> Bot formats response
+```
+
+### Client send
+
+```text
+derive sender locally
+ -> Light API fresh UTXO
+ -> local coin selection
+ -> Light API previous tx/raw data if required
+ -> local transaction build
+ -> local signing
+ -> Light API POST /api/wallet/broadcast
+ -> refresh/reconcile wallet state
+```
+
+## Transitional runtime
+
+The following are legacy migration paths, not the target architecture:
+
+```text
+wallet-api /wallet/balance
+wallet-api /wallet/utxos
+wallet-api /wallet/history
+wallet-api /wallet/tx/raw*
+wallet-api direct sendrawtransaction
+wallet-api CORE_RPC_URL
+wallet-api -> pepew-api chain proxy
+```
+
+They may remain temporarily while required by production. New code must not depend on them unless a migration milestone explicitly requires a compatibility bridge.
+
+### Temporary fee exception
+
+`/wallet/fee/estimate` may continue to use the core RPC during M1-M4.
+
+M5 must move fee policy away from this dependency before direct node RPC can be removed from wallet-api.
+
+## Repository boundaries
+
+| Repository | Responsibility |
+| --- | --- |
+| `pepepow-wallet-suite` | Telegram Bot, Mini App/product UX, wallet-api control plane, shared client wallet logic |
+| `pepepow-light-wallet` | Public Light Wallet reference client and proven Light API/send behavior |
+| `pepepow-electrumx-service` | PEPEW Light API gateway, cache, validation, wallet read/broadcast contract |
+| `electrumx-pepepow` | PEPEPOW ElectrumX chain support |
+| `pepepowd` | Blockchain consensus/node authority |
+
+## Backend storage policy
+
+Forbidden:
+
+- private keys;
+- mnemonic / recovery phrase;
+- seed / xprv / WIF;
+- data capable of reconstructing keys.
+
+Allowed when needed:
+
+- Telegram user metadata;
+- bound public addresses;
+- labels;
+- payment request metadata;
+- bounded operational caches.
+
+Avoid long-term identity/address/IP correlation not required for product operation.
+
+## Migration and rollback discipline
+
+Follow `docs/LIGHT_API_MIGRATION.md`.
+
+Each runtime milestone must:
+
+1. change one coherent layer;
+2. preserve a rollback path;
+3. compare old/new response semantics;
+4. test invalid address, timeout, 429, upstream failure, and stale UTXO behavior where applicable;
+5. verify no mnemonic/private key crosses a network boundary;
+6. update docs when behavior changes.
+
+## Final architecture acceptance
+
+Migration is complete only when Wallet Suite can lose access to local pepepowd RPC without breaking:
+
+- Telegram Bot balance/history;
+- Mini App balance/history;
+- UTXO lookup;
+- previous transaction lookup;
+- signed transaction broadcast.
+
+Fee policy must also be independent from Wallet API direct RPC by that point.

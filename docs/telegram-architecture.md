@@ -1,114 +1,240 @@
-# Telegram Architecture (Bot, Mini App, Web Wallet)
+# Telegram Architecture: Bot, Mini App, and Wallet Control Plane
 
-This document is for developers and AI agents. It describes how the Telegram Bot, Telegram Mini App, and Web Wallet interact with `wallet-api` and how Telegram identity is validated.
+> Target architecture for the PEPEW Light migration.
+>
+> Runtime migration status is tracked in `docs/LIGHT_API_MIGRATION.md`. M0 is documentation-only; legacy chain proxy/RPC endpoints may still exist until later milestones.
 
-## Roles and Responsibilities
+## Roles
 
 ### Telegram Bot
-- Entry point and command surface (`/start`, `/balance`, `/deposit`, `/send`, `/history`).
-- Sends users to the Mini App via WebApp buttons.
-- Uses short-lived JWTs to call `wallet-api` for Telegram-linked data (default address lookup).
-- Never signs transactions and never holds keys.
+
+Command and navigation surface:
+
+- `/start`
+- `/balance`
+- `/deposit`
+- `/send`
+- `/history`
+
+The bot never holds keys, derives private keys, builds transactions, or signs.
 
 ### Telegram Mini App
-- The wallet UI inside Telegram. Shares the same frontend codebase as the Web Wallet.
-- Uses Telegram WebApp `initData` to authenticate via `wallet-api` and obtain a JWT.
-- All key generation and signing happens locally in the browser.
 
-### Web Wallet
-- Same UI as Mini App, used outside Telegram (e.g., `https://wallet.pepepow.net`).
-- Uses public `wallet-api` read endpoints (`/wallet/*`) for balance/UTXO/history/fees.
-- Does not have Telegram identity unless opened via Telegram WebApp.
+The wallet UI inside Telegram.
 
-## Data Flow Overview
+- Shares wallet behavior with the Web Wallet.
+- Handles mnemonic/private-key material only on the client.
+- Uses wallet-core for derivation and transaction construction/signing.
+- Uses wallet-api for Telegram identity/product functions.
+- Uses PEPEW Light API for blockchain chain access.
 
-### Mini App Authentication and Session
-1. Telegram WebApp provides `initData` to the Mini App.
-2. Mini App calls `POST /auth/telegram` on `wallet-api` with `{ initData }`.
-3. `wallet-api` verifies `initData` and issues a JWT (30m expiration).
-4. Mini App stores JWT in local storage and uses it for `/v1/*` endpoints.
+### wallet-api :9194
 
-### Bot Command Flow
-1. User runs a command in the bot (e.g., `/balance`).
-2. Bot creates a short-lived JWT (subject = Telegram user id) using `JWT_SECRET`.
-3. Bot calls `wallet-api` to fetch default address (`GET /v1/address/default`).
-4. Bot calls `wallet-api` read endpoints (`/wallet/balance`, `/wallet/history`) to return results.
+Telegram/product control plane.
 
-### Read Queries
-- `wallet-api` proxies read requests to `pepew-api`:
-  - `/wallet/balance` -> `/v1/addr/:address/balance`
-  - `/wallet/utxos` -> `/v1/addr/:address/utxos`
-  - `/wallet/history` -> `/v1/addr/:address/txs`
+Target responsibilities:
 
-### Write / Broadcast
-- The client builds and signs transactions locally.
-- `wallet-api` broadcasts raw transactions directly to the core node (`sendrawtransaction`).
+- verify Telegram WebApp `initData`;
+- issue short-lived JWT;
+- store minimal Telegram metadata;
+- default public address binding;
+- resolve Telegram user/username to public address;
+- payment request / claim flows;
+- Telegram webhook.
 
-## Telegram WebApp initData Verification
+Target non-responsibilities:
 
-Implementation lives in `services/wallet-api/src/server.ts` and uses `TELEGRAM_BOT_TOKEN` (or `BOT_TOKEN` fallback) as the validation secret.
+- balance/UTXO/history proxy;
+- raw transaction lookup for signing;
+- direct node broadcast;
+- blockchain indexing.
 
-Steps:
-1. Parse `initData` as URL query string.
-2. Extract `hash`, remove it from the parameter set.
-3. Create `dataCheckString` by sorting key/value pairs and joining with `\n`.
-4. Compute secret: `HMAC_SHA256("WebAppData", botToken)`.
-5. Compute `computedHash = HMAC_SHA256(dataCheckString, secret)`.
-6. Compare hashes with a timing-safe comparison.
-7. Validate `auth_date` is not in the future and within `TELEGRAM_INITDATA_MAX_AGE_SEC` (default 86400 seconds).
-8. Parse `user` JSON if present and read `user.id`.
+### PEPEW Light API
 
-If valid, `wallet-api` issues a JWT:
-- `sub` = Telegram user id
-- payload: `{ telegramUserId, username }`
-- expiry: 30 minutes
+Blockchain data plane:
 
-## `/mini?debug=1`
+```text
+GET  /api/wallet/address/{address}
+GET  /api/wallet/history/{address}
+GET  /api/wallet/utxo/{address}
+GET  /api/wallet/tx/{txid}
+POST /api/wallet/broadcast
+```
 
-The Mini App route supports a debug view for Telegram context.
+Backed by private ElectrumX.
 
-Example: `https://wallet.pepepow.net/mini?debug=1`
+## Mini App authentication
 
-Debug info displayed:
-- `hasTelegram`: whether Telegram WebApp is detected
-- `initDataLen`: length of `initData`
-- `userId`: Telegram user id (from `initDataUnsafe`)
-- `platform`: Telegram platform identifier
+1. Telegram WebApp provides `initData`.
+2. Mini App calls `POST /auth/telegram` on wallet-api.
+3. wallet-api verifies `initData` with the Telegram bot token.
+4. wallet-api issues a short-lived JWT.
+5. The JWT is used only for authenticated Telegram/product routes such as `/v1/*`.
 
-If Telegram WebApp is present but `initData` is missing, the page shows a warning to test inside the Telegram mobile app.
+Blockchain reads do not require sending the mnemonic/private key or turning the chain API into an identity service.
 
-## Telegram Database (wallet-api)
+## Telegram initData verification
 
-`wallet-api` stores minimal Telegram-related metadata in SQLite.
+Implementation remains in `services/wallet-api/src/server.ts`.
 
-- **DB type**: SQLite (better-sqlite3)
-- **Path**: `services/wallet-api/wallet.db` (auto-created next to the service)
+Required validation:
 
-### Tables
-- `user`
-  - `tg_user_id`, `tg_username`, timestamps
-- `user_address`
-  - Telegram user id -> address mapping
-  - `address`, `label`, `is_default`, timestamps
-- `payment_request`
-  - Request id, from/to user, amount/memo, status, claim address, expiry
+1. Parse `initData`.
+2. Remove `hash`.
+3. Sort key/value pairs and join with newline.
+4. Derive Telegram WebApp HMAC secret from the bot token.
+5. Compute and timing-safely compare the expected hash.
+6. Validate `auth_date` age and future timestamps.
+7. Parse Telegram user data only after verification.
 
-### Allowed Data
-- Telegram user id and username
-- Wallet address and optional label
-- Payment request metadata (amount, memo, status, timestamps)
+## Bot command flows
 
-### Strictly Forbidden Data
-- Mnemonic phrase or seed
-- Private keys or xprv/extended keys
-- Raw signed transactions or PSBTs
-- Any client-side wallet state beyond public addresses
+### /start
 
-## Why the Telegram Bot Cannot Be the Wallet
+```text
+Bot
+ -> onboarding message
+ -> Mini App WebApp button
+```
 
-- Bots cannot securely store or derive private keys.
-- Bots cannot perform local signing and must never handle mnemonics.
-- Telegram chat is not a secure key storage channel.
-- The bot is a UI and routing layer; the wallet lives entirely in the client.
+### /deposit
 
-The Bot must remain stateless regarding secret material. All signing stays on the user device.
+```text
+Bot
+ -> short-lived bot JWT
+ -> wallet-api GET /v1/address/default
+ -> display the user's bound public receive address / open Mini App
+```
+
+### /balance
+
+Target:
+
+```text
+Bot
+ -> wallet-api GET /v1/address/default
+ -> obtain public PEPEW address
+ -> PEPEW Light API GET /api/wallet/address/{address}
+ -> format balance
+```
+
+Do not route the new implementation through `wallet-api /wallet/balance`.
+
+### /history
+
+Target:
+
+```text
+Bot
+ -> wallet-api GET /v1/address/default
+ -> PEPEW Light API GET /api/wallet/history/{address}?limit=10
+ -> format recent transactions
+```
+
+Do not route the new implementation through `wallet-api /wallet/history`.
+
+### /send
+
+```text
+Bot
+ -> open Mini App
+ -> client performs wallet send flow
+```
+
+The chat bot itself must never sign.
+
+## Mini App chain flow
+
+### Balance / history
+
+```text
+Mini App
+ -> dedicated Light API client
+ -> PEPEW Light API
+ -> ElectrumX
+```
+
+### Send
+
+```text
+Mini App
+ -> refresh UTXO
+ -> exclude recent-spent outpoints
+ -> local UTXO selection
+ -> fetch previous tx/raw data from PEPEW Light API when needed
+ -> build locally
+ -> sign locally
+ -> POST /api/wallet/broadcast with { raw_tx }
+ -> reconcile UTXO/history
+```
+
+Only the signed raw transaction may be submitted.
+
+## Fee-estimation transition
+
+During M1-M4 only, the Mini App may temporarily retain the existing `wallet-api /wallet/fee/estimate` path.
+
+This is an explicit compatibility exception. Do not use it as justification to keep other chain reads on wallet-api.
+
+M5 replaces the direct core-RPC fee dependency with an approved Light API or client-side fee policy.
+
+## Telegram database
+
+wallet-api may store minimal product metadata in SQLite/PostgreSQL.
+
+Allowed:
+
+- Telegram user id;
+- Telegram username;
+- public wallet address;
+- label / default flag;
+- payment request metadata;
+- timestamps required for product state.
+
+Forbidden:
+
+- mnemonic / seed;
+- private key / WIF / xprv;
+- transaction signing material;
+- server-side wallet state that can control funds.
+
+## Debugging
+
+`/mini?debug=1` may expose non-secret Telegram environment diagnostics such as:
+
+- whether Telegram WebApp context exists;
+- initData length;
+- verified/unsafe user id for debugging display;
+- platform identifier.
+
+Never log or display recovery material.
+
+## Migration compatibility
+
+Legacy paths currently implemented in wallet-api may remain until their milestone completes:
+
+```text
+/wallet/balance
+/wallet/utxos
+/wallet/history
+/wallet/tx/raw*
+/wallet/tx/broadcast
+```
+
+Rules:
+
+- no new feature may adopt a legacy path;
+- migrate Mini App reads before removing endpoints;
+- migrate Bot reads separately;
+- migrate signed broadcast only after parity testing;
+- keep rollback possible until each milestone is accepted.
+
+## Acceptance target
+
+After migration:
+
+- stopping/blocking Wallet Suite access to local pepepowd RPC does not break Bot balance/history;
+- Mini App balance/history/UTXO/tx lookup still work;
+- Mini App can broadcast a correctly signed transaction through PEPEW Light API;
+- Telegram identity and payment-request functions continue through wallet-api;
+- no secret material appears in backend DB, logs, requests, or responses.
