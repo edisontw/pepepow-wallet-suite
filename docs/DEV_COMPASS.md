@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M0 COMPLETE — Light API migration architecture approved; runtime still contains legacy paths until M1-M6 are completed.**
+> Migration status: **M1 COMPLETE — the typed PEPEW Light API client adapter exists, but production Wallet read call sites remain on legacy paths until M2.**
 
 ## 1. Core design principles
 

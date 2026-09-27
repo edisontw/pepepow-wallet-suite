@@ -64,7 +64,10 @@ Rate limiting (per IP + per JWT subject):
 - `WALLET_API_RATE_LIMIT_AUTH_MAX` (default: `60`)
 
 ## Web wallet build-time variables
-- `VITE_API_BASE` (default: `https://api.pepepow.net`)
+- `VITE_API_BASE` (legacy wallet-api/product API base; default: `https://api.pepepow.net`)
+- `VITE_PEPEW_LIGHT_API_BASE_URL` (PEPEW Light chain API base; default: `https://light.pepepow.net`)
+
+M1 only introduces the Light API client adapter. Production balance/history/UTXO call sites remain on the legacy path until M2.
 
 These values are baked at build time (Vite). Changing them requires a rebuild.
 

@@ -36,7 +36,7 @@ No runtime behavior change.
 
 ## M1 — Add Light API client to Wallet Suite
 
-Status: **NEXT**
+Status: **COMPLETE**
 
 Goal: create a dedicated client adapter in Wallet Suite without changing production call sites yet.
 
@@ -73,11 +73,21 @@ Verification:
 - 5xx/unavailable;
 - API requests contain no mnemonic/private key.
 
-M1 must not yet delete legacy API code.
+M1 implementation:
+
+- added `apps/web/src/lib/pepewLightClient.ts`;
+- added typed address/history/UTXO/tx/broadcast contracts;
+- GET/HEAD requests have one bounded retry by default for network/timeout/429/502/503/504 failures;
+- signed broadcast is never automatically retried;
+- API errors are mapped to stable safe messages rather than exposing upstream detail;
+- added `VITE_PEPEW_LIGHT_API_BASE_URL` with production default `https://light.pepepow.net`;
+- added `npm --prefix apps/web run test:light-client`.
+
+M1 does not change any production call site and does not delete legacy API code.
 
 ## M2 — Mini App read migration
 
-Status: planned
+Status: **NEXT**
 
 Switch these Mini App/Web Wallet functions to the Light API client:
 
