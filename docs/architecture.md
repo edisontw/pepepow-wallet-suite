@@ -195,11 +195,11 @@ wallet-api -> pepew-api chain proxy
 
 They may remain temporarily while required by production. New code must not depend on them unless a migration milestone explicitly requires a compatibility bridge.
 
-### Temporary fee exception
+### M5 fee policy
 
-`/wallet/fee/estimate` may continue to use the core RPC during M1-M4.
+M5 uses a deterministic client-side P2PKH size policy with a 0.0001 PEPEW minimum and 0.0001 PEPEW/kB rate. The Mini App/Web Wallet computes the transaction fee locally from input/output count, and wallet-api no longer exposes `/wallet/fee/estimate`.
 
-M5 must move fee policy away from this dependency before direct node RPC can be removed from wallet-api.
+Remaining wallet-api direct-RPC compatibility and diagnostic paths are legacy and deferred to M6 cleanup.
 
 ## Repository boundaries
 

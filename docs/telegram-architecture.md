@@ -170,13 +170,11 @@ Mini App
 
 Only the signed raw transaction may be submitted.
 
-## Fee-estimation transition
+## Fee policy
 
-During M1-M4 only, the Mini App may temporarily retain the existing `wallet-api /wallet/fee/estimate` path.
+M5 uses a deterministic client-side transaction-size policy. The Mini App computes fee locally from selected input/output count with a 0.0001 PEPEW minimum and 0.0001 PEPEW/kB rate.
 
-This is an explicit compatibility exception. Do not use it as justification to keep other chain reads on wallet-api.
-
-M5 replaces the direct core-RPC fee dependency with an approved Light API or client-side fee policy.
+The Mini App no longer calls `wallet-api /wallet/fee/estimate`, and fee calculation does not require Wallet API direct RPC.
 
 ## Telegram database
 

@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 PRODUCTION ACCEPTED. M5 client-side deterministic size-based fee policy is implemented in `main`; production acceptance and retirement of the rollback `/wallet/fee/estimate` route remain before M5 is complete.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 fee policy is PRODUCTION ACCEPTED; final Wallet API fee-route cleanup is code-complete in `main` and awaits wallet-api production deployment. M6 has not started.**
 
 ## 1. Core design principles
 
@@ -178,7 +178,7 @@ Rules:
 - the fee field is informational/read-only, not a server-provided estimate;
 - do not add a PEPEW Light API fee endpoint for this policy.
 
-During the M5 rollback window, legacy `GET /wallet/fee/estimate` may remain server-side but must have no Mini App/Web Wallet consumer. After production send acceptance, retire that route and its direct `estimatesmartfee` call as the final M5 cleanup.
+The client fee policy passed production send acceptance on 2026-09-28. Current `main` removes the legacy `GET /wallet/fee/estimate` route and its direct `estimatesmartfee` call; deploy the wallet-api build before marking M5 runtime cleanup complete. Remaining `CORE_RPC_URL` uses are legacy compatibility/diagnostic paths reserved for M6 cleanup, not active fee calculation.
 
 ## 6. Light API client rules
 

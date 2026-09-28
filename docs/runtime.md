@@ -14,8 +14,8 @@ Required:
 - Node.js 18+ (recommend 20 LTS)
 - `pepepowd` RPC reachable for both services
   - `pepew-api` uses `RPC_URL` + `RPC_USER` + `RPC_PASS`
-  - `pepepow-wallet-api` uses `CORE_RPC_URL` and optionally `CORE_RPC_USER` + `CORE_RPC_PASS` (or `http://user:pass@host:port`)
-  - `CORE_RPC_TIMEOUT_MS` controls wallet RPC timeout (default `10000`)
+  - `pepepow-wallet-api` still uses `CORE_RPC_URL` only for legacy compatibility/diagnostic routes pending M6; active Wallet reads/send/fee do not require it
+  - `CORE_RPC_TIMEOUT_MS` controls those legacy wallet RPC calls (default `10000`)
   - Ensure `rpcbind`, `rpcallowip`, `rpcuser`, `rpcpassword` are set in `pepepowd.conf`
 - nginx for public routing
 
@@ -102,15 +102,6 @@ curl -sS http://127.0.0.1:9193/v1/chain/height
 Expected JSON:
 ```json
 { "height": 123 }
-```
-
-Optional wallet API verification (depends on `PEPEW_API_BASE`):
-```bash
-curl -sS http://127.0.0.1:9194/wallet/fee/estimate
-```
-Expected JSON:
-```json
-{ "feerate": 0.0001, "source": "fallback" }
 ```
 
 ## Common failures and fixes

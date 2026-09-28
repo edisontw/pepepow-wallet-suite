@@ -66,7 +66,6 @@
 | GET | `/wallet/balance?address=` | Balance proxy to `pepew-api` | No |
 | GET | `/wallet/utxos?address=` | UTXO proxy to `pepew-api` | No |
 | GET | `/wallet/history?address=` | History proxy to `pepew-api` | No |
-| GET | `/wallet/fee/estimate` | Fee estimate via core RPC | No |
 | POST | `/wallet/tx/broadcast` | Broadcast raw tx to core RPC | No |
 | POST | `/wallet/tx/send` | Alias of `/wallet/tx/broadcast` | No |
 | POST | `/api/tx/send` | Legacy alias of `/wallet/tx/broadcast` | No |

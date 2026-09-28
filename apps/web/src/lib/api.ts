@@ -10,7 +10,6 @@ export const API_ENDPOINTS = {
     balance: "/wallet/balance",
     utxos: "/wallet/utxos",
     history: "/wallet/history",
-    feeEstimate: "/wallet/fee/estimate",
     price: "/wallet/price",
     txRaw: "/wallet/tx/raw",
     txRawBatch: "/wallet/tx/raw/batch",

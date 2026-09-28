@@ -1247,48 +1247,6 @@ app.post("/v1/history", ...readLimiters, async (req, res) => {
   }
 });
 
-function validFeeRate(rate: any) {
-  return typeof rate === "number" && isFinite(rate) && rate > 0;
-}
-
-app.get("/wallet/fee/estimate", ...readLimiters, async (req, res) => {
-  const target = Number(process.env.FEE_ESTIMATE_TARGET || "6");
-  const fallback = Number(process.env.FEE_ESTIMATE_FALLBACK || "0.0001");
-  const { url, headers } = getCoreRpcRequestConfig();
-  try {
-    const { res: rpcRes, data } = await fetchJson(
-      url,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          jsonrpc: "1.0",
-          id: "fee",
-          method: "estimatesmartfee",
-          params: [Number.isFinite(target) ? target : 6],
-        }),
-      },
-      5000,
-      {
-        requestId: getRequestId(req),
-        label: "rpc.estimatesmartfee",
-        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
-      }
-    );
-    if (!rpcRes.ok || data?.error) {
-      return res.json({ feerate: fallback, source: "fallback", requestId: getRequestId(req) });
-    }
-    const rate = data?.result?.feerate ?? data?.result?.feeRate;
-    return res.json({
-      feerate: validFeeRate(rate) ? rate : fallback,
-      source: validFeeRate(rate) ? "estimatesmartfee" : "fallback",
-      requestId: getRequestId(req),
-    });
-  } catch {
-    return res.json({ feerate: fallback, source: "fallback", requestId: getRequestId(req) });
-  }
-});
-
 function extractRawTx(body: any) {
   if (typeof body?.rawTx === "string") return body.rawTx;
   if (typeof body?.hex === "string") return body.hex;

@@ -34,7 +34,7 @@ Required for production:
 - `PORT` (default: `9194`)
 - `PEPEW_LIGHT_API_BASE` (Telegram Bot chain-read base; default: `https://light.pepepow.net`)
 - `PEPEW_API_BASE` (legacy pepew-api base URL while compatibility endpoints remain)
-- `CORE_RPC_URL` (legacy rollback/diagnostic RPC while compatibility endpoints remain; the active M5 Web/Mini App fee policy does not use it)
+- `CORE_RPC_URL` (legacy compatibility/diagnostic RPC while pre-M6 endpoints and RPC health remain; active M5 wallet reads/send/fee do not use it)
 - `JWT_SECRET` (JWT signing secret)
 - `CORS_ORIGINS` (comma-separated)
 - `WALLET_BASE_URL` (for paylinks)
@@ -48,8 +48,6 @@ Recommended/optional:
 - `TELEGRAM_BOT_TOKEN` (Telegram initData auth)
 - `TELEGRAM_INITDATA_MAX_AGE_SEC` (default: `86400`)
 - `BOT_TOKEN`, `BOT_SECRET_TOKEN` (Telegram bot/webhook)
-- `FEE_ESTIMATE_TARGET` (legacy `/wallet/fee/estimate` rollback route only; default: `6`)
-- `FEE_ESTIMATE_FALLBACK` (legacy `/wallet/fee/estimate` rollback route only; default: `0.0001`)
 - `WALLET_API_DEBUG_RAWTX` (`1` to write raw tx to `/tmp/rawtx.hex`)
 - `WALLET_API_VERSION` (release/version string returned by `/healthz`)
 - `WALLET_API_GIT_SHA` (optional git commit SHA returned by `/healthz`)
@@ -84,9 +82,6 @@ CORS_ORIGINS=https://wallet.pepepow.net
 WALLET_BASE_URL=https://wallet.pepepow.net
 WALLET_API_VERSION=2024.03.29
 WALLET_API_GIT_SHA=abcdef1234567890
-
-FEE_ESTIMATE_TARGET=6
-FEE_ESTIMATE_FALLBACK=0.0001
 
 WALLET_API_RATE_LIMIT_READ_WINDOW_MS=60000
 WALLET_API_RATE_LIMIT_READ_MAX=120

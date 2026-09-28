@@ -209,7 +209,7 @@ Do not mark the live transaction acceptance PASS without a user-authorized walle
 
 ## M5 — Fee decoupling
 
-Status: **CLIENT POLICY IMPLEMENTED IN MAIN — production acceptance and legacy fee-route retirement pending**
+Status: **FEE POLICY PRODUCTION ACCEPTED — final wallet-api cleanup code complete; production deployment pending**
 
 Selected design: **Option B — client-side deterministic size-based minimum fee policy**.
 
@@ -231,16 +231,17 @@ Implementation:
 - Consolidation computes fee independently for its selected input count and 1-output model.
 - The fee UI is read-only and identifies the source as `client-size-policy`.
 - Mini App/Web Wallet no longer calls `/wallet/fee/estimate`.
-- The legacy wallet-api fee route remains only for rollback until the new Web build passes production send acceptance.
+- The client fee policy passed production send acceptance. Current `main` removes the legacy wallet-api fee route and direct `estimatesmartfee` dependency; wallet-api production deployment is still required.
 
 Acceptance:
 
 - [PASS CODE] deterministic fee helper and low/high input-count tests;
 - [PASS CODE] normal send and consolidation both use the size-based policy;
 - [PASS CODE] Mini App/Web Wallet has no `/wallet/fee/estimate` consumer;
-- [PENDING PRODUCTION] deploy the Web build and complete a small client-signed send;
-- [PENDING FINAL M5 CLEANUP] remove wallet-api `/wallet/fee/estimate` and direct `estimatesmartfee` usage;
-- [PENDING FINAL M5 CLEANUP] confirm Wallet functions no longer require `CORE_RPC_URL`.
+- [PASS PRODUCTION] deployed Web build and completed a client-signed send with the new fee policy;
+- [PASS CODE] wallet-api `/wallet/fee/estimate` and direct `estimatesmartfee` usage removed in `main`;
+- [PENDING PRODUCTION CLEANUP DEPLOY] deploy/restart wallet-api and verify the removed fee route is no longer served;
+- [PASS ACTIVE WALLET PATH] fee calculation no longer requires `CORE_RPC_URL`. Remaining direct-RPC compatibility/diagnostic code is deferred to M6.
 
 ## M6 — Legacy cleanup
 
