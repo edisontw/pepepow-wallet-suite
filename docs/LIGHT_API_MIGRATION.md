@@ -209,7 +209,7 @@ Do not mark the live transaction acceptance PASS without a user-authorized walle
 
 ## M5 — Fee decoupling
 
-Status: **FEE POLICY PRODUCTION ACCEPTED — final wallet-api cleanup code complete; production deployment pending**
+Status: **COMPLETE — production accepted 2026-09-28**
 
 Selected design: **Option B — client-side deterministic size-based minimum fee policy**.
 
@@ -231,7 +231,7 @@ Implementation:
 - Consolidation computes fee independently for its selected input count and 1-output model.
 - The fee UI is read-only and identifies the source as `client-size-policy`.
 - Mini App/Web Wallet no longer calls `/wallet/fee/estimate`.
-- The client fee policy passed production send acceptance. Current `main` removes the legacy wallet-api fee route and direct `estimatesmartfee` dependency; wallet-api production deployment is still required.
+- The client fee policy and wallet-api cleanup passed production acceptance. The legacy wallet-api fee route and direct `estimatesmartfee` dependency are no longer served in production.
 
 Acceptance:
 
@@ -240,7 +240,7 @@ Acceptance:
 - [PASS CODE] Mini App/Web Wallet has no `/wallet/fee/estimate` consumer;
 - [PASS PRODUCTION] deployed Web build and completed a client-signed send with the new fee policy;
 - [PASS CODE] wallet-api `/wallet/fee/estimate` and direct `estimatesmartfee` usage removed in `main`;
-- [PENDING PRODUCTION CLEANUP DEPLOY] deploy/restart wallet-api and verify the removed fee route is no longer served;
+- [PASS PRODUCTION] wallet-api restarted successfully; `/wallet/fee/estimate` returns 404 and production source/dist contain no `estimatesmartfee` or `FEE_ESTIMATE_*`;
 - [PASS ACTIVE WALLET PATH] fee calculation no longer requires `CORE_RPC_URL`. Remaining direct-RPC compatibility/diagnostic code is deferred to M6.
 
 ## M6 — Legacy cleanup
