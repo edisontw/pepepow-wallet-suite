@@ -245,9 +245,25 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: planned
+Status: **IN PROGRESS — M6a code cleanup implemented in `main`; production deployment pending access-log verification.**
 
-After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api:
+After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
+
+### M6a — dead read-proxy retirement
+
+Code scope:
+
+- remove `GET /wallet/balance`;
+- remove `GET /wallet/utxos`;
+- remove `GET /wallet/history`;
+- remove `POST /v1/history` from wallet-api;
+- remove the wallet-api `pepew-api` read-proxy queue/concurrency helpers and their dedicated `PEPEW_API_UPSTREAM_*` variables;
+- remove stale Web API constants for those retired routes;
+- keep raw-tx compatibility, direct broadcast compatibility, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 slices.
+
+Deployment gate: verify production access logs show no legitimate consumers of the retired routes before deploying M6a. Repo-level Web/Mini App/Bot consumer search is already clean.
+
+Remaining M6 cleanup includes:
 
 - `/wallet/balance`;
 - `/wallet/utxos`;
