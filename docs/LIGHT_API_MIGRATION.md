@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a PRODUCTION ACCEPTED on 2026-09-28 at `bfcb581`; remaining M6 slices are not yet complete.**
+Status: **IN PROGRESS — M6a PRODUCTION ACCEPTED on 2026-09-28 at `bfcb581`; M6b raw-tx cleanup is implemented in source and pending production access-log verification/acceptance.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
