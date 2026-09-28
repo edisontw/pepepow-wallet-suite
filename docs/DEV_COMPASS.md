@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 CODE COMPLETE — Mini App signed broadcast uses PEPEW Light API with no automatic POST retry and persistent recent-spent protection. Live signed-tx acceptance is still required before M5. Fee estimation remains legacy.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 client-side deterministic size-based fee policy is implemented in `main`; production acceptance and retirement of the rollback `/wallet/fee/estimate` route remain before M5 is complete.**
 
 ## 1. Core design principles
 
@@ -156,26 +156,29 @@ Until the relevant milestone is complete:
 - preserve rollback capability;
 - compare the same address/tx against the current and Light API paths before cutover.
 
-## 5. Fee-estimation exception
+## 5. Fee policy / M5 transition
 
-Fee estimation is the only planned temporary chain/RPC dependency after read migration begins.
+M5 selected **client-side deterministic size-based minimum fee policy**. The active Mini App / Web Wallet fee does not require a fee API or direct node RPC.
 
-Current legacy path may remain temporarily:
+Policy:
 
 ```text
-GET /wallet/fee/estimate
-  -> wallet-api
-  -> pepepowd estimatesmartfee / fallback
+fee rate   = 0.0001 PEPEW / 1000 bytes = 10,000 atomic / kB
+minimum    = 0.0001 PEPEW              = 10,000 atomic
+tx bytes   = 10 + inputs * 148 + outputs * 34
+fee atomic = max(10,000, ceil(tx_bytes * 10,000 / 1000))
 ```
 
-Do not silently replace this with a fixed fee during migration.
+Rules:
 
-M5 must explicitly choose and document either:
+- calculate fee locally with integer atomic units only;
+- normal send uses a conservative 2-output size model while selecting inputs;
+- consolidation uses its actual 1-output size model;
+- recompute fee from the fresh UTXO selection immediately before build/sign;
+- the fee field is informational/read-only, not a server-provided estimate;
+- do not add a PEPEW Light API fee endpoint for this policy.
 
-1. a PEPEW Light fee-policy endpoint; or
-2. a reviewed client-side transaction-size x fee-rate policy.
-
-Only after M5 passes may `CORE_RPC_URL` stop being a Wallet API requirement.
+During the M5 rollback window, legacy `GET /wallet/fee/estimate` may remain server-side but must have no Mini App/Web Wallet consumer. After production send acceptance, retire that route and its direct `estimatesmartfee` call as the final M5 cleanup.
 
 ## 6. Light API client rules
 

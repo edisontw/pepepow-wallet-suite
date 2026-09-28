@@ -34,7 +34,7 @@ Required for production:
 - `PORT` (default: `9194`)
 - `PEPEW_LIGHT_API_BASE` (Telegram Bot chain-read base; default: `https://light.pepepow.net`)
 - `PEPEW_API_BASE` (legacy pepew-api base URL while compatibility endpoints remain)
-- `CORE_RPC_URL` (temporary RPC URL for fee estimate/broadcast until M4/M5; may include user/pass)
+- `CORE_RPC_URL` (legacy rollback/diagnostic RPC while compatibility endpoints remain; the active M5 Web/Mini App fee policy does not use it)
 - `JWT_SECRET` (JWT signing secret)
 - `CORS_ORIGINS` (comma-separated)
 - `WALLET_BASE_URL` (for paylinks)
@@ -48,8 +48,8 @@ Recommended/optional:
 - `TELEGRAM_BOT_TOKEN` (Telegram initData auth)
 - `TELEGRAM_INITDATA_MAX_AGE_SEC` (default: `86400`)
 - `BOT_TOKEN`, `BOT_SECRET_TOKEN` (Telegram bot/webhook)
-- `FEE_ESTIMATE_TARGET` (default: `6`)
-- `FEE_ESTIMATE_FALLBACK` (default: `0.0001`)
+- `FEE_ESTIMATE_TARGET` (legacy `/wallet/fee/estimate` rollback route only; default: `6`)
+- `FEE_ESTIMATE_FALLBACK` (legacy `/wallet/fee/estimate` rollback route only; default: `0.0001`)
 - `WALLET_API_DEBUG_RAWTX` (`1` to write raw tx to `/tmp/rawtx.hex`)
 - `WALLET_API_VERSION` (release/version string returned by `/healthz`)
 - `WALLET_API_GIT_SHA` (optional git commit SHA returned by `/healthz`)
@@ -68,7 +68,7 @@ Rate limiting (per IP + per JWT subject):
 - `VITE_API_BASE` (legacy wallet-api/product API base; default: `https://api.pepepow.net`)
 - `VITE_PEPEW_LIGHT_API_BASE_URL` (PEPEW Light chain API base; default: `https://light.pepepow.net`)
 
-M2 moved Mini App/Web Wallet chain reads to Light API. M3 moves Telegram Bot `/balance` and `/history` to the server-side `PEPEW_LIGHT_API_BASE`.
+M2 moved Mini App/Web Wallet chain reads to Light API. M3 moved Telegram Bot `/balance` and `/history` to the server-side `PEPEW_LIGHT_API_BASE`. M4 moved signed broadcast to Light API. M5 uses a client-side size-based fee policy and no longer consumes wallet-api fee estimation.
 
 These values are baked at build time (Vite). Changing them requires a rebuild.
 

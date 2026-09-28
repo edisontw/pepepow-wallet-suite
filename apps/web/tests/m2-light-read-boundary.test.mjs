@@ -18,7 +18,8 @@ assert.doesNotMatch(history, /API_ENDPOINTS\.wallet\.history|\/wallet\/history/)
 assert.match(tx, /pepewLightClient\.getTx/);
 assert.doesNotMatch(tx, /API_ENDPOINTS\.wallet\.txRaw|API_ENDPOINTS\.wallet\.txRawBatch|\/wallet\/tx\/raw/);
 
-assert.match(send, /API_ENDPOINTS\.wallet\.feeEstimate/);
+assert.doesNotMatch(send, /API_ENDPOINTS\.wallet\.feeEstimate|\/wallet\/fee\/estimate/);
+assert.match(send, /selectP2PKHFeeForSortedInputs/);
 assert.match(send, /walletStore\.fetch\(\{ fresh: true, includeBalance: false \}\)/);
 
 console.log("m2-light-read-boundary.test: ok");

@@ -14,6 +14,11 @@ import {
   validateAtomicRange,
 } from "../lib/atomic";
 import { formatAtomicToPepew, MAX_ATOMIC, parsePepewToAtomic, PEPEW_DECIMALS } from "../lib/amount";
+import {
+  calculateP2PKHFeeAtomic,
+  PEPEW_MIN_FEE_ATOMIC,
+  selectP2PKHFeeForSortedInputs,
+} from "../lib/feePolicy";
 import { triggerRefresh } from "../lib/refresh";
 import { hasPendingSpendTxid, recordPendingSpend } from "../lib/pending";
 import { walletStore, WalletState, type Utxo } from "../lib/walletStore";
@@ -112,7 +117,6 @@ type PersistedConsolidationProgress = {
 const DEFAULT_PATH = "m/44'/5'/0'/0/0";
 const MIN_SEND_SATS = 100000000;
 const DUST_THRESHOLD_SATS = 546;
-const FEE_FALLBACK = "0.0001";
 const RECENT_RECIPIENTS_KEY = "pepew_recentRecipients";
 const MAX_RECENT_RECIPIENTS = 6;
 const SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
@@ -303,7 +307,6 @@ export default function Send() {
   const [address, setAddress] = useState(localStorage.getItem("pepew_address") || "");
   const [to, setTo] = useState(searchParams.get("to") || "");
   const [amount, setAmount] = useState(searchParams.get("amount") || "");
-  const [fee, setFee] = useState("");
   const [subtractFee, setSubtractFee] = useState(false);
   const [mnemo] = useState(localStorage.getItem("pepew_mnemonic") || "");
   const [sending, setSending] = useState(false);
@@ -326,11 +329,6 @@ export default function Send() {
   } | null>(null);
   const [requestUrl, setRequestUrl] = useState<string | null>(null);
   const [requestLoading, setRequestLoading] = useState(false);
-  const [feeEstimate, setFeeEstimate] = useState<string | null>(null);
-  const [feeEstimateSource, setFeeEstimateSource] = useState<string | null>(null);
-  const [feeEstimateError, setFeeEstimateError] = useState<string | null>(null);
-  const [feeNotice, setFeeNotice] = useState<string | null>(null);
-  const [feeTouched, setFeeTouched] = useState(false);
   const [recentRecipients, setRecentRecipients] = useState<string[]>(loadRecentRecipients());
   const [sendAttempted, setSendAttempted] = useState(false);
   const [isSending, setIsSending] = useState(false);
@@ -362,7 +360,6 @@ export default function Send() {
   const lastSuccessSnapshotRef = useRef<{
     to: string;
     amount: string;
-    fee: string;
     subtractFee: boolean;
     address: string;
   } | null>(null);
@@ -466,7 +463,6 @@ export default function Send() {
     if (!snapshot) return;
     if (snapshot.to !== to
       || snapshot.amount !== amount
-      || snapshot.fee !== fee
       || snapshot.subtractFee !== subtractFee
       || snapshot.address !== address) {
       setSendLocked(false);
@@ -476,7 +472,7 @@ export default function Send() {
       setErr(null);
       setRawInternalError(null);
     }
-  }, [sendLocked, to, amount, fee, subtractFee, address]);
+  }, [sendLocked, to, amount, subtractFee, address]);
 
   useEffect(() => {
     if (!savedProgress) {
@@ -539,53 +535,6 @@ export default function Send() {
   }, [consolidationBusy, refreshBalanceOnce, releaseConsolidationWakeLock, requestConsolidationWakeLock, t]);
 
 
-  useEffect(() => {
-    let active = true;
-    const run = async () => {
-      setFeeEstimateError(null);
-      setFeeNotice(null);
-      try {
-        const r = await apiFetch(API_ENDPOINTS.wallet.feeEstimate);
-        const j = await r.json().catch(() => ({}));
-        if (!active) return;
-        if (!r.ok) {
-          setFeeEstimate(FEE_FALLBACK);
-          setFeeEstimateSource("fallback");
-          if (!feeTouched) setFee(FEE_FALLBACK);
-          setFeeEstimateError(j?.error || t("send.errors.feeEstimateFailed"));
-          setFeeNotice(t("send.feeFallbackNotice", { fee: FEE_FALLBACK }));
-          return;
-        }
-        const rawEstimate = j?.feerate ?? j?.feeRate;
-        const estimateNumber = typeof rawEstimate === "number" ? rawEstimate : Number(rawEstimate);
-        if (!Number.isFinite(estimateNumber) || estimateNumber <= 0) {
-          setFeeEstimate(FEE_FALLBACK);
-          setFeeEstimateSource("fallback");
-          if (!feeTouched) setFee(FEE_FALLBACK);
-          setFeeEstimateError(t("send.errors.feeEstimateFailed"));
-          setFeeNotice(t("send.feeFallbackNotice", { fee: FEE_FALLBACK }));
-          return;
-        }
-        const estimate = String(estimateNumber);
-        setFeeEstimate(estimate);
-        setFeeEstimateSource(j?.source || null);
-        if (!feeTouched) setFee(estimate);
-      } catch {
-        if (active) {
-          setFeeEstimate(FEE_FALLBACK);
-          setFeeEstimateSource("fallback");
-          if (!feeTouched) setFee(FEE_FALLBACK);
-          setFeeEstimateError(t("errors.apiUnreachable"));
-          setFeeNotice(t("send.feeFallbackNotice", { fee: FEE_FALLBACK }));
-        }
-      }
-    };
-
-    void run();
-    return () => {
-      active = false;
-    };
-  }, [feeTouched, t]);
 
   const addRecentRecipient = (addr: string) => {
     const trimmed = addr.trim();
@@ -771,18 +720,27 @@ export default function Send() {
   const availableSats = walletStore.getDisplayBalance() ?? 0;
   const availableAtomic = walletSatsToAtomic(availableSats, "availableSats");
   const amountAtomicInput = parseCoinToAtomic(amount);
-  const feeAtomicInput = parseCoinToAtomic(fee);
+  const previewInputValuesAtomic = walletState.utxos
+    .filter((u) => !u.invalid && Number.isFinite(u.valueSats) && Number.isInteger(u.valueSats) && u.valueSats >= 0)
+    .map((u, idx) => walletSatsToAtomic(u.valueSats, `preview.utxos[${idx}].valueSats`))
+    .sort((a, b) => (a > b ? -1 : a < b ? 1 : 0))
+    .slice(0, MAX_SEND_INPUTS);
+  const previewFeeSelection = amountAtomicInput !== null && amountAtomicInput > 0n
+    ? selectP2PKHFeeForSortedInputs(previewInputValuesAtomic, amountAtomicInput, subtractFee, 2)
+    : null;
+  const feeAtomicInput = previewFeeSelection?.feeAtomic ?? PEPEW_MIN_FEE_ATOMIC;
+  const fee = formatSatsInput(feeAtomicInput);
   const amountSatsForRequest = amountAtomicInput !== null && amountAtomicInput <= BigInt(Number.MAX_SAFE_INTEGER)
     ? Number(amountAtomicInput)
     : null;
   const amountValid = amountAtomicInput !== null;
-  const feeValid = feeAtomicInput !== null && feeAtomicInput >= 0n;
-  const recipientSats = amountValid && feeValid
+  const feeValid = true;
+  const recipientSats = amountValid
     ? subtractFee
       ? amountAtomicInput - feeAtomicInput
       : amountAtomicInput
     : null;
-  const totalSats = amountValid && feeValid
+  const totalSats = amountValid
     ? subtractFee
       ? amountAtomicInput
       : amountAtomicInput + feeAtomicInput
@@ -834,7 +792,7 @@ export default function Send() {
   const feeLabel = feeValid ? fmtPEPEWFromSats(feeAtomicInput) : fmtPEPEWFromSats(null);
   const totalLabel = totalSats !== null ? fmtPEPEWFromSats(totalSats) : fmtPEPEWFromSats(null);
   const receiveLabel = recipientSats !== null ? fmtPEPEWFromSats(recipientSats) : fmtPEPEWFromSats(null);
-  const feeEstimateLabel = feeEstimate ? `${feeEstimate} PEPEW` : "--";
+  const feeEstimateLabel = `${fee} PEPEW`;
   const utxoLimitErrorMessage = t("send.errors.notEnoughSpendableUtxosOneTx");
   const formatAtomicWithUnit = (atomic: bigint) => `${formatAtomicToPepew(atomic, PEPEW_DECIMALS, {
     group: true,
@@ -851,8 +809,13 @@ export default function Send() {
   }, [err, utxoLimitErrorDetail, utxoLimitErrorMessage]);
 
   const handleMax = () => {
-    const feeForMax = feeValid ? feeAtomicInput : 0n;
-    const maxSats = availableAtomic > feeForMax ? availableAtomic - feeForMax : 0n;
+    const spendableForMax = previewInputValuesAtomic.reduce((sum, value) => sum + value, 0n);
+    const feeForMax = calculateP2PKHFeeAtomic(Math.max(previewInputValuesAtomic.length, 1), 2);
+    const maxSats = subtractFee
+      ? spendableForMax
+      : spendableForMax > feeForMax
+        ? spendableForMax - feeForMax
+        : 0n;
     setAmount(formatSatsInput(maxSats));
   };
 
@@ -887,8 +850,6 @@ export default function Send() {
     setTo("");
     setAmount("");
     setSubtractFee(false);
-    setFeeTouched(false);
-    setFee(feeEstimate || "");
     setTgUserQuery("");
     setResolveStatus("idle");
     setResolveMessage(null);
@@ -1276,11 +1237,6 @@ export default function Send() {
       return null;
     }
 
-    if (feeAtomicInput === null || feeAtomicInput < 0n) {
-      setErr(t("send.errors.feeInvalid"));
-      return null;
-    }
-
     const totalCandidates = utxosForCheck.length;
     const selected = selectConsolidationUtxos(utxosForCheck, MAX_CONSOLIDATE_INPUTS);
     if (!selected.length) {
@@ -1301,7 +1257,8 @@ export default function Send() {
       (sum, u, idx) => sum + walletSatsToAtomic(u.valueSats, `preview.selected[${idx}].valueSats`),
       0n
     );
-    const outputAtomic = totalInAtomic - feeAtomicInput;
+    const feeAtomic = calculateP2PKHFeeAtomic(selected.length, 1);
+    const outputAtomic = totalInAtomic - feeAtomic;
     if (outputAtomic <= 0n) {
       setErr(t("send.errors.amountUnderFee"));
       return null;
@@ -1311,7 +1268,7 @@ export default function Send() {
       return null;
     }
     validateAtomicRange(totalInAtomic, "preview.totalInAtomic", MAX_ATOMIC);
-    validateAtomicRange(feeAtomicInput, "preview.feeAtomic", MAX_ATOMIC);
+    validateAtomicRange(feeAtomic, "preview.feeAtomic", MAX_ATOMIC);
     validateAtomicRange(outputAtomic, "preview.outputAtomic", MAX_ATOMIC);
 
     const estimatedBytes = estimateP2PKHTxBytes(selected.length, 1);
@@ -1325,7 +1282,7 @@ export default function Send() {
       totalCandidates,
       totalInAtomic,
       outputAtomic,
-      feeAtomic: feeAtomicInput,
+      feeAtomic,
       estimatedBytes,
       round: nextRound,
       totalRounds,
@@ -2128,40 +2085,8 @@ export default function Send() {
       if (amountAtomic === null) {
         abortSend(t("send.errors.amountInvalid"));
       }
-      const feeAtomic = parseCoinToAtomic(fee);
-      if (feeAtomic === null) {
-        abortSend(t("send.errors.feeInvalid"));
-      }
       const amountSatsBigInt = amountAtomic;
-      const feeSatsBigInt = feeAtomic;
       amountAtomicForDiag = amountSatsBigInt;
-      feeAtomicForDiag = feeSatsBigInt;
-      if (feeSatsBigInt < 0n) {
-        abortSend(t("send.errors.feeInvalid"));
-      }
-
-      const recipientSatsBigInt = subtractFee ? amountSatsBigInt - feeSatsBigInt : amountSatsBigInt;
-      if (recipientSatsBigInt <= 0n) {
-        abortSend(t("send.errors.amountUnderFee"));
-      }
-      if (recipientSatsBigInt < BigInt(DUST_THRESHOLD_SATS)) {
-        abortSend(t("send.errors.amountDust"));
-      }
-      if (recipientSatsBigInt < BigInt(MIN_SEND_SATS)) {
-        abortSend(t("send.errors.amountTooLow", { min: 1 }));
-      }
-      const totalSatsBigInt = subtractFee ? amountSatsBigInt : amountSatsBigInt + feeSatsBigInt;
-      totalAtomicForDiag = totalSatsBigInt;
-      if (debugEnabled) {
-        console.info("[send] atomic values", {
-          amountInput: amount,
-          amountAtomic: amountSatsBigInt.toString(),
-          feeAtomic: feeSatsBigInt.toString(),
-          totalAtomic: totalSatsBigInt.toString(),
-          maxAtomic: MAX_ATOMIC.toString(),
-        });
-      }
-      validateAtomicRange(totalSatsBigInt, "send.totalAtomic", MAX_ATOMIC);
       const usableUtxos = walletStore.getState().utxos;
       const sendTo = normalizeAddressInput(to);
       const sendFrom = normalizeAddressInput(address);
@@ -2200,27 +2125,58 @@ export default function Send() {
       const totalBalanceAtomic = sortedChosen.reduce((sum, u) => sum + u.valueAtomic, 0n);
       const spendableCandidates = sortedChosen.slice(0, MAX_SEND_INPUTS);
       const spendableNowAtomic = spendableCandidates.reduce((sum, u) => sum + u.valueAtomic, 0n);
-      const insufficientWithinLimit = spendableNowAtomic < totalSatsBigInt;
-      const walletEnough = totalBalanceAtomic >= totalSatsBigInt;
+      const limitedSelection = selectP2PKHFeeForSortedInputs(
+        spendableCandidates.map((u) => u.valueAtomic),
+        amountSatsBigInt,
+        subtractFee,
+        2,
+      );
 
-      if (insufficientWithinLimit && walletEnough) {
-        abortSend(t("send.errors.notEnoughSpendableUtxosOneTx"), {
-          totalBalanceAtomic,
-          spendableNowAtomic,
-          maxInputs: MAX_SEND_INPUTS,
-        });
-      }
-      if (insufficientWithinLimit && !walletEnough) {
+      if (!limitedSelection.covered) {
+        const fullSelection = selectP2PKHFeeForSortedInputs(
+          sortedChosen.map((u) => u.valueAtomic),
+          amountSatsBigInt,
+          subtractFee,
+          2,
+        );
+        if (fullSelection.covered && sortedChosen.length > MAX_SEND_INPUTS) {
+          abortSend(t("send.errors.notEnoughSpendableUtxosOneTx"), {
+            totalBalanceAtomic,
+            spendableNowAtomic,
+            maxInputs: MAX_SEND_INPUTS,
+          });
+        }
         abortSend(t("send.errors.insufficientUtxo"));
       }
 
-      const picked: typeof spendableCandidates = [];
-      let totalInAtomic = 0n;
-      for (const candidate of spendableCandidates) {
-        picked.push(candidate);
-        totalInAtomic += candidate.valueAtomic;
-        if (totalInAtomic >= totalSatsBigInt) break;
+      const feeSatsBigInt = limitedSelection.feeAtomic;
+      const totalSatsBigInt = limitedSelection.targetAtomic;
+      const recipientSatsBigInt = subtractFee ? amountSatsBigInt - feeSatsBigInt : amountSatsBigInt;
+      feeAtomicForDiag = feeSatsBigInt;
+      totalAtomicForDiag = totalSatsBigInt;
+
+      if (recipientSatsBigInt <= 0n) {
+        abortSend(t("send.errors.amountUnderFee"));
       }
+      if (recipientSatsBigInt < BigInt(DUST_THRESHOLD_SATS)) {
+        abortSend(t("send.errors.amountDust"));
+      }
+      if (recipientSatsBigInt < BigInt(MIN_SEND_SATS)) {
+        abortSend(t("send.errors.amountTooLow", { min: 1 }));
+      }
+      if (debugEnabled) {
+        console.info("[send] atomic values", {
+          amountInput: amount,
+          amountAtomic: amountSatsBigInt.toString(),
+          feeAtomic: feeSatsBigInt.toString(),
+          totalAtomic: totalSatsBigInt.toString(),
+          maxAtomic: MAX_ATOMIC.toString(),
+        });
+      }
+      validateAtomicRange(totalSatsBigInt, "send.totalAtomic", MAX_ATOMIC);
+
+      const picked = spendableCandidates.slice(0, limitedSelection.inputCount);
+      const totalInAtomic = limitedSelection.totalInAtomic;
       if (!picked.length || totalInAtomic < totalSatsBigInt) {
         abortSend(t("send.errors.insufficientUtxo"));
       }
@@ -2230,6 +2186,7 @@ export default function Send() {
         count: picked.length,
         sum: totalInAtomic.toString(),
         target: totalSatsBigInt.toString(),
+        policyFeeAtomic: feeSatsBigInt.toString(),
       });
       validateAtomicRange(totalInAtomic, "send.totalInAtomic", MAX_ATOMIC);
       const wif = await wifFromMnemonic(trimmedMnemonic, DEFAULT_PATH, PEPEPOW);
@@ -2385,7 +2342,6 @@ export default function Send() {
         lastSuccessSnapshotRef.current = {
           to,
           amount,
-          fee,
           subtractFee,
           address
         };
@@ -2404,7 +2360,6 @@ export default function Send() {
       lastSuccessSnapshotRef.current = {
         to,
         amount,
-        fee,
         subtractFee,
         address
       };
@@ -2592,8 +2547,8 @@ export default function Send() {
               <input
                 className="input"
                 value={fee}
-                onChange={(e) => { setFee(e.target.value); setFeeTouched(true); }}
-                placeholder={FEE_FALLBACK}
+                readOnly
+                aria-readonly="true"
                 inputMode="decimal"
               />
               <label className="checkbox-row" style={{ marginTop: 8 }}>
@@ -2645,9 +2600,7 @@ export default function Send() {
           )}
           <div className="note" style={{ marginTop: 10 }}>
             <div>{t("send.feeEstimate")} {feeEstimateLabel}</div>
-            {feeEstimateSource && <div>{t("send.sourceLabel")}: {feeEstimateSource}</div>}
-            {feeEstimateError && <div className="error">{feeEstimateError}</div>}
-            {feeNotice && <div className="muted">{feeNotice}</div>}
+            <div>{t("send.sourceLabel")}: client-size-policy</div>
             {walletState.error && <div className="error">{walletState.error}</div>}
           </div>
         </div>

@@ -26,10 +26,7 @@ export function estimateConsolidationRounds(totalUtxos: number, roundSize = MAX_
   return Math.ceil(totalUtxos / safeRound);
 }
 
-export function estimateP2PKHTxBytes(inputCount: number, outputCount = 1) {
-  // Legacy P2PKH size model: 10 bytes base + 148 bytes per input + 34 bytes per output.
-  return 10 + inputCount * 148 + outputCount * 34;
-}
+export { estimateP2PKHTxBytes } from "../lib/feePolicy";
 
 export function buildConsolidationTx(params: {
   inputs: ConsolidationInput[];

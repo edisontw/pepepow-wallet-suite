@@ -18,7 +18,8 @@ assert.match(client, /false,\s*\n\s*\);/);
 assert.match(send, /walletStore\.markSpentOutpoints\(spentOutpoints\)/);
 assert.match(send, /walletStore\.markSpentOutpoints\(\[\.\.\.spentOutpoints\]\)/);
 assert.match(send, /pepewLightClient\.getUtxo\(sendFrom, \{ fresh: true \}\)/);
-assert.match(send, /API_ENDPOINTS\.wallet\.feeEstimate/);
+assert.doesNotMatch(send, /API_ENDPOINTS\.wallet\.feeEstimate|\/wallet\/fee\/estimate/);
+assert.match(send, /selectP2PKHFeeForSortedInputs/);
 
 assert.match(store, /pepew_recent_spent_outpoints/);
 assert.match(store, /SPENT_OUTPOINT_TTL_MS = 10 \* 60 \* 1000/);

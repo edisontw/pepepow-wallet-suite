@@ -169,7 +169,7 @@ Acceptance:
 
 ## M4 — Signed broadcast migration
 
-Status: **CODE COMPLETE — live signed-tx acceptance pending**
+Status: **PRODUCTION ACCEPTED**
 
 Move Mini App broadcast to:
 
@@ -199,7 +199,7 @@ Implementation:
 
 Acceptance:
 
-- [PENDING MANUAL] real small-amount client-signed transaction broadcasts successfully;
+- [PASS PRODUCTION] real small-amount client-signed transaction broadcasts successfully;
 - [PASS CODE] request body contains only `raw_tx`;
 - [PASS CODE] no automatic broadcast retry;
 - [PASS CODE] stale/recent-spent UTXO protection is active;
@@ -209,28 +209,38 @@ Do not mark the live transaction acceptance PASS without a user-authorized walle
 
 ## M5 — Fee decoupling
 
-Status: **BLOCKED ON M4 LIVE ACCEPTANCE**
+Status: **CLIENT POLICY IMPLEMENTED IN MAIN — production acceptance and legacy fee-route retirement pending**
 
-Remove fee estimation as the final Wallet API direct-RPC exception.
+Selected design: **Option B — client-side deterministic size-based minimum fee policy**.
 
-Choose one reviewed design:
+No PEPEW Light API fee endpoint is required.
 
-### Option A — Light API fee policy
+Policy:
 
-Expose a bounded fee-rate/policy response through PEPEW Light API.
+```text
+fee rate   = 10,000 atomic / 1000 bytes (0.0001 PEPEW/kB)
+minimum    = 10,000 atomic              (0.0001 PEPEW)
+tx bytes   = 10 + inputs * 148 + outputs * 34
+fee atomic = max(minimum, ceil(tx_bytes * fee_rate / 1000))
+```
 
-### Option B — Client-side fee policy
+Implementation:
 
-Use reviewed transaction-size estimation and a documented fee-rate policy.
-
-Do not simply copy the Light Wallet's temporary fixed `0.0001 PEPEW` default as the production architecture.
+- Send fee is computed locally from fresh selected UTXO count using integer arithmetic.
+- Normal send selects UTXOs against the dynamically increasing fee with a conservative 2-output model.
+- Consolidation computes fee independently for its selected input count and 1-output model.
+- The fee UI is read-only and identifies the source as `client-size-policy`.
+- Mini App/Web Wallet no longer calls `/wallet/fee/estimate`.
+- The legacy wallet-api fee route remains only for rollback until the new Web build passes production send acceptance.
 
 Acceptance:
 
-- send preview shows deterministic fee;
-- low/high input-count cases are tested;
-- no direct `estimatesmartfee` dependency remains in wallet-api;
-- `CORE_RPC_URL` is no longer required for Wallet functions.
+- [PASS CODE] deterministic fee helper and low/high input-count tests;
+- [PASS CODE] normal send and consolidation both use the size-based policy;
+- [PASS CODE] Mini App/Web Wallet has no `/wallet/fee/estimate` consumer;
+- [PENDING PRODUCTION] deploy the Web build and complete a small client-signed send;
+- [PENDING FINAL M5 CLEANUP] remove wallet-api `/wallet/fee/estimate` and direct `estimatesmartfee` usage;
+- [PENDING FINAL M5 CLEANUP] confirm Wallet functions no longer require `CORE_RPC_URL`.
 
 ## M6 — Legacy cleanup
 
