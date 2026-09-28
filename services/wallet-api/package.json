@@ -7,7 +7,8 @@
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
     "build": "tsc",
-    "test:m3-bot-light-reads": "node ./tests/m3-bot-light-read-boundary.mjs"
+    "test:m3-bot-light-reads": "node ./tests/m3-bot-light-read-boundary.mjs",
+    "test:m6a-legacy-read-cleanup": "node ./tests/m6a-legacy-read-cleanup.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.6.0",
