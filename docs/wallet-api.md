@@ -3,8 +3,10 @@
 > **Migration status:** this document describes the current legacy-compatible runtime. The approved target is for `wallet-api` to become the Telegram/product control plane only, while PEPEW Light API handles Wallet chain reads and signed broadcast. Do not add new consumers of the legacy chain proxy/RPC endpoints. See `docs/LIGHT_API_MIGRATION.md`.
 >
 > **M4:** Mini App signed broadcast has moved to PEPEW Light API. `/wallet/tx/broadcast` and aliases remain only as rollback compatibility until M6; new client code must not call them.
+>
+> **M6a:** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired in `main`. Raw-tx and direct-broadcast compatibility remain for later M6 slices.
 
-`wallet-api` is the **wallet control plane**. In the current transitional runtime it still authenticates Telegram users, issues short-lived JWTs, proxies some read calls to `pepew-api`, and broadcasts raw transactions to the core node. These chain-access responsibilities are legacy migration paths, not the target architecture. It is **not** a wallet and **not** a custodian.
+`wallet-api` is the **wallet control plane**. In the current transitional runtime it still authenticates Telegram users and issues short-lived JWTs; only the remaining raw-tx compatibility and direct broadcast/diagnostic paths retain legacy chain access. These chain-access responsibilities are scheduled for later M6 removal. It is **not** a wallet and **not** a custodian.
 
 ## Positioning and Non-Goals
 
@@ -12,7 +14,6 @@
 - Telegram identity verification (WebApp `initData`).
 - JWT issuance and rotation.
 - Minimal, wallet-specific state (Telegram user <-> default address, payment requests).
-- Transitional read proxies to `pepew-api` (scheduled for removal after Light API cutover).
 - Transitional raw transaction broadcast to core RPC (scheduled for removal after Light API broadcast cutover).
 
 **What it is NOT:**
@@ -48,10 +49,7 @@
 | POST | `/v1/requests` | Create payment request | Yes |
 | POST | `/v1/requests/:id/claim` | Claim payment request and set default address | Yes |
 | GET | `/v1/requests/:id` | Get payment request status | Yes |
-| POST | `/v1/history` | Batch history proxy (addresses[]) | No |
 | GET | `/v1/price` | PEPEW price (CoinMarketCap) | No |
-
-`POST /v1/history` currently remains on `wallet-api` for compatibility. New Wallet chain-read code should use the PEPEW Light API contract defined by the migration roadmap rather than expanding this compatibility route.
 
 ## /wallet and /api Endpoints (Read/Broadcast)
 
@@ -63,9 +61,6 @@
 | GET | `/wallet/healthz` | Liveness | No |
 | GET | `/wallet/readyz` | Dependency readiness | No |
 | GET | `/wallet/healthz/rpc` | Core RPC health | No |
-| GET | `/wallet/balance?address=` | Balance proxy to `pepew-api` | No |
-| GET | `/wallet/utxos?address=` | UTXO proxy to `pepew-api` | No |
-| GET | `/wallet/history?address=` | History proxy to `pepew-api` | No |
 | POST | `/wallet/tx/broadcast` | Broadcast raw tx to core RPC | No |
 | POST | `/wallet/tx/send` | Alias of `/wallet/tx/broadcast` | No |
 | POST | `/api/tx/send` | Legacy alias of `/wallet/tx/broadcast` | No |
