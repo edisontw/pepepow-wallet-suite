@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a code cleanup implemented in `main`; production deployment pending access-log verification.**
+Status: **IN PROGRESS — M6a PRODUCTION ACCEPTED on 2026-09-28 at `bfcb581`; remaining M6 slices are not yet complete.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -261,7 +261,7 @@ Code scope:
 - remove stale Web API constants for those retired routes;
 - keep raw-tx compatibility, direct broadcast compatibility, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 slices.
 
-Deployment gate: verify production access logs show no legitimate consumers of the retired routes before deploying M6a. Repo-level Web/Mini App/Bot consumer search is already clean.
+Production acceptance (2026-09-28): post-Light-API-cutover access logs showed zero calls to the retired routes; wallet-api build, M2/M3/M4/M5/M6a boundary tests, and Web build passed; `/healthz` and `/readyz` passed after restart; all four retired routes returned 404; Telegram `/balance` and `/history` passed through PEPEW Light API.
 
 Remaining M6 cleanup includes:
 

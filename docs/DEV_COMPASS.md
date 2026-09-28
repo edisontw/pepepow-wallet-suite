@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a removes the dead wallet-api balance/UTXO/history read proxies in `main`; production deployment remains gated on access-log verification.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a PRODUCTION ACCEPTED on 2026-09-28 at `bfcb581`; dead wallet-api balance/UTXO/history read proxies are retired. Next slice: M6b raw-tx compatibility cleanup.**
 
 ## 1. Core design principles
 

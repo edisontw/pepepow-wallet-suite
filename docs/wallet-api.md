@@ -4,7 +4,7 @@
 >
 > **M4:** Mini App signed broadcast has moved to PEPEW Light API. `/wallet/tx/broadcast` and aliases remain only as rollback compatibility until M6; new client code must not call them.
 >
-> **M6a:** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired in `main`. Raw-tx and direct-broadcast compatibility remain for later M6 slices.
+> **M6a PRODUCTION ACCEPTED (2026-09-28):** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired and return 404. Raw-tx and direct-broadcast compatibility remain for later M6 slices.
 
 `wallet-api` is the **wallet control plane**. In the current transitional runtime it still authenticates Telegram users and issues short-lived JWTs; only the remaining raw-tx compatibility and direct broadcast/diagnostic paths retain legacy chain access. These chain-access responsibilities are scheduled for later M6 removal. It is **not** a wallet and **not** a custodian.
 
