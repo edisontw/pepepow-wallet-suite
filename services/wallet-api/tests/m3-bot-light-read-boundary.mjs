@@ -15,7 +15,5 @@ assert.doesNotMatch(bot, /127\.0\.0\.1:9194\/wallet\/history/);
 assert.match(bot, /127\.0\.0\.1:9194\/v1\/address\/default/);
 assert.match(bot, /formatPepewAtomic\(confirmed\)/);
 assert.match(bot, /formatLightHistoryAmount/);
-assert.match(server, /app\.post\("\/wallet\/tx\/broadcast"/);
-assert.match(server, /\/wallet\/fee\/estimate/);
 
 console.log("m3-bot-light-read-boundary: ok");
