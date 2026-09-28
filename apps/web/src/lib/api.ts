@@ -7,19 +7,12 @@ export const EXPLORER_BASE_URL = "https://explorer.pepepow.net";
 export const API_ENDPOINTS = {
   wallet: {
     healthz: "/wallet/healthz",
-    balance: "/wallet/balance",
-    utxos: "/wallet/utxos",
-    history: "/wallet/history",
     price: "/wallet/price",
-    txRaw: "/wallet/tx/raw",
-    txRawBatch: "/wallet/tx/raw/batch",
-    txBroadcast: "/wallet/tx/broadcast",
   },
   v1: {
     whoami: "/v1/whoami",
     profileUpsert: "/v1/profile/upsert",
     addressDefault: "/v1/address/default",
-    history: "/v1/history",
     resolve: (params: URLSearchParams) => `/v1/resolve?${params.toString()}`,
     requests: "/v1/requests",
     request: (id: string) => `/v1/requests/${id}`,
