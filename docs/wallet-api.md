@@ -1,6 +1,8 @@
 # wallet-api
 
 > **Migration status:** this document describes the current legacy-compatible runtime. The approved target is for `wallet-api` to become the Telegram/product control plane only, while PEPEW Light API handles Wallet chain reads and signed broadcast. Do not add new consumers of the legacy chain proxy/RPC endpoints. See `docs/LIGHT_API_MIGRATION.md`.
+>
+> **M4:** Mini App signed broadcast has moved to PEPEW Light API. `/wallet/tx/broadcast` and aliases remain only as rollback compatibility until M6; new client code must not call them.
 
 `wallet-api` is the **wallet control plane**. In the current transitional runtime it still authenticates Telegram users, issues short-lived JWTs, proxies some read calls to `pepew-api`, and broadcasts raw transactions to the core node. These chain-access responsibilities are legacy migration paths, not the target architecture. It is **not** a wallet and **not** a custodian.
 

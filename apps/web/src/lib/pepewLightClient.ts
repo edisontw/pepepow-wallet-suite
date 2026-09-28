@@ -200,7 +200,10 @@ function safeMessageForCode(code: string, status?: number) {
     return "Signed raw transaction is invalid.";
   }
   if (code === "rate_limited" || status === 429) return "PEPEW Light API rate limit reached. Please retry later.";
-  if (code === "electrumx_error" || code === "internal_error" || code === "broadcast_rejected" || (status !== undefined && status >= 500)) {
+  if (code === "broadcast_rejected") {
+    return "Transaction was rejected. Refresh UTXOs and reconcile recent history before trying again.";
+  }
+  if (code === "electrumx_error" || code === "internal_error" || (status !== undefined && status >= 500)) {
     return "PEPEW Light API is temporarily unavailable.";
   }
   if (code === "tx_not_found") return "Transaction was not found.";

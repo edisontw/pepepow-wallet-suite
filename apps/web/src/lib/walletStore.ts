@@ -2,6 +2,40 @@ import { addressToScript, PEPEPOW } from "@pepepow/wallet-core";
 import { getPendingSpendTotal } from "./pending";
 import { pepewLightClient } from "./pepewLightClient";
 
+const RECENT_SPENT_OUTPOINTS_KEY = "pepew_recent_spent_outpoints";
+const SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
+const MAX_RECENT_SPENT_OUTPOINTS = 2000;
+
+function loadRecentSpentOutpoints(now = Date.now()): Record<string, number> {
+    if (typeof localStorage === "undefined") return {};
+    try {
+        const raw = localStorage.getItem(RECENT_SPENT_OUTPOINTS_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(parsed)) return {};
+        const out: Record<string, number> = {};
+        for (const item of parsed.slice(0, MAX_RECENT_SPENT_OUTPOINTS)) {
+            if (!item || typeof item.key !== "string") continue;
+            const expiresAt = Number(item.expiresAt || 0);
+            if (expiresAt <= now) continue;
+            out[item.key] = expiresAt;
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+function saveRecentSpentOutpoints(outpoints: Record<string, number>) {
+    if (typeof localStorage === "undefined") return;
+    const now = Date.now();
+    const rows = Object.entries(outpoints)
+        .filter(([, expiresAt]) => Number.isFinite(expiresAt) && expiresAt > now)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, MAX_RECENT_SPENT_OUTPOINTS)
+        .map(([key, expiresAt]) => ({ key, expiresAt }));
+    localStorage.setItem(RECENT_SPENT_OUTPOINTS_KEY, JSON.stringify(rows));
+}
+
 export interface Utxo {
     txid: string;
     vout: number;
@@ -51,8 +85,7 @@ class WalletStore {
 
     private listeners: Set<Listener> = new Set();
     private requestSeq = 0;
-    private spentOutpoints: Record<string, number> = {};
-    private SPENT_OUTPOINT_TTL_MS = 10 * 60 * 1000;
+    private spentOutpoints: Record<string, number> = loadRecentSpentOutpoints();
 
     constructor() {
         this.updatePending();
@@ -120,20 +153,22 @@ class WalletStore {
     }
 
     markSpentOutpoints(outpoints: string[]) {
-        const now = Date.now();
+        const expiresAt = Date.now() + SPENT_OUTPOINT_TTL_MS;
         outpoints.filter(Boolean).forEach((key) => {
-            this.spentOutpoints[key] = now;
+            this.spentOutpoints[key] = expiresAt;
         });
+        saveRecentSpentOutpoints(this.spentOutpoints);
         this.filterUtxos();
+        this.notify();
     }
 
     private filterUtxos() {
         const now = Date.now();
         const filtered = this.state.utxos.filter((u) => {
             const key = `${u.txid}:${u.vout}`;
-            const ts = this.spentOutpoints[key];
-            if (!ts) return true;
-            if (now - ts > this.SPENT_OUTPOINT_TTL_MS) {
+            const expiresAt = this.spentOutpoints[key];
+            if (!expiresAt) return true;
+            if (expiresAt <= now) {
                 delete this.spentOutpoints[key];
                 return true;
             }
@@ -143,6 +178,7 @@ class WalletStore {
             this.state.utxos = filtered;
             this.state.utxoSumSats = filtered.reduce((s, u) => s + u.valueSats, 0);
         }
+        saveRecentSpentOutpoints(this.spentOutpoints);
     }
 
     async fetch(options: WalletFetchOptions = {}) {

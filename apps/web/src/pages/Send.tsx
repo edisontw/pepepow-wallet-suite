@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { addressToScript, buildAndSignP2PKH, wifFromMnemonic, PEPEPOW } from "@pepepow/wallet-core";
 import { apiFetch, getApiUrl, createPaymentRequest as apiCreatePaymentRequest, API_ENDPOINTS } from "../lib/api";
 import { broadcastTx, fetchRawTxBatchApi, TxApiError } from "../lib/tx";
+import { pepewLightClient } from "../lib/pepewLightClient";
 import { fmtPEPEWFromSats } from "../lib/format";
 import {
   assertAtomic,
@@ -1347,12 +1348,14 @@ export default function Send() {
     if (cancelRequestedRef.current) return { status: "cancelled" as const };
     if (backgroundPauseRef.current) return { status: "paused" as const };
 
-    await walletStore.fetch({ fresh: true, includeBalance: false });
-    const latest = walletStore.getState().utxos;
-    const remaining = Array.isArray(latest) ? latest.length : 0;
+    const sendFrom = normalizeAddressInput(address);
+    if (!sendFrom) return { status: "pending" as const, remaining: walletStore.getState().utxos.length };
+    const lightSnapshot = await pepewLightClient.getUtxo(sendFrom, { fresh: true });
+    const latestRaw = Array.isArray(lightSnapshot.utxos) ? lightSnapshot.utxos : [];
+    const remaining = latestRaw.length;
 
     const existingOutpoints = new Set(
-      latest
+      latestRaw
         .filter((u) => !!u.txid && Number.isFinite(Number(u.vout)))
         .map((u) => toOutpointKey(String(u.txid), Number(u.vout)))
     );
@@ -1362,13 +1365,14 @@ export default function Send() {
     }
     const spentGoneEnough = spentOutpoints.size === 0 || spentGone >= spentOutpoints.size;
 
-    const confirmationFieldAvailable = latest.some((u) => typeof u.confirmations === "number");
-    const txConfirmed = !!txid && latest.some(
-      (u) => u.txid === txid && typeof u.confirmations === "number" && Number(u.confirmations) >= 1
+    const confirmationFieldAvailable = latestRaw.some((u) => typeof u.height === "number");
+    const txConfirmed = !!txid && latestRaw.some(
+      (u) => u.txid === txid && typeof u.height === "number" && Number(u.height) > 0
     );
     const confirmationSatisfied = !txid || !confirmationFieldAvailable || txConfirmed;
 
     if (spentGoneEnough && confirmationSatisfied) {
+      await walletStore.fetch({ fresh: false, includeBalance: false });
       return { status: "progress" as const, remaining };
     }
     return { status: "pending" as const, remaining };
@@ -1585,7 +1589,8 @@ export default function Send() {
         lastTxid: txidToShow || prev?.lastTxid,
         requestId: prev?.requestId,
       }));
-      console.info(`[CONSOLIDATION] Broadcast success txid=${txidToShow || "unknown"}`);
+      walletStore.markSpentOutpoints([...spentOutpoints]);
+      console.info(`[CONSOLIDATION] Broadcast success txid=${txidToShow || "unknown"} source=dedupe`);
       return { txid: txidToShow || undefined, spentOutpoints };
     }
 
@@ -1613,7 +1618,8 @@ export default function Send() {
       lastTxid: txidString || undefined,
       requestId,
     });
-    console.info(`[CONSOLIDATION] Broadcast success txid=${txidString || "unknown"}`);
+    walletStore.markSpentOutpoints([...spentOutpoints]);
+    console.info(`[CONSOLIDATION] Broadcast success txid=${txidString || "unknown"} source=light`);
 
     const spendSats = Number(preview.feeAtomic);
     const alreadyPending = txidString ? hasPendingSpendTxid(txidString) : false;
@@ -2390,7 +2396,7 @@ export default function Send() {
       const j = await broadcastTx(raw);
       const txid = j.result || j.txid;
       const txidString = typeof txid === "string" ? txid : (localTxid || null);
-      console.log("SEND_BROADCAST_OK", traceId, txidString || null);
+      console.log("SEND_BROADCAST_OK", traceId, txidString || null, "source=light");
       setResult(txidString || JSON.stringify(j));
       setLastTxid(txidString);
       setSendLocked(true);
@@ -2441,7 +2447,7 @@ export default function Send() {
       const spentOutpoints = picked
         .map((u) => `${u.txid}:${u.vout}`)
         .filter((key) => key && !key.endsWith(":undefined"));
-      // walletStore.markSpentOutpoints(spentOutpoints); // DISABLED to avoid double-deduction
+      walletStore.markSpentOutpoints(spentOutpoints);
       if (!alreadyPending) {
         const baseline = walletStore.getState();
         triggerRefresh({ reason: "send", txid: txidString || undefined });

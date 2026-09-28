@@ -1,4 +1,3 @@
-import { apiFetch, API_ENDPOINTS } from "./api";
 import { PepewLightApiError, pepewLightClient } from "./pepewLightClient";
 
 type RawTxBatchSuccessItem = { txid: string; ok: true; rawTx: string; source?: "cache" | "upstream"; };
@@ -97,96 +96,72 @@ export async function fetchRawTxBatchApi(txids: string[]): Promise<RawTxBatchRes
   };
 }
 
-const BROADCAST_TIMEOUT_MS = 25000;
-const BROADCAST_MAX_ATTEMPTS = 2;
-const BROADCAST_RETRY_BACKOFF_MS = 800;
-
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
-}
-
-function isMissingInputsDetail(detail?: string) {
-  return /missing[-\s]?inputs|already spent/i.test(detail || "");
-}
-
-function normalizeFetchError(err: unknown, timedOut: boolean, attempt: number) {
-  if (err instanceof TxApiError) return err;
-  const rawMessage = err instanceof Error ? err.message : String(err || "");
-  const isDomAbort = typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError";
-  const isAbort = isDomAbort || (err instanceof Error && err.name === "AbortError");
-  const detail = timedOut || isAbort
-    ? `broadcast request timed out after ${BROADCAST_TIMEOUT_MS}ms`
-    : rawMessage || "network request failed";
-  const code = timedOut || isAbort ? "BROADCAST_TIMEOUT" : "NETWORK_ERROR";
-  const message = timedOut || isAbort
-    ? "Broadcast request timed out. The transaction may still have reached the node; retrying the same transaction is safe."
-    : "Network error while broadcasting transaction. Please retry; duplicate raw transactions are safely deduplicated by the node/API.";
-  return new TxApiError(message, timedOut || isAbort ? 504 : 0, detail, { code: `${code}_ATTEMPT_${attempt}` });
-}
-
-function shouldRetryBroadcastError(err: TxApiError) {
-  const code = err.code || "";
-  if (code === "UPSTREAM_BUSY" || err.status === 429) return false;
-  if (isMissingInputsDetail(err.detail)) return false;
-  if (err.status === 0 || err.status === 502 || err.status === 503 || err.status === 504) return true;
-  return code.includes("TIMEOUT")
-    || code.includes("NETWORK")
-    || code === "RPC_UNAVAILABLE"
-    || code === "UPSTREAM_ERROR";
-}
-
-async function broadcastFetchOnce(rawTx: string, attempt: number) {
-  const controller = new AbortController();
-  let timedOut = false;
-  const timeoutId = globalThis.setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, BROADCAST_TIMEOUT_MS);
-
-  try {
-    const r = await apiFetch(API_ENDPOINTS.wallet.txBroadcast, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rawTx }),
-      signal: controller.signal,
-    });
-    const payload = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      const detail = typeof payload?.message === "string"
-        ? payload.message
-        : typeof payload?.error === "string"
-          ? payload.error
-          : undefined;
-      const code = typeof payload?.code === "string" ? payload.code : undefined;
-      const requestId = r.headers.get("x-request-id")
-        || (typeof payload?.requestId === "string" ? payload.requestId : undefined);
-      const message = isMissingInputsDetail(detail)
-        ? "Missing inputs: selected UTXO is already spent or not yet indexed. Refresh the wallet and try again after the pending transaction updates."
-        : `broadcastTx failed: ${r.status}`;
-      throw new TxApiError(message, r.status, detail, { code, requestId });
+function mapLightBroadcastError(error: unknown) {
+  if (error instanceof TxApiError) return error;
+  if (error instanceof PepewLightApiError) {
+    if (error.code === "broadcast_rejected") {
+      return new TxApiError(
+        "Transaction was rejected. Refresh UTXOs and recent history before trying again.",
+        error.status ?? 503,
+        error.code,
+        { code: error.code },
+      );
     }
-    return payload;
-  } catch (err) {
-    throw normalizeFetchError(err, timedOut, attempt);
-  } finally {
-    globalThis.clearTimeout(timeoutId);
+    if (error.code === "invalid_raw_tx") {
+      return new TxApiError(
+        "Signed raw transaction is invalid.",
+        error.status ?? 400,
+        error.code,
+        { code: error.code },
+      );
+    }
+    if (error.code === "rate_limited" || error.status === 429) {
+      return new TxApiError(
+        "PEPEW Light API rate limit reached. Please wait before trying again.",
+        error.status ?? 429,
+        error.code,
+        { code: error.code },
+      );
+    }
+    if (
+      error.code === "timeout"
+      || error.code === "network_error"
+      || error.code === "electrumx_error"
+      || error.code === "api_unavailable"
+      || error.code === "internal_error"
+      || (typeof error.status === "number" && error.status >= 500)
+    ) {
+      return new TxApiError(
+        "Broadcast status is uncertain. Do not retry immediately; refresh history and UTXOs first.",
+        error.status ?? 0,
+        error.code,
+        { code: "BROADCAST_STATUS_UNCERTAIN" },
+      );
+    }
+    return new TxApiError(error.message, error.status ?? 0, error.code, { code: error.code });
   }
+  const detail = error instanceof Error ? error.message : String(error || "unknown broadcast failure");
+  return new TxApiError(
+    "Broadcast status is uncertain. Do not retry immediately; refresh history and UTXOs first.",
+    0,
+    detail,
+    { code: "BROADCAST_STATUS_UNCERTAIN" },
+  );
 }
 
+/**
+ * Submit an already-signed transaction to PEPEW Light API exactly once.
+ *
+ * Do not automatically retry POST /api/wallet/broadcast. A timeout or network
+ * failure can happen after the upstream accepted the transaction, so a blind
+ * retry risks confusing recovery and stale-UTXO handling.
+ */
 export async function broadcastTx(rawTx: string): Promise<any> {
-  let lastError: TxApiError | null = null;
-  for (let attempt = 1; attempt <= BROADCAST_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await broadcastFetchOnce(rawTx, attempt);
-    } catch (err) {
-      const txErr = normalizeFetchError(err, false, attempt);
-      lastError = txErr;
-      const canRetry = attempt < BROADCAST_MAX_ATTEMPTS && shouldRetryBroadcastError(txErr);
-      if (!canRetry) throw txErr;
-      await sleep(BROADCAST_RETRY_BACKOFF_MS);
-    }
+  try {
+    return await pepewLightClient.broadcastSignedRawTx(rawTx);
+  } catch (error) {
+    throw mapLightBroadcastError(error);
   }
-  throw lastError || new TxApiError("broadcastTx failed", 0, "unknown broadcast failure", { code: "BROADCAST_UNKNOWN" });
 }
 
 export function isTransientRawTxError(err: unknown) {

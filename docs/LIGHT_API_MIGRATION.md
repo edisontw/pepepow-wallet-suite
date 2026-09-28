@@ -169,7 +169,7 @@ Acceptance:
 
 ## M4 — Signed broadcast migration
 
-Status: **NEXT**
+Status: **CODE COMPLETE — live signed-tx acceptance pending**
 
 Move Mini App broadcast to:
 
@@ -186,16 +186,30 @@ Adopt proven Light Wallet resilience where applicable:
 - no blind repeated broadcast;
 - refresh history/UTXO after broadcast.
 
+Implementation:
+
+- Mini App and consolidation broadcast now call `pepewLightClient.broadcastSignedRawTx()`.
+- The Light API request body is exactly `{ "raw_tx": "<signed hex>" }`.
+- Broadcast POST is attempted exactly once; no automatic retry is allowed after timeout/network/upstream uncertainty.
+- Timeout/network/5xx ambiguity is surfaced as `BROADCAST_STATUS_UNCERTAIN` so the user reconciles history/UTXOs before any retry.
+- `broadcast_rejected` is treated as a definite rejection and directs the user to refresh UTXOs/history.
+- Successfully broadcast inputs are persisted in browser storage for 10 minutes and excluded from spend selection while ElectrumX/indexer state catches up.
+- Consolidation progress checks use a raw fresh Light API UTXO snapshot so local recent-spent filtering cannot falsely signal indexer progress.
+- The legacy wallet-api broadcast endpoint remains available only as rollback compatibility until M6; Mini App no longer calls it.
+
 Acceptance:
 
-- real small-amount client-signed transaction broadcasts successfully;
-- request body contains only `raw_tx`;
-- stale UTXO and mempool-conflict paths produce safe recovery behavior;
-- wallet-api direct `sendrawtransaction` is no longer required by Mini App.
+- [PENDING MANUAL] real small-amount client-signed transaction broadcasts successfully;
+- [PASS CODE] request body contains only `raw_tx`;
+- [PASS CODE] no automatic broadcast retry;
+- [PASS CODE] stale/recent-spent UTXO protection is active;
+- [PASS CODE] Mini App no longer requires wallet-api direct `sendrawtransaction`.
+
+Do not mark the live transaction acceptance PASS without a user-authorized wallet send.
 
 ## M5 — Fee decoupling
 
-Status: planned
+Status: **BLOCKED ON M4 LIVE ACCEPTANCE**
 
 Remove fee estimation as the final Wallet API direct-RPC exception.
 
