@@ -4,9 +4,11 @@
 >
 > **M4:** Mini App signed broadcast has moved to PEPEW Light API. `/wallet/tx/broadcast` and aliases remain only as rollback compatibility until M6; new client code must not call them.
 >
-> **M6a PRODUCTION ACCEPTED (2026-09-28):** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired and return 404. Raw-tx and direct-broadcast compatibility remain for later M6 slices.
+> **M6a PRODUCTION ACCEPTED (2026-09-28):** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired and return 404.
+>
+> **M6b:** Wallet API raw-tx compatibility routes/cache/RPC fallback are removed in source and pending production acceptance. Direct-broadcast compatibility remains for a later M6 slice.
 
-`wallet-api` is the **wallet control plane**. In the current transitional runtime it still authenticates Telegram users and issues short-lived JWTs; only the remaining raw-tx compatibility and direct broadcast/diagnostic paths retain legacy chain access. These chain-access responsibilities are scheduled for later M6 removal. It is **not** a wallet and **not** a custodian.
+`wallet-api` is the **wallet control plane**. In the current transitional source it still authenticates Telegram users and issues short-lived JWTs; direct broadcast plus readiness/diagnostic paths are the remaining legacy chain dependencies. These are scheduled for later M6 removal. It is **not** a wallet and **not** a custodian.
 
 ## Positioning and Non-Goals
 
@@ -64,23 +66,11 @@
 | POST | `/wallet/tx/broadcast` | Broadcast raw tx to core RPC | No |
 | POST | `/wallet/tx/send` | Alias of `/wallet/tx/broadcast` | No |
 | POST | `/api/tx/send` | Legacy alias of `/wallet/tx/broadcast` | No |
-| GET | `/wallet/tx/raw` | Raw tx lookup (proxy + RPC fallback) | No |
-| GET | `/v1/tx/raw/:txid` | Raw tx lookup (v1 path compatibility) | No |
-| POST | `/wallet/tx/raw/batch` | Batch raw tx lookup (cache + proxy/RPC fallback) | No |
-| GET | `/api/tx/raw` | Alias of `/wallet/tx/raw` | No |
-| POST | `/api/tx/raw/batch` | Alias of `/wallet/tx/raw/batch` | No |
 | GET | `/wallet/price` | Alias of `/v1/price` | No |
 | GET | `/api/price` | Alias of `/v1/price` | No |
 | POST | `/api/paylink/create` | Create JWT-signed payment link | No |
 | GET | `/api/paylink/verify` | Verify payment link token | No |
 | POST | `/tg/webhook` | Telegram bot webhook | No (verified by secret token header) |
-
-### RawTx Hot Cache and Batch Controls
-
-- `RAW_TX_CACHE_TTL_MS` (default `20000`)
-- `RAW_TX_CACHE_MAX` (default `2000`)
-- `RAW_TX_BATCH_MAX` (default `50`, hard-capped at `50`)
-- `RAW_TX_BATCH_CONCURRENCY` (default `6`, clamped to `1..10`)
 
 ## pepew-api vs wallet-api (Quick Comparison)
 

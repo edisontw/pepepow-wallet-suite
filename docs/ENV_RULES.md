@@ -33,8 +33,8 @@ sudo systemctl status pepepow-wallet-api.service --no-pager
 Required for production:
 - `PORT` (default: `9194`)
 - `PEPEW_LIGHT_API_BASE` (Telegram Bot chain-read base; default: `https://light.pepepow.net`)
-- `PEPEW_API_BASE` (legacy pepew-api base URL for raw-tx compatibility/readiness until later M6 slices)
-- `CORE_RPC_URL` (legacy compatibility/diagnostic RPC while pre-M6 endpoints and RPC health remain; active M5 wallet reads/send/fee do not use it)
+- `PEPEW_API_BASE` (legacy pepew-api readiness dependency until M6d)
+- `CORE_RPC_URL` (legacy direct-broadcast and RPC readiness/diagnostic dependency until later M6 slices; active Wallet reads/send/fee do not use it)
 - `JWT_SECRET` (JWT signing secret)
 - `CORS_ORIGINS` (comma-separated)
 - `WALLET_BASE_URL` (for paylinks)

@@ -209,10 +209,9 @@ Never log or display recovery material.
 
 ## Migration compatibility
 
-M6a retires the dead wallet-api balance/UTXO/history read proxies. The remaining legacy compatibility paths are:
+M6a retired the wallet-api balance/UTXO/history read proxies. M6b removes wallet-api raw-tx compatibility. The remaining legacy compatibility paths are:
 
 ```text
-/wallet/tx/raw*
 /wallet/tx/broadcast
 /wallet/tx/send
 /api/tx/send

@@ -145,3 +145,8 @@ sudo cp /path/to/known-good/pepepow-api /etc/nginx/sites-enabled/pepepow-api
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+
+### M6b raw-tx tombstone
+
+Keep an explicit `location ^~ /v1/tx/raw/` block that returns `404`. Do not simply delete the block while the broader `/v1/tx/` route still proxies to `pepew-api :9193`, otherwise the retired Wallet raw-tx path can fall through to the legacy chain API.
