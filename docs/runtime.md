@@ -34,7 +34,6 @@ Not used:
 - `api.pepepow.net` is path-split, not single-upstream
 - Route root `/health`, `/healthz`, `/readyz`, `/docs`, and selected public chain-read `/v1/*` paths to `http://127.0.0.1:9193`
 - Route `/wallet/*`, `/api/*`, `/tg/*`, and wallet compatibility `/v1/*` paths to `http://127.0.0.1:9194`
-- Keep `POST /v1/history` on `wallet-api` for public compatibility
 - Preserve `Host`/`X-Forwarded-*` headers and sane proxy timeouts
 - Allow `/.well-known/acme-challenge/` for certbot
 - Pass through `/healthz` and `/readyz` to `pepew-api`
