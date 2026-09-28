@@ -21,7 +21,7 @@ For `api.pepepow.net`, the split is intentional:
 
 - root `/health`, `/healthz`, `/readyz`, `/docs`, and selected chain-read `/v1/*` paths belong to `pepew-api`
 - `/wallet/*`, `/api/*`, `/tg/*`, and wallet compatibility `/v1/*` paths belong to `wallet-api`
-- `POST /v1/history` remains on `wallet-api` for compatibility
+- M6a retires wallet-api `POST /v1/history`; the explicit Nginx route may remain temporarily pointed at wallet-api so legacy requests fail closed with 404 until the later Nginx cleanup slice
 
 Do not simplify this back into a single default upstream for all `/v1/*` traffic.
 
