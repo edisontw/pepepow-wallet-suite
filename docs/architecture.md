@@ -184,16 +184,12 @@ derive sender locally
 The following are legacy migration paths, not the target architecture:
 
 ```text
-wallet-api /wallet/balance
-wallet-api /wallet/utxos
-wallet-api /wallet/history
-wallet-api /wallet/tx/raw*
 wallet-api direct sendrawtransaction
 wallet-api CORE_RPC_URL
-wallet-api -> pepew-api chain proxy
+wallet-api -> pepew-api readiness dependency
 ```
 
-They may remain temporarily while required by production. New code must not depend on them unless a migration milestone explicitly requires a compatibility bridge.
+The read proxies were retired in M6a and raw-tx compatibility is removed in M6b source. The remaining entries may stay temporarily while required by production. New code must not depend on them unless a migration milestone explicitly requires a compatibility bridge.
 
 ### M5 fee policy
 
