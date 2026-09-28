@@ -259,16 +259,27 @@ Code scope:
 - remove `POST /v1/history` from wallet-api;
 - remove the wallet-api `pepew-api` read-proxy queue/concurrency helpers and their dedicated `PEPEW_API_UPSTREAM_*` variables;
 - remove stale Web API constants for those retired routes;
-- keep raw-tx compatibility, direct broadcast compatibility, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 slices.
+- keep raw-tx compatibility until M6b; keep direct broadcast compatibility, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 slices.
 
 Production acceptance (2026-09-28): post-Light-API-cutover access logs showed zero calls to the retired routes; wallet-api build, M2/M3/M4/M5/M6a boundary tests, and Web build passed; `/healthz` and `/readyz` passed after restart; all four retired routes returned 404; Telegram `/balance` and `/history` passed through PEPEW Light API.
 
+### M6b — raw-tx compatibility retirement
+
+Code scope:
+
+- remove `GET /wallet/tx/raw`;
+- remove `GET /api/tx/raw`;
+- remove `GET /v1/tx/raw/:txid`;
+- remove `POST /wallet/tx/raw/batch`;
+- remove `POST /api/tx/raw/batch`;
+- remove the Wallet API raw-tx cache, batch/concurrency controls, retry logic, `pepew-api` raw lookup, and direct `getrawtransaction` RPC fallback;
+- keep an explicit Nginx `/v1/tx/raw/` 404 tombstone so requests cannot fall through to the broader `pepew-api :9193` `/v1/tx/` route;
+- preserve direct broadcast compatibility, RPC health/readiness, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 slices.
+
+Production deployment gate: verify post-Light-API-cutover access logs show no legitimate consumers of the retired raw-tx routes. Repo-level Web/Mini App/Bot consumer search is clean.
+
 Remaining M6 cleanup includes:
 
-- `/wallet/balance`;
-- `/wallet/utxos`;
-- `/wallet/history`;
-- raw-tx lookup/cache/RPC fallback;
 - direct broadcast aliases/RPC implementation;
 - Wallet dependency on `pepew-api :9193`;
 - Wallet direct `CORE_RPC_URL`.
