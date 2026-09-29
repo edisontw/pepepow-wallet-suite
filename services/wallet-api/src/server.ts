@@ -1,6 +1,5 @@
 import express from "express";
 import crypto from "crypto";
-import { promises as fs } from "fs";
 import jwt from "jsonwebtoken";
 import fetch from "node-fetch";
 import { webhookCallback, Bot, InlineKeyboard } from "grammy";
@@ -644,11 +643,8 @@ const authMax = parseEnvNumber(process.env.WALLET_API_RATE_LIMIT_AUTH_MAX, 60);
 const readWindowMs = parseEnvNumber(process.env.WALLET_API_RATE_LIMIT_READ_WINDOW_MS, 1 * 60 * 1000);
 const readMax = parseEnvNumber(process.env.WALLET_API_RATE_LIMIT_READ_MAX, 120);
 const readJwtMax = parseEnvNumber(process.env.WALLET_API_RATE_LIMIT_JWT_READ_MAX, readMax);
-const txWindowMs = parseEnvNumber(process.env.WALLET_API_RATE_LIMIT_TX_WINDOW_MS, 10 * 60 * 1000);
-const txMax = parseEnvNumber(process.env.WALLET_API_RATE_LIMIT_TX_MAX, 20);
-const txJwtMax = parseEnvNumber(process.env.WALLET_API_RATE_LIMIT_JWT_TX_MAX, txMax);
 
-type RateLimiterType = "auth" | "read" | "tx";
+type RateLimiterType = "auth" | "read";
 const makeRateLimitHandler =
   (limiterType: RateLimiterType) =>
     (req: express.Request, res: express.Response) => {
@@ -692,24 +688,6 @@ const readJwtLimiter = rateLimit({
   skip: (req) => !getJwtSubject(req as RateLimitRequest),
   handler: makeRateLimitHandler("read"),
 });
-const txLimiter = rateLimit({
-  windowMs: txWindowMs,
-  max: txMax,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: ipKeyGenerator,
-  handler: makeRateLimitHandler("tx"),
-});
-const txJwtLimiter = rateLimit({
-  windowMs: txWindowMs,
-  max: txJwtMax,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => `jwt:${getJwtSubject(req as RateLimitRequest)}`,
-  skip: (req) => !getJwtSubject(req as RateLimitRequest),
-  handler: makeRateLimitHandler("tx"),
-});
-
 const resolveLimiter = rateLimit({
   windowMs: readWindowMs,
   max: 30,
@@ -720,7 +698,6 @@ const resolveLimiter = rateLimit({
 });
 
 const readLimiters = [readLimiter, readJwtLimiter];
-const txLimiters = [txLimiter, txJwtLimiter];
 
 const walletApiVersion = process.env.WALLET_API_VERSION;
 const walletApiGitSha = process.env.WALLET_API_GIT_SHA || process.env.GIT_SHA;
@@ -997,211 +974,6 @@ app.get("/v1/requests/:id", ...readLimiters, requireAuth, (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-function extractRawTx(body: any) {
-  if (typeof body?.rawTx === "string") return body.rawTx;
-  if (typeof body?.hex === "string") return body.hex;
-  return "";
-}
-
-function isDebugRawTxEnabled() {
-  return process.env.WALLET_API_DEBUG_RAWTX === "1";
-}
-
-function computeTxidFromRawTx(rawTx: string) {
-  try {
-    const bytes = Buffer.from(rawTx, "hex");
-    const hash1 = crypto.createHash("sha256").update(bytes).digest();
-    const hash2 = crypto.createHash("sha256").update(hash1).digest();
-    return Buffer.from(hash2).reverse().toString("hex");
-  } catch {
-    return null;
-  }
-}
-
-async function debugDecodeRawTx(req: express.Request, rawTx: string, url: string, headers: Record<string, string>) {
-  const tmpPath = "/tmp/rawtx.hex";
-  const allowDebugFile = process.env.WALLET_API_DEBUG_RAWTX_FILE === "1";
-  if (allowDebugFile) {
-    try {
-      await fs.writeFile(tmpPath, rawTx, { mode: 0o600 });
-      const stat = await fs.stat(tmpPath);
-      console.info(`[broadcast] rawTx debug file written path=${tmpPath} bytes=${stat.size}`);
-    } catch (err: any) {
-      const msg = err?.message || String(err);
-      console.warn(`[broadcast] rawTx debug file write failed: ${msg}`);
-    }
-  }
-
-  try {
-    const timeoutMs = Number(process.env.CORE_RPC_TIMEOUT_MS || process.env.CORE_RPC_TIMEOUT || "10000");
-    const { res: rpcRes, data } = await fetchJson(
-      url,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          jsonrpc: "1.0",
-          id: "decode",
-          method: "decoderawtransaction",
-          params: [rawTx],
-        }),
-      },
-      Number.isFinite(timeoutMs) ? timeoutMs : 10000,
-      {
-        requestId: getRequestId(req),
-        label: "rpc.decoderawtransaction",
-        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
-      }
-    );
-    if (!data) {
-      console.warn(`[broadcast] decoderawtransaction parse failed (status=${rpcRes.status}) rid=${getRequestId(req)}`);
-      return;
-    }
-    if (!rpcRes.ok) {
-      console.warn(`[broadcast] decoderawtransaction HTTP ${rpcRes.status} rid=${getRequestId(req)}`);
-    }
-    if (data?.error) {
-      const code = typeof data.error.code === "number" ? data.error.code : undefined;
-      const message = typeof data.error.message === "string"
-        ? data.error.message
-        : typeof data.error === "string"
-          ? data.error
-          : JSON.stringify(data.error);
-      console.warn(`[broadcast] decoderawtransaction error ${code ?? "unknown"}: ${message} rid=${getRequestId(req)}`);
-      return;
-    }
-    const result = data?.result || {};
-    const txid = typeof result.txid === "string" ? result.txid : "n/a";
-    const vsize = typeof result.vsize === "number"
-      ? result.vsize
-      : typeof result.size === "number"
-        ? result.size
-        : "n/a";
-    const vinCount = Array.isArray(result.vin) ? result.vin.length : 0;
-    const voutCount = Array.isArray(result.vout) ? result.vout.length : 0;
-    console.info(`[broadcast] decoderawtransaction ok txid=${txid} vsize=${vsize} vin=${vinCount} vout=${voutCount} rid=${getRequestId(req)}`);
-  } catch (err: any) {
-    const detail = classifyFetchError(err, url);
-    console.warn(`[broadcast] decoderawtransaction request failed: ${detail} rid=${getRequestId(req)}`);
-  } finally {
-    if (allowDebugFile) {
-      try {
-        await fs.rm(tmpPath, { force: true });
-      } catch {
-        // ignore cleanup errors
-      }
-    }
-  }
-}
-
-async function handleBroadcast(req: express.Request, res: express.Response) {
-  const startedAt = Date.now();
-  const fromAddress = typeof req.body?.fromAddress === "string" ? req.body.fromAddress : "unknown";
-  const amount = typeof req.body?.amount === "number" || typeof req.body?.amount === "string"
-    ? String(req.body.amount)
-    : "unknown";
-  const utxos = Array.isArray(req.body?.utxos) ? req.body.utxos : [];
-  console.info(`[wallet.broadcast] start rid=${getRequestId(req)} address=${fromAddress}`);
-  console.info(`[tx-build] address=${fromAddress} utxoCount=${utxos.length} amount=${amount} rid=${getRequestId(req)}`);
-
-  const rawTx = extractRawTx(req.body);
-  const minHexLen = 10;
-  const rawTxLen = rawTx.length;
-  const rawTxHex = /^[0-9a-fA-F]+$/.test(rawTx);
-  const rawTxEvenLen = rawTxLen % 2 === 0;
-  const rawTxStartsWith0x = rawTx.startsWith("0x") || rawTx.startsWith("0X");
-  const rawTxHasNewline = /[\r\n]/.test(rawTx);
-  const rawTxHash16 = rawTxHex && rawTxEvenLen && rawTxLen >= minHexLen
-    ? crypto.createHash("sha256").update(rawTx, "hex").digest("hex").slice(0, 16)
-    : "n/a";
-  console.info(
-    `[broadcast] RPC request method=sendrawtransaction params=[string] rawTxLen=${rawTxLen} rawTxHex=${rawTxHex} rawTxEvenLen=${rawTxEvenLen} rawTxStartsWith0x=${rawTxStartsWith0x} rawTxHasNewline=${rawTxHasNewline} rawTxHash16=${rawTxHash16} rid=${getRequestId(req)}`
-  );
-  if (!rawTx || !rawTxHex || !rawTxEvenLen || rawTxLen < minHexLen) {
-    return errorWithRequestId(req, res, 400, "VALIDATION_ERROR", "invalid rawTx");
-  }
-  const { url, headers } = getCoreRpcRequestConfig();
-  if (isDebugRawTxEnabled()) {
-    await debugDecodeRawTx(req, rawTx, url, headers);
-  }
-  try {
-    const timeoutMs = Number(process.env.CORE_RPC_TIMEOUT_MS || process.env.CORE_RPC_TIMEOUT || "10000");
-    const { res: rpcRes, data } = await fetchJson(
-      url,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          jsonrpc: "1.0",
-          id: "send",
-          method: "sendrawtransaction",
-          params: [rawTx],
-        }),
-      },
-      Number.isFinite(timeoutMs) ? timeoutMs : 10000,
-      {
-        requestId: getRequestId(req),
-        label: "rpc.sendrawtransaction",
-        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
-      }
-    );
-    if (!data) {
-      console.error(`[broadcast] RPC response parse failed (status=${rpcRes.status}) rid=${getRequestId(req)}`);
-      return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
-    }
-    if (data?.error) {
-      const code = typeof data.error.code === "number" ? data.error.code : undefined;
-      const message = typeof data.error.message === "string"
-        ? data.error.message
-        : typeof data.error === "string"
-          ? data.error
-          : JSON.stringify(data.error);
-      console.warn(`[broadcast] RPC error ${code ?? "unknown"}: ${message} rid=${getRequestId(req)}`);
-      if (code === -22) {
-        return errorWithRequestId(req, res, 400, "INVALID_RAW_TX", "invalid rawTx", { code, message });
-      }
-      if (code === -26) {
-        if (message.toLowerCase().includes("txn-mempool-conflict")) {
-          const txid = computeTxidFromRawTx(rawTx);
-          if (txid) {
-            console.info(`[broadcast] mempool-conflict treated as ok txid=${txid} rid=${getRequestId(req)}`);
-            console.info(`[broadcast] address=${fromAddress} txid=${txid} rid=${getRequestId(req)}`);
-            return res.json({ ok: true, txid, note: "already in mempool", requestId: getRequestId(req) });
-          }
-          console.warn(`[broadcast] mempool-conflict but txid compute failed rid=${getRequestId(req)}`);
-          return res.json({ ok: true, note: "already in mempool", requestId: getRequestId(req) });
-        }
-        return errorWithRequestId(req, res, 422, "TX_REJECTED", "tx rejected", { code, message });
-      }
-      return errorWithRequestId(req, res, 502, "RPC_ERROR", "rpc error", { code, message });
-    }
-    if (!rpcRes.ok) {
-      console.error(`[broadcast] RPC HTTP ${rpcRes.status} rid=${getRequestId(req)}`);
-      return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
-    }
-    const txid = data?.result;
-    if (!txid) {
-      console.error(`[broadcast] RPC missing txid rid=${getRequestId(req)}`);
-      return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
-    }
-    console.info(`[broadcast] address=${fromAddress} txid=${txid} rid=${getRequestId(req)}`);
-    return res.json({ ok: true, txid, requestId: getRequestId(req) });
-  } catch (err: any) {
-    const detail = classifyFetchError(err, url);
-    console.error(`[broadcast] RPC request failed: ${detail} rid=${getRequestId(req)}`);
-    if (isTimeoutErrorMessage(detail)) {
-      return errorWithRequestId(req, res, 504, "RPC_TIMEOUT", detail);
-    }
-    return errorWithRequestId(req, res, 502, "RPC_UNAVAILABLE", "rpc unavailable");
-  } finally {
-    console.info(`[wallet.broadcast] end rid=${getRequestId(req)} address=${fromAddress} timing=${Date.now() - startedAt}ms status=${res.statusCode}`);
-  }
-}
-
-app.post("/wallet/tx/broadcast", ...txLimiters, handleBroadcast);
-app.post("/wallet/tx/send", ...txLimiters, handleBroadcast);
-app.post("/api/tx/send", ...txLimiters, handleBroadcast);
 
 // --- Bot Helper Functions ---
 function createBotJWT(telegramUserId: string, username?: string): string {
