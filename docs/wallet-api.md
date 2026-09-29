@@ -2,7 +2,7 @@
 
 > **Migration status:** this document describes the current legacy-compatible runtime. The approved target is for `wallet-api` to become the Telegram/product control plane only, while PEPEW Light API handles Wallet chain reads and signed broadcast. Do not add new consumers of the legacy chain proxy/RPC endpoints. See `docs/LIGHT_API_MIGRATION.md`.
 >
-> **M4:** Mini App signed broadcast has moved to PEPEW Light API. `/wallet/tx/broadcast` and aliases remain only as rollback compatibility until M6; new client code must not call them.
+> **M4:** Mini App signed broadcast moved to PEPEW Light API. The legacy Wallet API broadcast aliases remained only as rollback compatibility and are removed by M6c; new client code must not call them.
 >
 > **M6a PRODUCTION ACCEPTED (2026-09-28):** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired and return 404.
 >
@@ -54,7 +54,7 @@
 | GET | `/v1/requests/:id` | Get payment request status | Yes |
 | GET | `/v1/price` | PEPEW price (CoinMarketCap) | No |
 
-## /wallet and /api Endpoints (Read/Broadcast)
+## /wallet and /api Endpoints (Control/Health)
 
 | Method | Path | Purpose | JWT Required |
 | --- | --- | --- | --- |
