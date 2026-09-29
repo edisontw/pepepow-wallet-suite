@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a, M6b, M6c, and M6d PRODUCTION ACCEPTED. Wallet chain proxies, raw-tx compatibility, direct broadcast, and legacy readiness/RPC dependencies are retired. Next: M6e deployment/config/script cleanup, then final M6f isolation acceptance.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a–M6d PRODUCTION ACCEPTED. M6e deployment/config/script cleanup is implemented in source and pending production cleanup/acceptance. Final M6f isolation acceptance follows.**
 
 ## 1. Core design principles
 
