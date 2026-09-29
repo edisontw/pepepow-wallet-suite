@@ -5,18 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
-
-# Path to the current release
-WorkingDirectory=/opt/pepepow-wallet-suite/current/services/wallet-api
-
-# Production secrets live on the host
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/pepepow-wallet-suite/services/wallet-api
 EnvironmentFile=/etc/pepepow/pepepow-wallet-api.env
-
-# Path to node and server script
-ExecStart=/usr/bin/node /opt/pepepow-wallet-suite/current/services/wallet-api/dist/server.js
-
+Environment=NODE_ENV=production
+ExecStart=/home/ubuntu/.nvm/versions/node/v20.19.6/bin/node dist/server.js
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
