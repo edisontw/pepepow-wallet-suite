@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a PRODUCTION ACCEPTED on 2026-09-28 at `bfcb581`; M6b PRODUCTION ACCEPTED on 2026-09-29 at `77ab1c9`; remaining M6 slices are not yet complete.**
+Status: **IN PROGRESS — M6a and M6b PRODUCTION ACCEPTED; M6c direct-broadcast cleanup is implemented in source and pending production access-log verification/acceptance.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -278,11 +278,25 @@ Code scope:
 
 Production acceptance (2026-09-29): post-Light-API-cutover access logs showed zero calls to the retired raw-tx routes; wallet-api build plus M2/M3/M4/M5/M6a/M6b boundary tests passed; `/healthz` and `/readyz` passed after restart; all five raw-tx routes returned 404; direct broadcast compatibility remained available; public Nginx still explicitly routed `/v1/tx/raw/` to wallet-api `:9194`, so there was no fall-through to `pepew-api :9193`; Telegram `/balance` and `/history` passed.
 
+### M6c — direct-broadcast retirement
+
+Code scope:
+
+- remove `POST /wallet/tx/broadcast`;
+- remove `POST /wallet/tx/send`;
+- remove `POST /api/tx/send`;
+- remove Wallet API direct `sendrawtransaction` RPC implementation;
+- remove `decoderawtransaction` debug flow and `/tmp/rawtx.hex` debug-file support;
+- remove Wallet API transaction-specific rate limiters and `WALLET_API_RATE_LIMIT_TX_*` settings;
+- make the three retired Wallet direct-broadcast routes explicit Nginx 404 tombstones;
+- preserve `pepew-api :9193` `/v1/tx/broadcast`, RPC health/readiness, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 work.
+
+Production deployment gate: verify post-Light-API-cutover access logs show no legitimate consumers of the three retired Wallet direct-broadcast routes. Mini App/Web Wallet already broadcast through PEPEW Light API and do not consume these routes.
+
 Remaining M6 cleanup includes:
 
-- direct broadcast aliases/RPC implementation;
-- Wallet dependency on `pepew-api :9193`;
-- Wallet direct `CORE_RPC_URL`.
+- Wallet dependency on `pepew-api :9193` readiness;
+- Wallet direct `CORE_RPC_URL` readiness/diagnostic dependency.
 
 Do not remove `pepew-api` itself if other products still consume it.
 

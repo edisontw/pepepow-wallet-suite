@@ -6,8 +6,8 @@ This document focuses on operational defense and rate limiting. It complements `
 
 ### wallet-api
 - Authenticated surface (Telegram JWT).
-- Small number of write-capable endpoints (broadcast, profile binding, payment requests).
-- Higher sensitivity per request (identity binding, broadcast attempts).
+- Small number of write-capable product endpoints (profile binding, payment requests).
+- Higher sensitivity per request (identity binding and product-state changes).
 - Lower expected traffic volume.
 
 ### pepew-api
@@ -34,7 +34,6 @@ This document focuses on operational defense and rate limiting. It complements `
 - `/v1/mempool/info`
 
 **wallet-api high-risk paths:**
-- `/wallet/tx/broadcast` (and aliases)
 - `/auth/telegram` (initData validation + JWT issue)
 - `/v1/resolve` (username/address probing)
 
@@ -51,8 +50,8 @@ This document focuses on operational defense and rate limiting. It complements `
 
 **App layer (Node services):**
 - JWT validation and user-specific limits.
-- Input validation (address formats, tx hex format).
-- Per-route rate limiting for auth/read/tx flows.
+- Input validation for product/control-plane inputs.
+- Per-route rate limiting for auth/read/product-state flows.
 
 ## Relationship to `security.md`
 - `security.md` defines non-custodial guarantees and user safety.
