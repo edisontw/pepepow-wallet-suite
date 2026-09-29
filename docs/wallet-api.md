@@ -8,7 +8,7 @@
 >
 > **M6b PRODUCTION ACCEPTED (2026-09-29):** Wallet API raw-tx compatibility routes/cache/RPC fallback are retired in production and return 404.
 >
-> **M6c:** Wallet API direct-broadcast routes and direct `sendrawtransaction` implementation are removed in source and pending production acceptance. RPC health/readiness remains for M6d.
+> **M6c PRODUCTION ACCEPTED (2026-09-29):** Wallet API direct-broadcast routes and direct `sendrawtransaction` implementation are retired in production and return 404. RPC health/readiness remains for M6d.
 
 `wallet-api` is the **wallet control plane**. In the current M6c source it authenticates Telegram users and serves product/control-plane state; only readiness/diagnostic dependencies still reach legacy chain infrastructure. These are scheduled for M6d removal. It is **not** a wallet and **not** a custodian.
 

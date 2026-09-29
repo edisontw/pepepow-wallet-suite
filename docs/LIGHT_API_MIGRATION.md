@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a and M6b PRODUCTION ACCEPTED; M6c direct-broadcast cleanup is implemented in source and pending production access-log verification/acceptance.**
+Status: **IN PROGRESS — M6a, M6b, and M6c PRODUCTION ACCEPTED; next slice is M6d readiness/RPC decoupling.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -291,7 +291,7 @@ Code scope:
 - make the three retired Wallet direct-broadcast routes explicit Nginx 404 tombstones;
 - preserve `pepew-api :9193` `/v1/tx/broadcast`, RPC health/readiness, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 work.
 
-Production deployment gate: verify post-Light-API-cutover access logs show no legitimate consumers of the three retired Wallet direct-broadcast routes. Mini App/Web Wallet already broadcast through PEPEW Light API and do not consume these routes.
+Production acceptance (2026-09-29): post-Light-API-cutover access logs showed zero calls to the three retired Wallet direct-broadcast routes; wallet-api build plus M2/M3/M4/M5/M6a/M6b/M6c boundary tests passed; `/healthz` and `/readyz` passed after restart; all three direct-broadcast routes returned 404 locally; the public `/wallet/tx/broadcast` path also returned 404 through the existing Nginx proxy to wallet-api; Telegram `/balance` and `/history` passed. `PEPEW_API_BASE` and `CORE_RPC_URL` readiness/diagnostic dependencies remain for M6d.
 
 Remaining M6 cleanup includes:
 
