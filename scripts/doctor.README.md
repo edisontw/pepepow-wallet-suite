@@ -1,39 +1,46 @@
-# PEPEPOW Wallet Suite Doctor (No-Docker v4.1.1)
+# PEPEPOW Wallet Suite Doctor
 
-Use this toolkit to validate an Ubuntu host running the non-Docker release layout (`/opt/pepepow-wallet-suite/{releases,shared,current}`).
+Use `scripts/doctor.sh` to validate the current non-Docker Wallet checkout and its runtime dependencies.
 
-## Runnable components
-- wallet-api (Node, default port 9194) – systemd unit: `pepepow-wallet-api.service`
-- Web static files served from `/srv/wallet` (built by `apps/web`)
-- Optional original `pepew-api` (Node, default port 9193) if you deploy it separately
+## Default source checkout
 
-## Run
-```bash
-bash scripts/doctor.sh             # assumes /opt/pepepow-wallet-suite as APP_ROOT
-# or override paths
-APP_ROOT=/opt/pepepow-wallet-suite CODE_ROOT=/opt/pepepow-wallet-suite/current bash scripts/doctor.sh
+The script defaults to the repository that contains it. In production this is currently:
+
+```text
+/home/ubuntu/pepepow-wallet-suite
 ```
 
-The script uses safe flags (`set -euo pipefail`), avoids printing secrets, and masks credentials in URLs.
+Override only when intentionally testing another checkout:
+
+```bash
+CODE_ROOT=/path/to/pepepow-wallet-suite bash scripts/doctor.sh
+```
 
 ## What it checks
-- Host: OS/kernel, CPU/RAM, disk, ulimit, timezone
-- Toolchain: Node (>=18), npm, python3, g++, make, openssl, curl
-- Layout: existence of `/shared`, `/current` with `current` as a symlink (missing `/releases` is a warning)
-- Builds: wallet-core, wallet-api, web dist, optional pepew-api dist
-- Services: systemd presence/enablement for wallet-api, port conflicts (9194, 9193 if present)
-- Config: compares `/etc/pepepow/*.env` against `.env.example` (falls back to `/shared/.env`), lists missing keys (no values shown)
-- Connectivity (if variables exist): Core RPC JSON-RPC, Redis, Telegram getMe
-- Dependency sanity: `node` imports for key modules used by API/core
 
-## Exit codes
-- `0` healthy
-- `10` build-time problems
-- `20` deploy-time problems
-- `30` runtime problems
-- `40` missing/invalid config
+- host/toolchain basics;
+- Git source checkout and working-tree state;
+- wallet-api build output and systemd unit;
+- optional legacy `pepew-api :9193` presence separately;
+- Wallet env keys against `.env.example`;
+- PEPEW Light API `/api/status`;
+- Telegram `getMe` when configured;
+- optional Redis connectivity for the separate legacy `pepew-api`;
+- wallet-core and Web build artifacts.
 
-The summary block at the end shows counts per category and next actions to take. Save reports with:
+It does **not** require the historical `/opt/.../{releases,shared,current}` layout and does not test Wallet `CORE_RPC_URL`, because direct Wallet RPC dependency was retired in M6d.
+
+## Run
+
 ```bash
-scripts/doctor.sh | tee logs/doctor_report.txt
+cd /home/ubuntu/pepepow-wallet-suite
+bash scripts/doctor.sh
 ```
+
+The script does not print secrets. Exit codes remain:
+
+- `0`: healthy
+- `10`: build-time problem
+- `20`: deploy/systemd problem
+- `30`: runtime/connectivity problem
+- `40`: config problem
