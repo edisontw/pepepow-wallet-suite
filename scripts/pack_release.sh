@@ -134,7 +134,7 @@ fi
 echo "[smoke] wallet-api on :$wallet_port"
 (
   cd "$smoke_root/services/wallet-api"
-  PORT="$wallet_port" JWT_SECRET="smoke" PEPEW_API_BASE="http://127.0.0.1:${pepew_port}" node dist/server.js
+  PORT="$wallet_port" JWT_SECRET="smoke" PEPEW_LIGHT_API_BASE="https://light.pepepow.net" node dist/server.js
 ) &
 smoke_pids+=("$!")
 
