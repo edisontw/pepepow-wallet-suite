@@ -31,6 +31,9 @@ assert.match(doctor, /PEPEW Light API:/);
 assert.match(doctor, /\/api\/status/);
 assert.doesNotMatch(doctor, /CORE_RPC_URL|\/releases|\/shared|\/current/);
 assert.doesNotMatch(doctor, /PEPEW_ENV_FILE|pepew-api\||REDIS_URL|redis-cli/);
+assert.doesNotMatch(doctor, /NODE_PATH=/);
+assert.match(doctor, /cd "\$\{CODE_ROOT\}\/services\/wallet-api"/);
+assert.match(doctor, /cd "\$\{CODE_ROOT\}\/packages\/wallet-core"/);
 
 assert.doesNotMatch(packRelease, /PEPEW_API_BASE=/);
 assert.doesNotMatch(envExample, /^(?:PEPEW_API_BASE|CORE_RPC_URL|CORE_RPC_USER|CORE_RPC_PASS|CORE_RPC_TIMEOUT(?:_MS)?)=/m);
