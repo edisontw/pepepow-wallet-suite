@@ -9,7 +9,8 @@
     "build": "tsc",
     "test:m3-bot-light-reads": "node ./tests/m3-bot-light-read-boundary.mjs",
     "test:m6a-legacy-read-cleanup": "node ./tests/m6a-legacy-read-cleanup.mjs",
-    "test:m6b-raw-tx-cleanup": "node ./tests/m6b-raw-tx-cleanup.mjs"
+    "test:m6b-raw-tx-cleanup": "node ./tests/m6b-raw-tx-cleanup.mjs",
+    "test:m6c-direct-broadcast-cleanup": "node ./tests/m6c-direct-broadcast-cleanup.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.6.0",
