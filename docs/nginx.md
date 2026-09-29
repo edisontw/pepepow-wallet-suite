@@ -20,8 +20,8 @@ Each vhost includes:
 For `api.pepepow.net`, the split is intentional:
 
 - root `/health`, `/healthz`, `/readyz`, `/docs`, and selected chain-read `/v1/*` paths belong to `pepew-api`
-- `/wallet/*`, `/api/*`, `/tg/*`, and wallet compatibility `/v1/*` paths belong to `wallet-api`
-- M6a retires wallet-api `POST /v1/history`; the explicit Nginx route may remain temporarily pointed at wallet-api so legacy requests fail closed with 404 until the later Nginx cleanup slice
+- `/wallet/*`, `/api/*`, `/tg/*`, and active wallet/product `/v1/*` paths belong to `wallet-api`
+- retired Wallet chain routes remain fail-closed through explicit tombstones where route fall-through could resurrect legacy behavior
 
 Do not simplify this back into a single default upstream for all `/v1/*` traffic.
 
@@ -80,16 +80,14 @@ Heavy public read paths:
 - `GET /v1/mempool/info`
 - `GET /v1/tx/:txid`
 
-Sensitive wallet paths:
+Sensitive paths:
 
 - `POST /auth/telegram`
 - `POST /api/auth/telegram`
 - `GET /v1/resolve`
 - `POST /v1/requests`
 - `POST /v1/requests/:id/claim`
-- `POST /wallet/tx/send`
-- `POST /api/tx/send`
-- `POST /v1/tx/broadcast`
+- separate legacy `POST /v1/tx/broadcast` on `pepew-api :9193`
 
 ## Certbot notes
 
@@ -103,6 +101,10 @@ sudo certbot certonly --webroot \
 ```
 
 If you prefer `--nginx`, certbot may add or update TLS directives. Keep the HSTS header and proxy headers intact.
+
+## Wallet webroot
+
+The production Wallet SPA is served from `/var/www/pepepow-wallet/`. Do not use the historical `/srv/wallet` path in new deployment config.
 
 ## Verification
 

@@ -1,44 +1,40 @@
-# Non-Docker Deployment (Ubuntu)
+# Non-Docker Wallet Deployment
 
-## Prereqs
-- Node.js 18+ (recommend 20 LTS)
-- nginx
-- systemd
-- certbot (optional)
+The active Wallet production convention is a Git checkout rather than the historical `/opt/.../current` release symlink layout.
 
-## 1) Env
-Create `/etc/pepepow/pepepow-wallet-api.env` and fill secrets.
+## Production paths
 
-## 2) Build + deploy
-From project root:
-```bash
-sudo bash infra/nodocker/deploy.sh /opt/pepepow-wallet-suite
+```text
+source:   /home/ubuntu/pepepow-wallet-suite
+env:      /etc/pepepow/pepepow-wallet-api.env
+webroot:  /var/www/pepepow-wallet/
+service:  pepepow-wallet-api.service
 ```
 
-## 3) systemd
-Copy:
-- `systemd/pepepow-wallet-api.service` -> `/etc/systemd/system/pepepow-wallet-api.service`
+## Deploy
 
-Enable/start:
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now pepepow-wallet-api.service
+cd /home/ubuntu/pepepow-wallet-suite
+git fetch origin main
+git pull --ff-only origin main
+bash scripts/deploy.sh
 ```
 
-## 4) nginx
-Copy:
-- `infra/nginx/api.conf` -> `/etc/nginx/sites-available/api.pepepow.net`
-- `infra/nginx/wallet.conf` -> `/etc/nginx/sites-available/wallet.pepepow.net`
+`infra/nodocker/deploy.sh` is a thin wrapper around the same canonical deploy helper.
 
-Symlink and reload:
+Wallet deployment does not build or restart `pepew-api :9193`.
+
+## Nginx
+
+Repository templates:
+- `ops/nginx/api.conf`
+- `ops/nginx/wallet.conf`
+
+Inspect the live Nginx configuration before replacing it. Validate with:
+
 ```bash
-sudo ln -sf /etc/nginx/sites-available/api.pepepow.net /etc/nginx/sites-enabled/api.pepepow.net
-sudo ln -sf /etc/nginx/sites-available/wallet.pepepow.net /etc/nginx/sites-enabled/wallet.pepepow.net
 sudo nginx -t
-sudo systemctl reload nginx
+sudo nginx -T
 ```
 
-## 5) Telegram webhook
-```bash
-curl -X POST "https://api.telegram.org/bot$BOT_TOKEN/setWebhook"   -d "url=https://api.pepepow.net/tg/webhook"   -d "secret_token=$BOT_SECRET_TOKEN"
-```
+The Wallet SPA webroot is `/var/www/pepepow-wallet/`.

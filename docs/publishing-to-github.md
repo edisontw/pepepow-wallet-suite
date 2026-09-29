@@ -59,4 +59,4 @@ The repo only contains **examples** and **templates**.
 
 ## 5. Continuous Deployment
 
-When updating code, push to GitHub first, then pull/deploy on your server using the existing `scripts/deploy_release.sh` or your preferred method. See `docs/deploy_layout.md` for details.
+When updating code, push to GitHub first, then pull the accepted `main` SHA into `/home/ubuntu/pepepow-wallet-suite` and use `scripts/deploy.sh`. The historical release/symlink deploy path is not the current Wallet production convention. See `docs/deploy_layout.md`.

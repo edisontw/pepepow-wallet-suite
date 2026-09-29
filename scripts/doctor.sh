@@ -1,29 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# No-Docker v4.1.1 doctor for PEPEPOW Wallet Suite
-APP_NAME="${APP_NAME:-pepepow-wallet-suite}"
-APP_ROOT="${APP_ROOT:-/opt/${APP_NAME}}"
+# No-Docker v4.2 doctor for PEPEPOW Wallet Suite
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_CODE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CODE_ROOT="${CODE_ROOT:-}"
-if [[ -z "$CODE_ROOT" ]]; then
-  if [[ -e "${APP_ROOT}/current" ]]; then
-    CODE_ROOT="$(readlink -f "${APP_ROOT}/current" 2>/dev/null || echo "${APP_ROOT}/current")"
-  else
-    CODE_ROOT="$DEFAULT_CODE_ROOT"
-  fi
-fi
+CODE_ROOT="${CODE_ROOT:-$DEFAULT_CODE_ROOT}"
 ENV_FILE="${ENV_FILE:-/etc/pepepow/pepepow-wallet-api.env}"
 PEPEW_ENV_FILE="${PEPEW_ENV_FILE:-/etc/pepepow/pepew-api.env}"
-DEPRECATED_SHARED_ENV="${APP_ROOT}/shared/.env"
-
-if [[ ! -f "$ENV_FILE" && -f "$DEPRECATED_SHARED_ENV" ]]; then
-  ENV_FILE="$DEPRECATED_SHARED_ENV"
-fi
-if [[ ! -f "$PEPEW_ENV_FILE" && -f "$DEPRECATED_SHARED_ENV" ]]; then
-  PEPEW_ENV_FILE="$DEPRECATED_SHARED_ENV"
-fi
 
 build_issues=()
 deploy_issues=()
@@ -104,10 +87,10 @@ check_port() {
   fi
 
   if [[ -n "$listener" ]]; then
-    echo "  port $port: CONFLICT ($listener)"
-    add_issue runtime "Port $port for ${name} already in use by ${listener}"
+    echo "  port $port: listening ($listener)"
   else
-    echo "  port $port: free"
+    echo "  port $port: not listening"
+    add_issue runtime "${name} is not listening on expected port $port"
   fi
 }
 
@@ -158,7 +141,6 @@ collect_env_map() {
 }
 
 section "Context"
-echo "APP_ROOT     : ${APP_ROOT}"
 echo "CODE_ROOT    : ${CODE_ROOT}"
 echo "ENV_FILE     : ${ENV_FILE}"
 echo "Run at       : $(date -Iseconds)"
@@ -191,55 +173,18 @@ check_cmd make "make"
 check_cmd openssl "openssl"
 check_cmd curl "curl"
 
-section "Deployment layout (/opt releases/shared/current pattern)"
-echo "Checking APP_ROOT layout..."
-if [[ ! -d "$APP_ROOT" ]]; then
-  add_issue deploy "APP_ROOT missing at ${APP_ROOT}"
-  echo "- APP_ROOT missing"
+section "Source checkout"
+echo "CODE_ROOT: $CODE_ROOT"
+if [[ ! -d "$CODE_ROOT" ]]; then
+  add_issue deploy "Source checkout missing at ${CODE_ROOT}"
+elif [[ ! -d "$CODE_ROOT/.git" ]]; then
+  add_issue deploy "Source checkout is not a Git worktree (${CODE_ROOT})"
 else
-  echo "- APP_ROOT present"
-fi
-
-current_target=""
-for dir in "${APP_ROOT}/releases" "${APP_ROOT}/shared" "${APP_ROOT}/current"; do
-  if [[ ! -e "$dir" ]]; then
-    if [[ "$dir" == "${APP_ROOT}/releases" ]]; then
-      echo "- ${dir}: missing (warning)"
-    else
-      add_issue deploy "Missing ${dir}"
-      echo "- ${dir}: missing"
-    fi
+  echo "- git SHA: $(git -C "$CODE_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  if [[ -n "$(git -C "$CODE_ROOT" status --short 2>/dev/null || true)" ]]; then
+    echo "- working tree: modified"
   else
-    if [[ "$dir" == "${APP_ROOT}/current" ]]; then
-      if [[ -L "$dir" ]]; then
-        target_path="$(readlink -f "$dir" || true)"
-        current_target="$target_path"
-        echo "- ${dir}: symlink -> ${target_path}"
-        if [[ -n "$target_path" && ! -d "$target_path" ]]; then
-          add_issue deploy "current symlink target missing (${target_path})"
-        fi
-      else
-        current_target="$dir"
-        add_issue deploy "current is not a symlink (${dir})"
-        echo "- ${dir}: not a symlink"
-      fi
-    else
-      echo "- ${dir}: present"
-    fi
-  fi
-done
-
-if [[ -d "${APP_ROOT}/releases" ]]; then
-  release_count="$(find "${APP_ROOT}/releases" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')"
-  echo "- releases count: ${release_count}"
-  if [[ "$release_count" -eq 0 ]]; then
-    echo "- releases warning: no releases found under ${APP_ROOT}/releases"
-  fi
-fi
-
-if [[ -n "$current_target" && -d "$current_target" ]]; then
-  if [[ ! -f "${current_target}/services/wallet-api/dist/server.js" ]]; then
-    add_issue build "wallet-api build output missing (${current_target}/services/wallet-api/dist/server.js)"
+    echo "- working tree: clean"
   fi
 fi
 
@@ -299,8 +244,7 @@ if [[ ! -f "${CODE_ROOT}/apps/web/dist/index.html" ]]; then
 fi
 
 section ".env validation"
-expected_root_keys=()
-while IFS= read -r k; do expected_root_keys+=("$k"); done < <(collect_keys_from_example "${CODE_ROOT}/.env.example")
+expected_root_keys=(PORT PEPEW_LIGHT_API_BASE JWT_SECRET CORS_ORIGINS WALLET_BASE_URL)
 declare -A root_env=()
 while IFS='=' read -r k v; do
   [[ -z "$k" ]] && continue
@@ -340,19 +284,20 @@ else
 fi
 
 section "Connectivity checks"
-core_rpc="${root_env[CORE_RPC_URL]:-}"
-if [[ -n "$core_rpc" ]] && command -v curl >/dev/null 2>&1; then
-  printf "CORE_RPC_URL: %s\n" "$(echo "$core_rpc" | sed 's#://.*@#://****@#')"
-  if curl -s --max-time 5 -X POST "$core_rpc" -H 'Content-Type: application/json' -d '{"jsonrpc":"1.0","id":"doctor","method":"getblockchaininfo","params":[]}'>/tmp/core_rpc_check.json 2>/dev/null; then
-    if (command -v jq >/dev/null 2>&1 && jq . >/dev/null 2>&1 < /tmp/core_rpc_check.json) || grep -q '"result"' /tmp/core_rpc_check.json; then
-      echo "  core RPC reachable"
+light_base="${root_env[PEPEW_LIGHT_API_BASE]:-https://light.pepepow.net}"
+light_base="${light_base%/}"
+if command -v curl >/dev/null 2>&1; then
+  echo "PEPEW Light API: ${light_base}/api/status"
+  if curl -fsS --max-time 8 "${light_base}/api/status" >/tmp/pepew_light_status.json 2>/dev/null; then
+    if (command -v jq >/dev/null 2>&1 && jq -e '.ok == true' /tmp/pepew_light_status.json >/dev/null 2>&1) || grep -q '"ok"[[:space:]]*:[[:space:]]*true' /tmp/pepew_light_status.json; then
+      echo "  Light API status ok"
     else
-      echo "  core RPC responded but unreadable"
-      add_issue runtime "CORE_RPC_URL responded unexpectedly"
+      echo "  Light API status not ok"
+      add_issue runtime "PEPEW Light API /api/status did not report ok=true"
     fi
   else
-    echo "  core RPC unreachable"
-    add_issue runtime "CORE_RPC_URL unreachable (${core_rpc})"
+    echo "  Light API unreachable"
+    add_issue runtime "PEPEW Light API unreachable (${light_base})"
   fi
 fi
 
@@ -409,7 +354,7 @@ echo "Exit code: ${exit_code} (0 ok, 10 build, 20 deploy, 30 runtime, 40 config)
 if [[ "$exit_code" -ne 0 ]]; then
   echo "Next actions:"
   [[ "${#build_issues[@]}" -gt 0 ]] && echo "  - Rebuild missing artifacts or reinstall dependencies."
-  [[ "${#deploy_issues[@]}" -gt 0 ]] && echo "  - Fix layout (/releases,/shared,/current) and systemd enablement."
+  [[ "${#deploy_issues[@]}" -gt 0 ]] && echo "  - Fix the Git checkout path, service files, or systemd enablement."
   [[ "${#runtime_issues[@]}" -gt 0 ]] && echo "  - Resolve port conflicts and connectivity to external services."
   [[ "${#config_issues[@]}" -gt 0 ]] && echo "  - Populate missing .env keys."
 else
