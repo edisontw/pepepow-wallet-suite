@@ -87,10 +87,10 @@ check_port() {
   fi
 
   if [[ -n "$listener" ]]; then
-    echo "  port $port: CONFLICT ($listener)"
-    add_issue runtime "Port $port for ${name} already in use by ${listener}"
+    echo "  port $port: listening ($listener)"
   else
-    echo "  port $port: free"
+    echo "  port $port: not listening"
+    add_issue runtime "${name} is not listening on expected port $port"
   fi
 }
 
@@ -141,7 +141,6 @@ collect_env_map() {
 }
 
 section "Context"
-echo "APP_ROOT     : ${APP_ROOT}"
 echo "CODE_ROOT    : ${CODE_ROOT}"
 echo "ENV_FILE     : ${ENV_FILE}"
 echo "Run at       : $(date -Iseconds)"
@@ -245,8 +244,7 @@ if [[ ! -f "${CODE_ROOT}/apps/web/dist/index.html" ]]; then
 fi
 
 section ".env validation"
-expected_root_keys=()
-while IFS= read -r k; do expected_root_keys+=("$k"); done < <(collect_keys_from_example "${CODE_ROOT}/.env.example")
+expected_root_keys=(PORT PEPEW_LIGHT_API_BASE JWT_SECRET CORS_ORIGINS WALLET_BASE_URL)
 declare -A root_env=()
 while IFS='=' read -r k v; do
   [[ -z "$k" ]] && continue
