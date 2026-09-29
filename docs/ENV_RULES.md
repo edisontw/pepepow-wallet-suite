@@ -34,7 +34,7 @@ Required for production:
 - `PORT` (default: `9194`)
 - `PEPEW_LIGHT_API_BASE` (Telegram Bot chain-read base; default: `https://light.pepepow.net`)
 - `PEPEW_API_BASE` (legacy pepew-api readiness dependency until M6d)
-- `CORE_RPC_URL` (legacy direct-broadcast and RPC readiness/diagnostic dependency until later M6 slices; active Wallet reads/send/fee do not use it)
+- `CORE_RPC_URL` (legacy RPC readiness/diagnostic dependency until M6d; active Wallet reads/send/fee do not use it)
 - `JWT_SECRET` (JWT signing secret)
 - `CORS_ORIGINS` (comma-separated)
 - `WALLET_BASE_URL` (for paylinks)
@@ -48,7 +48,6 @@ Recommended/optional:
 - `TELEGRAM_BOT_TOKEN` (Telegram initData auth)
 - `TELEGRAM_INITDATA_MAX_AGE_SEC` (default: `86400`)
 - `BOT_TOKEN`, `BOT_SECRET_TOKEN` (Telegram bot/webhook)
-- `WALLET_API_DEBUG_RAWTX` (`1` to write raw tx to `/tmp/rawtx.hex`)
 - `WALLET_API_VERSION` (release/version string returned by `/healthz`)
 - `WALLET_API_GIT_SHA` (optional git commit SHA returned by `/healthz`)
 
@@ -56,9 +55,6 @@ Rate limiting (per IP + per JWT subject):
 - `WALLET_API_RATE_LIMIT_READ_WINDOW_MS` (default: `60000`)
 - `WALLET_API_RATE_LIMIT_READ_MAX` (default: `120`)
 - `WALLET_API_RATE_LIMIT_JWT_READ_MAX` (default: same as read max)
-- `WALLET_API_RATE_LIMIT_TX_WINDOW_MS` (default: `600000`)
-- `WALLET_API_RATE_LIMIT_TX_MAX` (default: `20`)
-- `WALLET_API_RATE_LIMIT_JWT_TX_MAX` (default: same as tx max)
 - `WALLET_API_RATE_LIMIT_AUTH_WINDOW_MS` (default: `600000`)
 - `WALLET_API_RATE_LIMIT_AUTH_MAX` (default: `60`)
 
@@ -86,12 +82,9 @@ WALLET_API_GIT_SHA=abcdef1234567890
 WALLET_API_RATE_LIMIT_READ_WINDOW_MS=60000
 WALLET_API_RATE_LIMIT_READ_MAX=120
 WALLET_API_RATE_LIMIT_JWT_READ_MAX=120
-WALLET_API_RATE_LIMIT_TX_WINDOW_MS=600000
-WALLET_API_RATE_LIMIT_TX_MAX=20
-WALLET_API_RATE_LIMIT_JWT_TX_MAX=20
 ```
 
 ## Security principles
 - Non-custodial: mnemonic/private keys must never be sent to or stored on the server.
 - Do not enable any backend signing or storage of secrets.
-- Keep debug flags (like raw tx dumps) off in production unless needed.
+- Keep debug-only runtime flags off in production unless needed.
