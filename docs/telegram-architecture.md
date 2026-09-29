@@ -209,13 +209,7 @@ Never log or display recovery material.
 
 ## Migration compatibility
 
-M6a retired the wallet-api balance/UTXO/history read proxies. M6b removes wallet-api raw-tx compatibility. The remaining legacy compatibility paths are:
-
-```text
-/wallet/tx/broadcast
-/wallet/tx/send
-/api/tx/send
-```
+M6a retired wallet-api balance/UTXO/history read proxies. M6b retired wallet-api raw-tx compatibility. M6c removes wallet-api direct-broadcast compatibility. Wallet chain reads and signed broadcast now use PEPEW Light API; remaining M6 work is readiness/RPC dependency cleanup.
 
 Rules:
 
