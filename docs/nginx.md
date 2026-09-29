@@ -67,10 +67,10 @@ The production `api.pepepow.net` vhost is intended to use these shared zones:
 - `wallet_auth_ip`: `6r/m`
 - `wallet_resolve_ip`: `20r/m`
 - `wallet_request_ip`: `15r/m`
-- `wallet_tx_ip`: `6r/m`, with `burst=12` on transaction broadcast paths
+- `wallet_tx_ip`: `6r/m`, retained for the separate `pepew-api :9193` `/v1/tx/broadcast` compatibility path
 - `api_per_ip_conn`: `20` concurrent connections per IP at the server block
 
-Wallet transaction broadcasts are user-initiated and may happen in short bursts when users test small sends or retry after pending UTXO/indexer updates. The `wallet_tx_ip` limit should allow normal short bursts while still blocking sustained automated sends.
+Wallet API direct-broadcast routes are retired in M6c. The `wallet_tx_ip` Nginx zone remains because the separate `pepew-api :9193` `/v1/tx/broadcast` compatibility route is outside M6c scope.
 
 Heavy public read paths:
 
@@ -87,7 +87,6 @@ Sensitive wallet paths:
 - `GET /v1/resolve`
 - `POST /v1/requests`
 - `POST /v1/requests/:id/claim`
-- `POST /wallet/tx/broadcast`
 - `POST /wallet/tx/send`
 - `POST /api/tx/send`
 - `POST /v1/tx/broadcast`
@@ -150,3 +149,8 @@ sudo systemctl reload nginx
 ### M6b raw-tx tombstone
 
 Keep an explicit `location ^~ /v1/tx/raw/` block that returns `404`. Do not simply delete the block while the broader `/v1/tx/` route still proxies to `pepew-api :9193`, otherwise the retired Wallet raw-tx path can fall through to the legacy chain API.
+
+
+### M6c direct-broadcast tombstones
+
+Keep exact `404` tombstones for `/wallet/tx/broadcast`, `/wallet/tx/send`, and `/api/tx/send`. These paths must not proxy to wallet-api after M6c. The separate `/v1/tx/broadcast` route on `pepew-api :9193` remains outside this slice.
