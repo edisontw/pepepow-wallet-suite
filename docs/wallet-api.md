@@ -13,6 +13,8 @@
 > **M6d PRODUCTION ACCEPTED (2026-09-29):** Wallet API no longer depends on legacy `pepew-api` or direct node RPC for readiness. `/readyz` checks PEPEW Light `/api/status` plus Telegram; RPC health endpoints are retired.
 >
 > **M6e PRODUCTION ACCEPTED (2026-09-29):** Wallet production env, deployment tooling, doctor checks, systemd guidance, webroot, and Nginx retired-route handling are aligned with the current production runtime. Legacy Wallet chain env keys are removed; Wallet doctor is isolated from `pepew-api :9193`.
+>
+> **M6f:** final isolation boundary test is implemented and pending production acceptance. This verifies the Wallet target architecture without deleting the separate legacy `pepew-api :9193` service.
 
 `wallet-api` is the **wallet control plane**. In M6d source it authenticates Telegram users and serves product/control-plane state; chain readiness is aligned to PEPEW Light API rather than direct legacy chain infrastructure. It is **not** a wallet and **not** a custodian.
 

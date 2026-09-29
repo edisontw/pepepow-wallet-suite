@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a–M6e PRODUCTION ACCEPTED. Wallet chain proxies, raw-tx compatibility, direct broadcast, legacy readiness/RPC dependencies, and obsolete production deployment coupling are retired. Final M6f isolation acceptance follows.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a–M6e PRODUCTION ACCEPTED. M6f final isolation boundary test is implemented and pending final production acceptance. Wallet target paths are Light API + Wallet control plane; `pepew-api :9193` remains separate legacy infrastructure.**
 
 ## 1. Core design principles
 

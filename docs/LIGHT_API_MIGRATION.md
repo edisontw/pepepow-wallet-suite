@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a–M6e PRODUCTION ACCEPTED; final M6f isolation acceptance remains.**
+Status: **IN PROGRESS — M6a–M6e PRODUCTION ACCEPTED; M6f final isolation boundary test is implemented and pending production acceptance.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -322,6 +322,21 @@ Production acceptance (2026-09-29): retired Wallet legacy env keys were removed 
 Remaining M6 cleanup after M6d is deployment/config/script documentation cleanup and final production isolation acceptance (M6e/M6f).
 
 Do not remove `pepew-api` itself if other products still consume it.
+
+### M6f — final isolation acceptance
+
+Final boundary requirements:
+
+- Wallet API source contains no legacy Wallet chain read/raw/broadcast/fee routes or direct node RPC calls;
+- Web/Mini App chain access uses PEPEW Light API address/history/UTXO/tx/broadcast endpoints;
+- Wallet env/systemd/deploy/doctor contain no `PEPEW_API_BASE`, `CORE_RPC_*`, `pepew-api :9193`, or Redis dependency;
+- retired Wallet Nginx routes remain absent or explicit 404 tombstones;
+- Wallet readiness reports only target dependencies (`pepewLight` and Telegram when enabled);
+- `pepew-api :9193` remains available only as a separate legacy service for its own consumers, including its independent compatibility routes.
+
+Automated boundary: `npm --prefix services/wallet-api run test:m6f-final-isolation`.
+
+Production acceptance does not require another Wallet restart if the accepted M6e runtime SHA is unchanged; run the final isolation test, confirm the live env/systemd/Nginx/readiness boundaries, and repeat Telegram `/balance` and `/history` smoke tests.
 
 Update:
 
