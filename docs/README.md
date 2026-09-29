@@ -1,44 +1,53 @@
 # Documentation Map
 
-Use this page to find the right document based on your role.
+Use this page to find the authoritative document for the task at hand.
 
-## For Users (Non-Technical)
-- `docs/telegram-user-guide.md` - How to use the Telegram wallet (simple steps).
-- `docs/security.md` - Safety rules for protecting your mnemonic and funds.
+> **Wallet migration status:** M6 is complete. The production Wallet architecture is Wallet API control plane + PEPEW Light API chain data plane.
 
-## For Developers
-- `docs/architecture.md` - Approved target Wallet/Telegram architecture and component boundaries.
-- `docs/LIGHT_API_MIGRATION.md` - Authoritative staged migration from local wallet chain access to PEPEW Light API / ElectrumX.
-- `docs/telegram-architecture.md` - Telegram Bot/Mini App/control-plane flows.
-- `docs/wallet-api.md` - Current wallet-api endpoints and security model; legacy chain endpoints remain transitional until migration completes.
-- `docs/pepew-api.md` - Legacy pepew-api integration overview; no new Telegram Wallet chain dependencies should be added here.
-- `docs/devmm.md` - DevMM bot commands, guards, and operator-facing usage.
-- `docs/DEVMM_BUG_FRAMEWORK.md` - DevMM failure taxonomy, guardrails, and regression framework.
-- `docs/DEVMM_INCIDENT_TEMPLATE.md` - Incident record template for repeated DevMM bugs.
+## For Users
+
+- `docs/telegram-user-guide.md` — Telegram wallet usage.
+- `docs/security.md` — mnemonic/private-key safety and non-custodial guarantees.
+
+## For Wallet Developers
+
+- `docs/DEV_COMPASS.md` — engineering guardrails, repository navigation, and current accepted status.
+- `docs/architecture.md` — current production Wallet/Telegram architecture and component boundaries.
+- `docs/telegram-architecture.md` — Telegram Bot, Mini App, auth, balance/history, and send flows.
+- `docs/wallet-api.md` — current Wallet API control-plane endpoints and security model.
+- `docs/ENV_RULES.md` — Wallet runtime/build-time environment variables and secrets policy.
+- `docs/LIGHT_API_MIGRATION.md` — completed M0-M6 Light API migration history, tests, and acceptance evidence.
+- `docs/pepew-api.md` — separate legacy `pepew-api :9193` service. Do not create new Wallet dependencies on it.
 
 ## For Operators / DevOps
-- `docs/runtime.md` - Runbook, health checks, and common failures.
-- `docs/deploy_layout.md` - Release directory layout.
-- `docs/deploy-web.md` - Web UI deployment.
-- `docs/systemd.md` - Service unit setup.
-- `docs/nginx.md` - Reverse proxy guidance.
-- `docs/nginx-hardening-minimal.md` - Baseline Nginx hardening.
-- `docs/nginx-rate-limit-pepew-api.md` - Existing production rate limiting for pepew-api.
-- `docs/api-defense-strategy.md` - Security posture for wallet-api vs public chain APIs.
-- `docs/telegram-troubleshooting.md` - Telegram Mini App and initData troubleshooting.
-- `scripts/devmm-doctor.sh` - One-shot DevMM status + log diagnostics.
-- `scripts/cleanup-devmm-logs.sh` - DevMM log retention cleanup helper for cron/systemd timer.
 
-## For AI Agents / Internal Engineering Only
-- `docs/DEV_COMPASS.md` - Repository navigation, architecture target, and hard guardrails.
-- `docs/LIGHT_API_MIGRATION.md` - Milestone order, validation, rollback, and migration completion criteria.
-- `docs/ENV_RULES.md` - Environment variables and secrets policy.
-- `docs/telegram-botfather-setup.md` - BotFather and webhook setup (operator-focused).
-- `docs/publishing-to-github.md` - Internal release workflow.
+- `docs/runtime.md` — current production paths, readiness, deployment, and troubleshooting.
+- `docs/deploy_layout.md` — active Git-checkout deployment convention and rollback guidance.
+- `docs/deploy-web.md` — static Web Wallet deployment.
+- `docs/systemd.md` — Wallet API unit and environment setup.
+- `docs/nginx.md` — public path routing, retired-route tombstones, and verification.
+- `docs/nginx-hardening-minimal.md` — baseline Nginx hardening.
+- `docs/nginx-rate-limit-pepew-api.md` — rate limiting for the separate legacy/public pepew-api surface.
+- `docs/api-defense-strategy.md` — API security posture and service boundary considerations.
+- `docs/telegram-troubleshooting.md` — Telegram Mini App and initData troubleshooting.
 
-## Authority and transition rules
+## Trade / DevMM
+
+- `docs/TRADE_ARCHITECTURE.md` — Trade security boundary and architecture.
+- `docs/TRADE_STRATEGIES_SPEC.md` — strategy specifications.
+- `docs/trade-api.md` — Trade API.
+- `docs/trade-bot.md` — Trade Bot.
+- `docs/devmm.md` — DevMM operator commands.
+- `docs/DEVMM_BUG_FRAMEWORK.md` — DevMM failure taxonomy and regression framework.
+- `docs/DEVMM_INCIDENT_TEMPLATE.md` — incident template.
+- `scripts/devmm-doctor.sh` — DevMM diagnostic helper.
+- `scripts/cleanup-devmm-logs.sh` — DevMM log retention helper.
+
+## Authority rules
+
 - `docs/security.md` is authoritative for non-custodial guarantees.
-- `docs/LIGHT_API_MIGRATION.md` is authoritative for the Light API migration sequence.
-- `docs/architecture.md` describes the approved target architecture.
-- `docs/wallet-api.md` continues to describe current legacy-compatible runtime endpoints until they are actually removed.
-- `docs/runtime.md` is authoritative for on-call troubleshooting.
+- `docs/DEV_COMPASS.md` is authoritative for Wallet engineering guardrails and current accepted state.
+- `docs/architecture.md` describes the current Wallet target architecture now live in production.
+- `docs/wallet-api.md` describes current Wallet API endpoints; retired chain proxy/RPC endpoints must not be reintroduced.
+- `docs/runtime.md` is authoritative for current Wallet production runtime conventions.
+- `docs/LIGHT_API_MIGRATION.md` is the historical/acceptance record for the completed M0-M6 migration.

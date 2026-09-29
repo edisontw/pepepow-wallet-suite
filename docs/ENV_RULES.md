@@ -59,12 +59,12 @@ Rate limiting (per IP + per JWT subject):
 - `WALLET_API_RATE_LIMIT_AUTH_MAX` (default: `60`)
 
 ## Web wallet build-time variables
-- `VITE_API_BASE` (legacy wallet-api/product API base; default: `https://api.pepepow.net`)
+- `VITE_API_BASE` (Wallet API product/control-plane base; default: `https://api.pepepow.net`)
 - `VITE_PEPEW_LIGHT_API_BASE_URL` (PEPEW Light chain API base; default: `https://light.pepepow.net`)
 
-M2 moved Mini App/Web Wallet chain reads to Light API. M3 moved Telegram Bot `/balance` and `/history` to the server-side `PEPEW_LIGHT_API_BASE`. M4 moved signed broadcast to Light API. M5 moved fee calculation client-side. M6a-M6d retire Wallet chain proxies, raw-tx compatibility, direct broadcast, and legacy readiness/RPC dependencies.
+M2 moved Mini App/Web Wallet chain reads to Light API. M3 moved Telegram Bot `/balance` and `/history` to the server-side `PEPEW_LIGHT_API_BASE`. M4 moved signed broadcast to Light API. M5 moved fee calculation client-side. M6a-M6f completed retirement of Wallet chain proxies, raw-tx compatibility, direct broadcast, legacy readiness/RPC dependencies, and obsolete deployment coupling.
 
-These values are baked at build time (Vite). Changing them requires a rebuild.
+`VITE_*` values are baked at build time by Vite. Changing them requires a Web Wallet rebuild. Server-side Wallet API variables are read at runtime from the systemd EnvironmentFile.
 
 ## Example: `/etc/pepepow/pepepow-wallet-api.env`
 ```

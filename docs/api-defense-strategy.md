@@ -1,59 +1,121 @@
-# API Defense Strategy: wallet-api vs pepew-api
+# API Defense Strategy
 
-This document focuses on operational defense and rate limiting. It complements `docs/security.md` without repeating the non-custodial principles.
+This document covers operational defense and rate limiting for the Wallet control plane, PEPEW Light API data plane, and the separate legacy pepew-api surface. Non-custodial guarantees remain authoritative in `docs/security.md`.
 
-## Threat Model Differences
+## Service boundaries
 
-### wallet-api
-- Authenticated surface (Telegram JWT).
-- Small number of write-capable product endpoints (profile binding, payment requests).
-- Higher sensitivity per request (identity binding and product-state changes).
-- Lower expected traffic volume.
+### wallet-api :9194
 
-### pepew-api
-- Public read-only API with no user identity.
-- High-volume, high-scan surface (address, tx, history queries).
-- Primary DoS target due to public access and indexer cost.
-- Serves external consumers beyond the wallet UI.
+Purpose: Telegram/product control plane.
 
-## Why pepew-api Needs Stricter Rate Limits
-- It is the public entry point for chain data and will be scanned.
-- Address and tx queries can be expensive (index lookups, cache misses).
-- High-volume abuse affects explorer, wallet, and third-party integrations.
-- Rate limiting reduces load amplification and protects the node/indexer.
+Characteristics:
 
-## Endpoints Most Likely to be Abused
+- Telegram/JWT-authenticated product surface.
+- Stores only minimal product metadata such as public address bindings and payment requests.
+- Does not provide Wallet balance/UTXO/history/raw-tx/broadcast chain routes.
+- Does not use direct pepepowd RPC.
+- Higher sensitivity per authenticated state-changing request, but lower expected traffic volume.
 
-**pepew-api high-risk paths:**
-- `/v1/addr/:address/utxos`
-- `/v1/addr/:address/txs`
-- `/v1/addr/:address/balance`
-- `/v1/tx/:txid`
-- `/v1/utxos` (batch)
-- `/v1/history` (batch)
-- `/v1/mempool/info`
+High-risk examples:
 
-**wallet-api high-risk paths:**
-- `/auth/telegram` (initData validation + JWT issue)
-- `/v1/resolve` (username/address probing)
+- `POST /auth/telegram`
+- `POST /api/auth/telegram`
+- `GET /v1/resolve`
+- payment request / claim routes
+- default-address binding changes
 
-## Cloudflare / Nginx / App Layer Responsibilities
+### PEPEW Light API
 
-**Cloudflare (edge):**
-- Global WAF rules, bot filtering, DDoS protection.
-- Global request rate caps to avoid volumetric spikes.
+Purpose: Wallet blockchain data plane.
 
-**Nginx (origin edge):**
-- Path-based rate limits for pepew-api vs wallet-api.
-- Restrict admin or debug endpoints if any are added.
-- Enforce TLS and standard security headers.
+Base:
 
-**App layer (Node services):**
-- JWT validation and user-specific limits.
-- Input validation for product/control-plane inputs.
-- Per-route rate limiting for auth/read/product-state flows.
+```text
+https://light.pepepow.net
+```
 
-## Relationship to `security.md`
-- `security.md` defines non-custodial guarantees and user safety.
-- This file defines **operational defenses** against abuse and load.
-- Keep `security.md` authoritative for key custody and trust boundaries.
+Wallet contract:
+
+```text
+GET  /api/wallet/address/{address}
+GET  /api/wallet/history/{address}
+GET  /api/wallet/utxo/{address}
+GET  /api/wallet/tx/{txid}
+POST /api/wallet/broadcast
+```
+
+Characteristics:
+
+- public chain-data queries;
+- potentially high-volume address/history/UTXO/tx access;
+- accepts only already-signed raw transactions for broadcast;
+- must enforce input validation, request-size limits, rate limits, bounded timeouts, and safe error handling;
+- must never receive mnemonic/private-key/signing requests.
+
+An uncertain broadcast POST must not be blindly retried.
+
+### legacy pepew-api :9193
+
+Purpose: separate legacy/public compatibility service for non-Wallet consumers.
+
+Characteristics:
+
+- may expose legacy chain read/broadcast compatibility paths;
+- may depend on node RPC/Redis/ZMQ;
+- remains a separate operational security surface;
+- new Wallet features must not depend on it.
+
+Its Nginx rate-limit policy remains documented separately in `docs/nginx-rate-limit-pepew-api.md`.
+
+## Defense layers
+
+### Edge / CDN
+
+- DDoS mitigation and bot filtering.
+- Global request-rate controls.
+- TLS enforcement.
+- Avoid exposing private ElectrumX or pepepowd interfaces.
+
+### Nginx
+
+- Route Wallet control-plane paths to `:9194`.
+- Keep retired Wallet chain routes absent or fail-closed with explicit 404 tombstones where broader legacy routes could otherwise catch them.
+- Apply service-appropriate rate limits.
+- Validate configuration before reload with `nginx -t`.
+- Avoid duplicate active vhosts or backup files under `sites-enabled`.
+
+### Application layer
+
+wallet-api:
+
+- validate Telegram `initData`;
+- validate JWTs;
+- rate-limit auth and product-state operations;
+- validate public addresses and product inputs;
+- never log secrets or recovery material.
+
+PEPEW Light API:
+
+- validate addresses/txids/raw transaction size and encoding;
+- apply bounded upstream timeouts;
+- rate-limit expensive read and broadcast paths;
+- treat broadcast uncertainty carefully and do not automatically retry;
+- return safe errors without leaking infrastructure secrets.
+
+## Boundary rule
+
+The operational defense model must preserve the architecture boundary:
+
+```text
+Wallet identity/product state -> wallet-api :9194
+Wallet chain data/broadcast   -> PEPEW Light API
+Other legacy consumers        -> pepew-api :9193 (separate)
+```
+
+Do not solve an availability problem by reintroducing Wallet direct RPC or legacy Wallet chain proxy dependencies.
+
+## Relationship to security.md
+
+- `docs/security.md` defines key custody, signing, and trust boundaries.
+- This file defines abuse/load defenses and service separation.
+- `docs/runtime.md` defines current production runtime and operational checks.

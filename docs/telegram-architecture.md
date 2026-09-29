@@ -1,8 +1,8 @@
 # Telegram Architecture: Bot, Mini App, and Wallet Control Plane
 
-> Target architecture for the PEPEW Light migration.
+> Current production Telegram/Wallet architecture.
 >
-> Runtime migration status is tracked in `docs/LIGHT_API_MIGRATION.md`. M0 is documentation-only; legacy chain proxy/RPC endpoints may still exist until later milestones.
+> The PEPEW Light migration M0-M6 is complete. Wallet chain access uses PEPEW Light API; Wallet API remains the Telegram/product control plane.
 
 ## Roles
 
@@ -32,7 +32,7 @@ The wallet UI inside Telegram.
 
 Telegram/product control plane.
 
-Target responsibilities:
+Responsibilities:
 
 - verify Telegram WebApp `initData`;
 - issue short-lived JWT;
@@ -42,7 +42,7 @@ Target responsibilities:
 - payment request / claim flows;
 - Telegram webhook.
 
-Target non-responsibilities:
+Non-responsibilities:
 
 - balance/UTXO/history proxy;
 - raw transaction lookup for signing;
@@ -108,7 +108,7 @@ Bot
 
 ### /balance
 
-Current after M3:
+Current production flow:
 
 ```text
 Bot
@@ -118,7 +118,7 @@ Bot
  -> format balance
 ```
 
-M3 follows this flow and no longer routes Bot balance through `wallet-api /wallet/balance`.
+The retired `wallet-api /wallet/balance` proxy must not be reintroduced.
 
 ### /history
 
@@ -131,7 +131,7 @@ Bot
  -> format recent transactions
 ```
 
-M3 follows this flow and no longer routes Bot history through `wallet-api /wallet/history`.
+The retired `wallet-api /wallet/history` proxy must not be reintroduced.
 
 ### /send
 
@@ -207,24 +207,26 @@ Forbidden:
 
 Never log or display recovery material.
 
-## Migration compatibility
+## Migration status and compatibility boundary
 
-M6a retired wallet-api balance/UTXO/history read proxies. M6b retired wallet-api raw-tx compatibility. M6c removes wallet-api direct-broadcast compatibility. Wallet chain reads and signed broadcast now use PEPEW Light API; remaining M6 work is readiness/RPC dependency cleanup.
+M6a-M6f are production accepted.
+
+Retired Wallet paths include balance/UTXO/history proxies, raw-tx compatibility, direct Wallet broadcast aliases, fee estimation, direct RPC readiness, and legacy chain env dependencies.
 
 Rules:
 
-- no new feature may adopt a legacy path;
-- migrate Mini App reads before removing endpoints;
-- migrate Bot reads separately;
-- migrate signed broadcast only after parity testing;
-- keep rollback possible until each milestone is accepted.
+- no new feature may adopt a retired Wallet chain path;
+- Bot chain reads use PEPEW Light API;
+- Mini App/Web Wallet chain reads and signed broadcast use PEPEW Light API;
+- wallet-api remains limited to Telegram/product control-plane responsibilities;
+- `pepew-api :9193` is a separate legacy service, not a Wallet dependency.
 
-## Acceptance target
+## Production acceptance
 
-After migration:
+The accepted production boundary requires:
 
-- stopping/blocking Wallet Suite access to local pepepowd RPC does not break Bot balance/history;
-- Mini App balance/history/UTXO/tx lookup still work;
-- Mini App can broadcast a correctly signed transaction through PEPEW Light API;
+- blocking Wallet Suite access to local pepepowd RPC does not break Bot balance/history;
+- Mini App balance/history/UTXO/tx lookup continue through PEPEW Light API;
+- a correctly signed transaction can be broadcast through PEPEW Light API;
 - Telegram identity and payment-request functions continue through wallet-api;
 - no secret material appears in backend DB, logs, requests, or responses.

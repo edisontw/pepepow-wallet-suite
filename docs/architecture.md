@@ -1,8 +1,8 @@
 # Architecture: PEPEPOW Wallet Suite
 
-> Status: **approved target architecture** for the PEPEW Light migration.
+> Status: **current production Wallet architecture**.
 >
-> M0 is documentation-only. Production runtime may still use legacy `wallet-api -> pepew-api -> pepepowd` and direct RPC paths until M1-M6 in `docs/LIGHT_API_MIGRATION.md` are completed.
+> The PEPEW Light migration M0-M6 is complete and production accepted. Wallet API is the Telegram/product control plane; PEPEW Light API is the Wallet blockchain data plane. The separate `pepew-api :9193` service is legacy infrastructure for other consumers only.
 
 ## Core principles
 
@@ -14,7 +14,7 @@ The Wallet Suite is non-custodial.
 - Only public addresses, txids, read options, product metadata, and already-signed raw transactions may cross the wallet API boundary.
 - Telegram identity/product functions and blockchain chain-access functions are separate domains.
 
-## Target architecture
+## Current production architecture
 
 ```mermaid
 graph TD
@@ -89,7 +89,7 @@ PEPEW  8 decimal places
 
 ### wallet-api :9194
 
-Target role: authenticated **control plane** for Telegram/product features.
+Role: authenticated **control plane** for Telegram/product features.
 
 Responsibilities:
 
@@ -102,7 +102,7 @@ Responsibilities:
 - Telegram bot webhook;
 - other product-specific state that does not require wallet secrets.
 
-The target wallet-api does **not**:
+wallet-api does **not**:
 
 - index chain data;
 - proxy balance/UTXO/history;
@@ -179,22 +179,20 @@ derive sender locally
  -> refresh/reconcile wallet state
 ```
 
-## Transitional runtime
+## Runtime dependencies and legacy isolation
 
-The following are legacy migration paths, not the target architecture:
+Wallet API readiness checks only the dependencies it actually uses:
 
 ```text
 wallet-api -> PEPEW Light API /api/status
 wallet-api -> Telegram Bot API getMe
 ```
 
-M6a retired read proxies, M6b raw-tx compatibility, M6c direct wallet-api broadcast, and M6d source removes Wallet API `pepew-api`/direct-RPC readiness dependencies. `pepew-api :9193` remains a separate legacy service for other consumers.
+Wallet API no longer depends on `pepew-api :9193`, Redis, or direct `pepepowd` RPC. The separate `pepew-api :9193` service may continue serving its own legacy/public consumers, but new Wallet code must not depend on it.
 
-### M5 fee policy
+### Fee policy
 
-M5 uses a deterministic client-side P2PKH size policy with a 0.0001 PEPEW minimum and 0.0001 PEPEW/kB rate. The Mini App/Web Wallet computes the transaction fee locally from input/output count, and wallet-api no longer exposes `/wallet/fee/estimate`.
-
-Remaining wallet-api direct-RPC compatibility and diagnostic paths are legacy and deferred to M6 cleanup.
+The Mini App/Web Wallet uses a deterministic client-side P2PKH size policy with a 0.0001 PEPEW minimum and 0.0001 PEPEW/kB rate. Fee calculation is local and does not require Wallet API or direct RPC.
 
 ## Repository boundaries
 
@@ -225,27 +223,27 @@ Allowed when needed:
 
 Avoid long-term identity/address/IP correlation not required for product operation.
 
-## Migration and rollback discipline
+## Change discipline
 
-Follow `docs/LIGHT_API_MIGRATION.md`.
+The migration history and acceptance evidence remain in `docs/LIGHT_API_MIGRATION.md`.
 
-Each runtime milestone must:
+For new changes:
 
-1. change one coherent layer;
-2. preserve a rollback path;
-3. compare old/new response semantics;
-4. test invalid address, timeout, 429, upstream failure, and stale UTXO behavior where applicable;
+1. preserve non-custodial boundaries;
+2. keep Wallet chain access on PEPEW Light API;
+3. make the smallest coherent change;
+4. test invalid address, timeout, 429, upstream failure, stale UTXO, and uncertain broadcast behavior where applicable;
 5. verify no mnemonic/private key crosses a network boundary;
-6. update docs when behavior changes.
+6. update docs when runtime behavior changes.
 
-## Final architecture acceptance
+## Production acceptance state
 
-Migration is complete only when Wallet Suite can lose access to local pepepowd RPC without breaking:
+The final architecture was production accepted on 2026-09-29:
 
-- Telegram Bot balance/history;
-- Mini App balance/history;
-- UTXO lookup;
-- previous transaction lookup;
-- signed transaction broadcast.
-
-Fee policy must also be independent from Wallet API direct RPC by that point.
+- Telegram Bot balance/history use PEPEW Light API;
+- Mini App balance/history/UTXO/tx lookup use PEPEW Light API;
+- signed transaction broadcast uses PEPEW Light API;
+- fee calculation is client-side;
+- Wallet API has no direct node RPC dependency;
+- Wallet API remains the Telegram/product control plane;
+- legacy Wallet chain proxy/raw/broadcast endpoints are retired and fail closed.
