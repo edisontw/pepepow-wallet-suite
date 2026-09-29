@@ -8,9 +8,11 @@
 >
 > **M6b PRODUCTION ACCEPTED (2026-09-29):** Wallet API raw-tx compatibility routes/cache/RPC fallback are retired in production and return 404.
 >
-> **M6c PRODUCTION ACCEPTED (2026-09-29):** Wallet API direct-broadcast routes and direct `sendrawtransaction` implementation are retired in production and return 404. RPC health/readiness remains for M6d.
+> **M6c PRODUCTION ACCEPTED (2026-09-29):** Wallet API direct-broadcast routes and direct `sendrawtransaction` implementation are retired in production and return 404.
+>
+> **M6d:** Wallet API legacy `pepew-api`/direct-RPC readiness is removed in source and pending production acceptance. `/readyz` now checks PEPEW Light `/api/status` plus Telegram.
 
-`wallet-api` is the **wallet control plane**. In the current M6c source it authenticates Telegram users and serves product/control-plane state; only readiness/diagnostic dependencies still reach legacy chain infrastructure. These are scheduled for M6d removal. It is **not** a wallet and **not** a custodian.
+`wallet-api` is the **wallet control plane**. In M6d source it authenticates Telegram users and serves product/control-plane state; chain readiness is aligned to PEPEW Light API rather than direct legacy chain infrastructure. It is **not** a wallet and **not** a custodian.
 
 ## Positioning and Non-Goals
 
@@ -59,11 +61,9 @@
 | Method | Path | Purpose | JWT Required |
 | --- | --- | --- | --- |
 | GET | `/healthz` | Liveness | No |
-| GET | `/readyz` | Dependency readiness | No |
-| GET | `/healthz/rpc` | Core RPC health | No |
+| GET | `/readyz` | PEPEW Light + Telegram dependency readiness | No |
 | GET | `/wallet/healthz` | Liveness | No |
-| GET | `/wallet/readyz` | Dependency readiness | No |
-| GET | `/wallet/healthz/rpc` | Core RPC health | No |
+| GET | `/wallet/readyz` | Alias of Wallet readiness | No |
 | GET | `/wallet/price` | Alias of `/v1/price` | No |
 | GET | `/api/price` | Alias of `/v1/price` | No |
 | POST | `/api/paylink/create` | Create JWT-signed payment link | No |

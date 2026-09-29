@@ -21,7 +21,5 @@ assert.doesNotMatch(api, /history:\s*"\/v1\/history"/);
 assert.match(server, /app\.get\("\/wallet\/healthz"/);
 assert.match(server, /app\.get\("\/wallet\/price"/);
 assert.match(server, /app\.get\("\/v1\/address\/default"/);
-assert.match(server, /PEPEW_API_BASE/);
-assert.match(server, /CORE_RPC_URL/);
 
 console.log("m6a-legacy-read-cleanup: ok");

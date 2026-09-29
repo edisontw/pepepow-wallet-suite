@@ -21,15 +21,6 @@ for (const retired of [
   assert.ok(!server.includes(retired), `retired raw-tx implementation still present: ${retired}`);
 }
 
-for (const preserved of [
-  "getCoreRpcRequestConfig",
-  "checkCoreRpc",
-  "PEPEW_API_BASE",
-  "CORE_RPC_URL",
-]) {
-  assert.ok(server.includes(preserved), `later-M6 compatibility boundary missing: ${preserved}`);
-}
-
 for (const [name, nginx] of [["ops", opsNginx], ["infra", infraNginx]]) {
   assert.match(
     nginx,

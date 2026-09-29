@@ -33,15 +33,11 @@ sudo systemctl status pepepow-wallet-api.service --no-pager
 Required for production:
 - `PORT` (default: `9194`)
 - `PEPEW_LIGHT_API_BASE` (Telegram Bot chain-read base; default: `https://light.pepepow.net`)
-- `PEPEW_API_BASE` (legacy pepew-api readiness dependency until M6d)
-- `CORE_RPC_URL` (legacy RPC readiness/diagnostic dependency until M6d; active Wallet reads/send/fee do not use it)
 - `JWT_SECRET` (JWT signing secret)
 - `CORS_ORIGINS` (comma-separated)
 - `WALLET_BASE_URL` (for paylinks)
 
 Recommended/optional:
-- `CORE_RPC_USER`, `CORE_RPC_PASS` (if not embedded in `CORE_RPC_URL`)
-- `CORE_RPC_TIMEOUT_MS` (default: `10000`)
 - `CMC_API_KEY` (enables `/wallet/price`)
 - `CMC_SYMBOL` (default: `PEPEW`)
 - `CMC_CONVERT` (default: `USD`)
@@ -62,7 +58,7 @@ Rate limiting (per IP + per JWT subject):
 - `VITE_API_BASE` (legacy wallet-api/product API base; default: `https://api.pepepow.net`)
 - `VITE_PEPEW_LIGHT_API_BASE_URL` (PEPEW Light chain API base; default: `https://light.pepepow.net`)
 
-M2 moved Mini App/Web Wallet chain reads to Light API. M3 moved Telegram Bot `/balance` and `/history` to the server-side `PEPEW_LIGHT_API_BASE`. M4 moved signed broadcast to Light API. M5 uses a client-side size-based fee policy and no longer consumes wallet-api fee estimation.
+M2 moved Mini App/Web Wallet chain reads to Light API. M3 moved Telegram Bot `/balance` and `/history` to the server-side `PEPEW_LIGHT_API_BASE`. M4 moved signed broadcast to Light API. M5 moved fee calculation client-side. M6a-M6d retire Wallet chain proxies, raw-tx compatibility, direct broadcast, and legacy readiness/RPC dependencies.
 
 These values are baked at build time (Vite). Changing them requires a rebuild.
 
@@ -71,8 +67,6 @@ These values are baked at build time (Vite). Changing them requires a rebuild.
 PORT=9194
 NODE_ENV=production
 PEPEW_LIGHT_API_BASE=https://light.pepepow.net
-PEPEW_API_BASE=https://api.pepepow.net
-CORE_RPC_URL=http://127.0.0.1:8093
 JWT_SECRET=replace-with-strong-secret
 CORS_ORIGINS=https://wallet.pepepow.net
 WALLET_BASE_URL=https://wallet.pepepow.net

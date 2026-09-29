@@ -37,9 +37,7 @@ const {
   BOT_TOKEN,
   BOT_SECRET_TOKEN,
   JWT_SECRET,
-  PEPEW_API_BASE,
   PEPEW_LIGHT_API_BASE,
-  CORE_RPC_URL,
   CORS_ORIGINS,
   CMC_API_KEY,
   TELEGRAM_BOT_TOKEN,
@@ -94,8 +92,7 @@ const serviceName = "wallet-api";
 
 function logStartupConfig() {
   const missing: string[] = [];
-  if (!PEPEW_API_BASE) missing.push("PEPEW_API_BASE (legacy readiness dependency)");
-  if (!CORE_RPC_URL) missing.push("CORE_RPC_URL (defaulting to http://127.0.0.1:8093)");
+  if (!PEPEW_LIGHT_API_BASE) missing.push("PEPEW_LIGHT_API_BASE (defaulting to https://light.pepepow.net)");
   if (!telegramInitToken) missing.push("TELEGRAM_BOT_TOKEN (Telegram initData auth disabled)");
   if (!BOT_TOKEN) missing.push("BOT_TOKEN (Telegram bot disabled)");
   if (!BOT_SECRET_TOKEN) missing.push("BOT_SECRET_TOKEN (webhook auth disabled)");
@@ -109,11 +106,6 @@ function logStartupConfig() {
   if (telegramInitToken && !isLikelyTelegramToken(telegramInitToken)) {
     console.warn("[startup] Telegram bot token format looks invalid; expected '<bot_id>:<token>'.");
   }
-}
-
-function normalizeApiBase(base: string) {
-  const trimmed = base.replace(/\/+$/, "");
-  return trimmed.replace(/\/v1$/, "");
 }
 
 function isLikelyTelegramToken(token: string) {
@@ -247,56 +239,6 @@ async function getCmcPriceCached(): Promise<PriceResponse> {
   };
 }
 
-function getCoreRpcRequestConfig() {
-  const raw = process.env.CORE_RPC_URL || "http://127.0.0.1:8093";
-  let url = raw;
-  let urlUser = "";
-  let urlPass = "";
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-
-  try {
-    const parsed = new URL(raw);
-    if (parsed.username || parsed.password) {
-      urlUser = decodeURIComponent(parsed.username || "");
-      urlPass = decodeURIComponent(parsed.password || "");
-      parsed.username = "";
-      parsed.password = "";
-      url = parsed.toString();
-    }
-  } catch {
-    if (raw.includes("@")) {
-      url = raw.replace(/\/\/[^@]*@/, "//");
-    }
-  }
-
-  const envUser = process.env.CORE_RPC_USER;
-  const envPass = process.env.CORE_RPC_PASS;
-  const finalUser = envUser || urlUser;
-  const finalPass = envPass || urlPass;
-  if (finalUser || finalPass) {
-    const auth = Buffer.from(`${finalUser}:${finalPass}`).toString("base64");
-    headers.Authorization = `Basic ${auth}`;
-  }
-
-  return { url, headers };
-}
-
-function getCoreRpcHostLabel() {
-  const raw = process.env.CORE_RPC_URL || "http://127.0.0.1:8093";
-  try {
-    const parsed = new URL(raw);
-    const host = parsed.hostname;
-    const port = parsed.port || (parsed.protocol === "https:" ? "443" : parsed.protocol === "http:" ? "80" : "");
-    if (host) return port ? `${host}:${port}` : host;
-  } catch {
-    // fall through to string parsing
-  }
-  const withoutCreds = raw.includes("@") ? raw.replace(/^[^@]*@/, "") : raw;
-  const cleaned = withoutCreds.replace(/^[a-zA-Z]+:\/\//, "");
-  const hostPort = cleaned.split("/")[0];
-  return hostPort || "unknown";
-}
-
 function isTransientFetchError(err: any) {
   const code = typeof err?.code === "string" ? err.code : "";
   if (err?.name === "AbortError") return true;
@@ -321,10 +263,6 @@ function mergeHeaders(input: any, requestId?: string) {
     out["x-request-id"] = requestId;
   }
   return out;
-}
-
-function isTimeoutErrorMessage(message: string) {
-  return /\btimeout\b/i.test(message);
 }
 
 type FetchRetryPolicy = {
@@ -422,59 +360,20 @@ function errorWithRequestId(
   });
 }
 
-async function checkPepewApi() {
-  if (!PEPEW_API_BASE) return { ok: false, error: "PEPEW_API_BASE not set" };
-  const base = normalizeApiBase(PEPEW_API_BASE);
-  const urls = [`${base}/readyz`, `${base}/healthz`, `${base}/health`];
-  let lastError = "";
-  for (const url of urls) {
-    try {
-      const { res, data } = await fetchJson(url, { method: "GET" }, 5000);
-      if (res.status === 404) {
-        lastError = `not found: ${url}`;
-        continue;
-      }
-      if (!res.ok) {
-        return { ok: false, error: `HTTP ${res.status} from ${url}` };
-      }
-      if (data && typeof data.ok === "boolean" && !data.ok) {
-        return { ok: false, error: data.error || "upstream not ok" };
-      }
-      return { ok: true };
-    } catch (err: any) {
-      lastError = classifyFetchError(err, url);
-    }
-  }
-  return { ok: false, error: lastError || "upstream health check failed" };
-}
-
-async function checkCoreRpc() {
-  const { url, headers } = getCoreRpcRequestConfig();
-  const timeoutMs = parseEnvNumber(
-    process.env.CORE_RPC_CHECK_TIMEOUT_MS || process.env.CORE_RPC_TIMEOUT_MS || process.env.CORE_RPC_TIMEOUT,
-    5000
-  );
+async function checkPepewLightApi() {
+  const url = `${getPepewLightApiBase()}/api/status`;
   try {
-    const { res, data } = await fetchJson(
-      url,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          jsonrpc: "1.0",
-          id: "health",
-          method: "getblockcount",
-          params: [],
-        }),
-      },
-      timeoutMs
-    );
-    if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: `RPC auth failed (${res.status}). Check CORE_RPC_URL credentials or pepepowd rpcuser/rpcpassword.` };
+    const { res, data } = await fetchJson(url, { method: "GET", headers: { Accept: "application/json" } }, 5000);
+    if (!res.ok) {
+      return { ok: false, error: `HTTP ${res.status} from ${url}` };
     }
-    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-    if (data?.error) return { ok: false, error: `RPC error: ${JSON.stringify(data.error)}` };
-    return { ok: true, height: data?.result };
+    if (!data || data.ok !== true) {
+      return { ok: false, error: data?.error || "Light API status not ok" };
+    }
+    return {
+      ok: true,
+      ...(data?.electrumx?.height !== undefined ? { height: data.electrumx.height } : {}),
+    };
   } catch (err: any) {
     return { ok: false, error: classifyFetchError(err, url) };
   }
@@ -513,11 +412,8 @@ async function checkTelegram(logFailures = false) {
 
 function summarizeDependencyErrors(deps: Record<string, any>) {
   const errors: string[] = [];
-  if (deps.pepewApi && !deps.pepewApi.ok) {
-    errors.push(`pepew-api: ${deps.pepewApi.error || "unreachable"}`);
-  }
-  if (deps.coreRpc && !deps.coreRpc.ok) {
-    errors.push(`core-rpc: ${deps.coreRpc.error || "unreachable"}`);
+  if (deps.pepewLight && !deps.pepewLight.ok) {
+    errors.push(`pepew-light: ${deps.pepewLight.error || "unreachable"}`);
   }
   if (deps.telegram && !deps.telegram.ok) {
     errors.push(`telegram: ${deps.telegram.error || "unreachable"}`);
@@ -526,13 +422,12 @@ function summarizeDependencyErrors(deps: Record<string, any>) {
 }
 
 async function checkDependencies(logFailures = false) {
-  const [api, rpc, bot] = await Promise.all([
-    checkPepewApi(),
-    checkCoreRpc(),
+  const [light, bot] = await Promise.all([
+    checkPepewLightApi(),
     checkTelegram(logFailures),
   ]);
-  const ok = api.ok && rpc.ok && bot.ok;
-  return { ok, deps: { pepewApi: api, coreRpc: rpc, telegram: bot } };
+  const ok = light.ok && bot.ok;
+  return { ok, deps: { pepewLight: light, telegram: bot } };
 }
 
 logStartupConfig();
@@ -717,59 +612,8 @@ app.get("/wallet/healthz", async (_req, res) => {
   return res.json(buildHealthzPayload());
 });
 
-async function handleRpcHealthz(req: express.Request, res: express.Response) {
-  const { url, headers } = getCoreRpcRequestConfig();
-  const startedAt = Date.now();
-  const rpcTimeoutMs = parseEnvNumber(process.env.CORE_RPC_TIMEOUT_MS || process.env.CORE_RPC_TIMEOUT, 4000);
-  const rpcHost = getCoreRpcHostLabel();
-  try {
-    const { res: rpcRes, data } = await fetchJson(
-      url,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          jsonrpc: "1.0",
-          id: "healthz",
-          method: "getblockcount",
-          params: [],
-        }),
-      },
-      rpcTimeoutMs,
-      {
-        requestId: getRequestId(req),
-        label: "rpc.healthz.getblockcount",
-        retry: { maxRetries: 1, backoffMs: [200, 500], retryOnStatuses: [502, 503] }
-      }
-    );
-    const latencyMs = Date.now() - startedAt;
-    if (!rpcRes.ok || data?.error) {
-      const detail = data?.error?.message || data?.error || `RPC HTTP ${rpcRes.status}`;
-      return errorWithRequestId(req, res, 503, "RPC_UNAVAILABLE", String(detail), { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
-    }
-    const height = data?.result;
-    if (!Number.isFinite(height)) {
-      return errorWithRequestId(req, res, 503, "RPC_INVALID_DATA", "invalid block height", { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
-    }
-    return res.json({ ok: true, height, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs, requestId: getRequestId(req) });
-  } catch (err: any) {
-    const latencyMs = Date.now() - startedAt;
-    const detail = classifyFetchError(err, url);
-    if (isTimeoutErrorMessage(detail)) {
-      return errorWithRequestId(req, res, 504, "RPC_TIMEOUT", detail, { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
-    }
-    return errorWithRequestId(req, res, 503, "RPC_UNAVAILABLE", detail, { ok: false, latencyMs, rpcHost, timeoutMs: rpcTimeoutMs });
-  }
-}
-
-app.get("/healthz/rpc", handleRpcHealthz);
-app.get("/wallet/healthz/rpc", handleRpcHealthz);
-
 async function handleReadyz(_req: express.Request, res: express.Response) {
   const status = await checkDependencies();
-  if ((status.deps as any)?.coreRpc?.height !== undefined) {
-    res.setHeader("x-block-height", String((status.deps as any).coreRpc.height));
-  }
   const errors = status.ok ? [] : summarizeDependencyErrors(status.deps);
   return res.status(status.ok ? 200 : 503).json({
     ok: status.ok,
@@ -1073,12 +917,12 @@ async function botFetchJson(url: string, options: any = {}, timeoutMs = 8000): P
   }
 }
 
-function getBotLightApiBase(): string {
+function getPepewLightApiBase(): string {
   return (PEPEW_LIGHT_API_BASE || "https://light.pepepow.net").trim().replace(/\/+$/, "");
 }
 
 async function botFetchLightJson(path: string, label: string): Promise<any> {
-  const url = `${getBotLightApiBase()}${path.startsWith("/") ? path : `/${path}`}`;
+  const url = `${getPepewLightApiBase()}${path.startsWith("/") ? path : `/${path}`}`;
   return fetchJson(
     url,
     { method: "GET", headers: { Accept: "application/json" } },

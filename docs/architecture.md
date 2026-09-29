@@ -184,11 +184,11 @@ derive sender locally
 The following are legacy migration paths, not the target architecture:
 
 ```text
-wallet-api CORE_RPC_URL
-wallet-api -> pepew-api readiness dependency
+wallet-api -> PEPEW Light API /api/status
+wallet-api -> Telegram Bot API getMe
 ```
 
-The read proxies were retired in M6a, raw-tx compatibility in M6b, and direct wallet-api broadcast in M6c source. The remaining entries are readiness/diagnostic dependencies scheduled for M6d. New code must not depend on them.
+M6a retired read proxies, M6b raw-tx compatibility, M6c direct wallet-api broadcast, and M6d source removes Wallet API `pepew-api`/direct-RPC readiness dependencies. `pepew-api :9193` remains a separate legacy service for other consumers.
 
 ### M5 fee policy
 

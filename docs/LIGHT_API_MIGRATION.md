@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a, M6b, and M6c PRODUCTION ACCEPTED; next slice is M6d readiness/RPC decoupling.**
+Status: **IN PROGRESS — M6a, M6b, and M6c PRODUCTION ACCEPTED; M6d readiness/RPC decoupling is implemented in source and pending production acceptance.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -293,10 +293,19 @@ Code scope:
 
 Production acceptance (2026-09-29): post-Light-API-cutover access logs showed zero calls to the three retired Wallet direct-broadcast routes; wallet-api build plus M2/M3/M4/M5/M6a/M6b/M6c boundary tests passed; `/healthz` and `/readyz` passed after restart; all three direct-broadcast routes returned 404 locally; the public `/wallet/tx/broadcast` path also returned 404 through the existing Nginx proxy to wallet-api; Telegram `/balance` and `/history` passed. `PEPEW_API_BASE` and `CORE_RPC_URL` readiness/diagnostic dependencies remain for M6d.
 
-Remaining M6 cleanup includes:
+### M6d — readiness/RPC decoupling
 
-- Wallet dependency on `pepew-api :9193` readiness;
-- Wallet direct `CORE_RPC_URL` readiness/diagnostic dependency.
+Code scope:
+
+- remove Wallet API `PEPEW_API_BASE`, `CORE_RPC_URL`, `CORE_RPC_USER`, `CORE_RPC_PASS`, and `CORE_RPC_TIMEOUT*` usage;
+- remove direct `getblockcount` readiness checks and `/healthz/rpc`, `/wallet/healthz/rpc`;
+- make Wallet API `/readyz` depend on PEPEW Light API `GET /api/status` plus Telegram instead of `pepew-api :9193` and direct node RPC;
+- keep `PEPEW_LIGHT_API_BASE` as the Bot chain-read dependency;
+- do not remove `pepew-api` itself or its separate `/v1/tx/broadcast`, because other consumers may still use it.
+
+Production deployment gate: verify the retired RPC-health endpoints have no legitimate consumers, build/test the wallet-api, restart, and confirm `/readyz` reports `pepewLight` + `telegram` with no `pepewApi` or `coreRpc` dependency. Production env cleanup and broader legacy deploy/script documentation cleanup follow in M6e.
+
+Remaining M6 cleanup after M6d is deployment/config/script documentation cleanup and final production isolation acceptance (M6e/M6f).
 
 Do not remove `pepew-api` itself if other products still consume it.
 
