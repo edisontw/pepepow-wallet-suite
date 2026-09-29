@@ -22,10 +22,6 @@ for (const retired of [
 }
 
 for (const preserved of [
-  'app.post("/wallet/tx/broadcast"',
-  'app.post("/wallet/tx/send"',
-  'app.post("/api/tx/send"',
-  "sendrawtransaction",
   "getCoreRpcRequestConfig",
   "checkCoreRpc",
   "PEPEW_API_BASE",
