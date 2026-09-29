@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a–M6d PRODUCTION ACCEPTED; M6e deployment/config/script cleanup is implemented in source and pending production cleanup/acceptance; M6f remains.**
+Status: **IN PROGRESS — M6a–M6e PRODUCTION ACCEPTED; final M6f isolation acceptance remains.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -317,7 +317,7 @@ Source scope:
 - keep fail-closed tombstones for raw-tx/direct-broadcast routes that could otherwise fall through;
 - retain `pepew-api :9193` itself and its separate consumers.
 
-Production cleanup gate: remove the retired Wallet legacy env keys from `/etc/pepepow/pepepow-wallet-api.env`, inspect the live unit and Nginx config before replacing anything, run the updated doctor/deploy checks, and verify Wallet health/readiness plus Telegram smoke tests.
+Production acceptance (2026-09-29): retired Wallet legacy env keys were removed with a backup retained; Wallet API restarted successfully and `/readyz` reported only `pepewLight` + `telegram`; the updated Wallet doctor returned exit code 0; duplicate Nginx `api.pepepow.net` backup loading was removed; the active API vhost passed `nginx -t`; retired raw/broadcast/history paths were fail-closed with public 404 responses; Telegram `/balance` and `/history` passed.
 
 Remaining M6 cleanup after M6d is deployment/config/script documentation cleanup and final production isolation acceptance (M6e/M6f).
 
