@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a, M6b, M6c, and M6d PRODUCTION ACCEPTED; M6e/M6f remain.**
+Status: **IN PROGRESS — M6a–M6d PRODUCTION ACCEPTED; M6e deployment/config/script cleanup is implemented in source and pending production cleanup/acceptance; M6f remains.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -304,6 +304,20 @@ Code scope:
 - do not remove `pepew-api` itself or its separate `/v1/tx/broadcast`, because other consumers may still use it.
 
 Production acceptance (2026-09-29): retired RPC-health endpoint consumer check passed; wallet-api build and M3/M6a/M6b/M6c/M6d plus Web M2/M4/M5 regression checks passed; after restart `/healthz` passed, `/readyz` reported `pepewLight` + `telegram` with no `pepewApi` or `coreRpc`, retired `/healthz/rpc` routes returned 404, and Telegram `/balance` and `/history` passed. Production env cleanup and broader deploy/script documentation cleanup follow in M6e.
+
+### M6e — deployment/config/script cleanup
+
+Source scope:
+
+- make the verified Git checkout deployment model authoritative for Wallet production;
+- remove Wallet deploy/doctor assumptions about `/opt/.../current`, release symlinks, and Wallet `CORE_RPC_URL`;
+- make Wallet deploy build/restart Wallet components only, without coupling to `pepew-api :9193`;
+- align Wallet systemd templates and static webroot with the verified production paths;
+- remove the retired explicit Nginx `/v1/history` compatibility route;
+- keep fail-closed tombstones for raw-tx/direct-broadcast routes that could otherwise fall through;
+- retain `pepew-api :9193` itself and its separate consumers.
+
+Production cleanup gate: remove the retired Wallet legacy env keys from `/etc/pepepow/pepepow-wallet-api.env`, inspect the live unit and Nginx config before replacing anything, run the updated doctor/deploy checks, and verify Wallet health/readiness plus Telegram smoke tests.
 
 Remaining M6 cleanup after M6d is deployment/config/script documentation cleanup and final production isolation acceptance (M6e/M6f).
 
