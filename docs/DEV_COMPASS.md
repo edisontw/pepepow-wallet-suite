@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a, M6b, and M6c PRODUCTION ACCEPTED. M6d readiness/RPC decoupling is implemented in source and pending production acceptance. Wallet readiness now targets PEPEW Light API + Telegram instead of `pepew-api :9193` + direct node RPC.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a, M6b, M6c, and M6d PRODUCTION ACCEPTED. Wallet chain proxies, raw-tx compatibility, direct broadcast, and legacy readiness/RPC dependencies are retired. Next: M6e deployment/config/script cleanup, then final M6f isolation acceptance.**
 
 ## 1. Core design principles
 

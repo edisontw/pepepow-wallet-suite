@@ -10,7 +10,7 @@
 >
 > **M6c PRODUCTION ACCEPTED (2026-09-29):** Wallet API direct-broadcast routes and direct `sendrawtransaction` implementation are retired in production and return 404.
 >
-> **M6d:** Wallet API legacy `pepew-api`/direct-RPC readiness is removed in source and pending production acceptance. `/readyz` now checks PEPEW Light `/api/status` plus Telegram.
+> **M6d PRODUCTION ACCEPTED (2026-09-29):** Wallet API no longer depends on legacy `pepew-api` or direct node RPC for readiness. `/readyz` checks PEPEW Light `/api/status` plus Telegram; RPC health endpoints are retired.
 
 `wallet-api` is the **wallet control plane**. In M6d source it authenticates Telegram users and serves product/control-plane state; chain readiness is aligned to PEPEW Light API rather than direct legacy chain infrastructure. It is **not** a wallet and **not** a custodian.
 
