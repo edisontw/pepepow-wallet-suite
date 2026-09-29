@@ -259,18 +259,38 @@ else
 fi
 
 section "Node dependency sanity"
-export NODE_PATH="${CODE_ROOT}/node_modules:${CODE_ROOT}/services/wallet-api/node_modules:${CODE_ROOT}/apps/web/node_modules:${CODE_ROOT}/packages/wallet-core/node_modules"
 if command -v node >/dev/null 2>&1; then
-  if node --input-type=module - <<'NODE'
-const mods = ['express','node-fetch','jsonwebtoken','grammy','bitcoinjs-lib','bip39','bs58check'];
-Promise.all(mods.map(m => import(m)))
-  .then(() => { console.log('module imports ok'); })
-  .catch(err => { console.error(err); process.exit(1); });
+  wallet_import_ok=0
+  core_import_ok=0
+
+  if (
+    cd "${CODE_ROOT}/services/wallet-api"
+    node --input-type=module - <<'NODE'
+const mods = ['express', 'node-fetch', 'jsonwebtoken', 'grammy', 'bs58check'];
+await Promise.all(mods.map((m) => import(m)));
+console.log('wallet-api module imports ok');
 NODE
-  then
-    echo "Imports: ok"
+  ); then
+    wallet_import_ok=1
   else
-    add_issue build "Node module import failed (see above)"
+    add_issue build "wallet-api module import failed (see above)"
+  fi
+
+  if (
+    cd "${CODE_ROOT}/packages/wallet-core"
+    node --input-type=module - <<'NODE'
+const mods = ['bitcoinjs-lib', 'bip39', 'bs58check'];
+await Promise.all(mods.map((m) => import(m)));
+console.log('wallet-core module imports ok');
+NODE
+  ); then
+    core_import_ok=1
+  else
+    add_issue build "wallet-core module import failed (see above)"
+  fi
+
+  if [[ "$wallet_import_ok" -eq 1 && "$core_import_ok" -eq 1 ]]; then
+    echo "Imports: ok"
   fi
 else
   echo "Node unavailable, skipping module imports"
