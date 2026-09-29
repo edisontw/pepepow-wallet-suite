@@ -47,8 +47,9 @@ for (const nginx of [opsWallet, infraWallet]) {
   assert.match(nginx, /root \/var\/www\/pepepow-wallet;/);
 }
 
-for (const doc of [envRules, runtime, systemdDoc, layoutDoc]) {
+for (const doc of [envRules, runtime, systemdDoc]) {
   assert.doesNotMatch(doc, /\/opt\/pepepow-wallet-suite\/current/);
 }
+assert.match(layoutDoc, /not the active Wallet production convention/);
 
 console.log("m6e-deployment-config-cleanup: ok");
