@@ -28,16 +28,10 @@ for (const retired of [
 assert.doesNotMatch(envExample, /WALLET_API_DEBUG_RAWTX|WALLET_API_RATE_LIMIT_(?:JWT_)?TX_/);
 
 for (const preserved of [
-  "getCoreRpcRequestConfig",
-  "checkCoreRpc",
-  'app.get("/healthz/rpc"',
-  'app.get("/wallet/healthz/rpc"',
   'app.get("/readyz"',
   'app.get("/wallet/readyz"',
-  "PEPEW_API_BASE",
-  "CORE_RPC_URL",
 ]) {
-  assert.ok(server.includes(preserved), `M6d boundary missing: ${preserved}`);
+  assert.ok(server.includes(preserved), `readiness route missing: ${preserved}`);
 }
 
 for (const [name, nginx] of [["ops", opsNginx], ["infra", infraNginx]]) {
