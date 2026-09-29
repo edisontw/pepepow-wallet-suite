@@ -265,10 +265,6 @@ function mergeHeaders(input: any, requestId?: string) {
   return out;
 }
 
-function isTimeoutErrorMessage(message: string) {
-  return /\btimeout\b/i.test(message);
-}
-
 type FetchRetryPolicy = {
   maxRetries?: number;
   backoffMs?: number[];
