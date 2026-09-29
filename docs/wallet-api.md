@@ -16,7 +16,7 @@
 >
 > **M6f PRODUCTION ACCEPTED (2026-09-29):** final isolation passed. Wallet API/Web/env/systemd/deploy/doctor/Nginx boundaries are isolated from legacy Wallet chain dependencies; the separate `pepew-api :9193` service remains available only for its own legacy consumers.
 
-`wallet-api` is the **wallet control plane**. In M6d source it authenticates Telegram users and serves product/control-plane state; chain readiness is aligned to PEPEW Light API rather than direct legacy chain infrastructure. It is **not** a wallet and **not** a custodian.
+`wallet-api` is the **Wallet control plane**. It authenticates Telegram users and serves product/control-plane state; chain readiness is aligned to PEPEW Light API rather than direct legacy chain infrastructure. It is **not** a wallet and **not** a custodian.
 
 ## Positioning and Non-Goals
 
@@ -74,22 +74,23 @@
 | GET | `/api/paylink/verify` | Verify payment link token | No |
 | POST | `/tg/webhook` | Telegram bot webhook | No (verified by secret token header) |
 
-## pepew-api vs wallet-api (Quick Comparison)
+## Service boundary comparison
 
-| Dimension | wallet-api | pepew-api |
-| --- | --- | --- |
-| Purpose | Wallet control plane | Chain data indexer / proxy |
-| Auth | JWT (Telegram identity) | No auth (public) |
-| Writes | Product/control-plane state only | Chain API compatibility/read operations |
-| Data Store | Minimal Telegram metadata (SQLite) | Cache/index data (Redis, node) |
-| Threat Surface | Auth/product-state abuse | High-volume scraping / DoS |
+| Dimension | wallet-api | PEPEW Light API | legacy pepew-api |
+| --- | --- | --- | --- |
+| Purpose | Telegram/product control plane | Wallet blockchain data plane | Separate legacy/public chain API |
+| Wallet dependency | Required for identity/product features | Required for Wallet chain access | None |
+| Auth | JWT / Telegram identity | Public Wallet query/broadcast contract | Service-specific/public compatibility |
+| Writes | Product/control-plane state only | Already-signed raw transaction broadcast | Legacy compatibility surface |
+| Wallet secrets | Forbidden | Forbidden | Forbidden |
+| Direct Wallet signing | Never | Never | Never |
 
-## Why wallet-api Does NOT Provide a Balance Index
+## Why wallet-api Does NOT Provide Chain Indexing
 
-- Indexing belongs to `pepew-api`, which is built for read-heavy chain queries.
-- Keeping `wallet-api` stateless and minimal reduces attack surface.
+- Wallet chain indexing/query responsibility belongs to PEPEW Light API backed by ElectrumX.
+- Keeping `wallet-api` focused on product/control-plane state reduces attack surface.
 - Avoids duplicated chain state and inconsistent indexing logic.
-- Keeps the wallet control plane focused on auth, payment requests, and user bindings.
+- Keeps Telegram identity/payment metadata separate from blockchain data-plane responsibilities.
 
 ## Security Notes
 
@@ -105,11 +106,11 @@
 - `wallet-api` trusts a single proxy hop (`trust proxy = 1`).
 
 ### Rate Limiting (Conceptual)
-- Separate limiters for auth, read, and tx flows.
-- IP-based limits with optional JWT-subject limits.
-- Tx endpoints are intentionally stricter than read endpoints.
+- Wallet API applies limits to auth and product/control-plane reads/actions.
+- IP-based limits may be combined with JWT-subject limits.
+- Signed blockchain broadcast is not a Wallet API responsibility; PEPEW Light API owns that chain-facing rate-limit boundary.
 
-For production-level limits, see `docs/nginx-rate-limit-pepew-api.md` and `docs/security.md`.
+For public legacy pepew-api limits, see `docs/nginx-rate-limit-pepew-api.md`. For Wallet security principles, see `docs/security.md`.
 
 ### Telegram Webhook Secret
 - `POST /tg/webhook` validates `x-telegram-bot-api-secret-token` when `BOT_SECRET_TOKEN` is set.
