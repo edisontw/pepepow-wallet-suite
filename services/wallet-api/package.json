@@ -12,7 +12,8 @@
     "test:m6b-raw-tx-cleanup": "node ./tests/m6b-raw-tx-cleanup.mjs",
     "test:m6c-direct-broadcast-cleanup": "node ./tests/m6c-direct-broadcast-cleanup.mjs",
     "test:m6d-readiness-rpc-decoupling": "node ./tests/m6d-readiness-rpc-decoupling.mjs",
-    "test:m6e-deployment-config-cleanup": "node ./tests/m6e-deployment-config-cleanup.mjs"
+    "test:m6e-deployment-config-cleanup": "node ./tests/m6e-deployment-config-cleanup.mjs",
+    "test:m6f-final-isolation": "node ./tests/m6f-final-isolation.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.6.0",
