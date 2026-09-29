@@ -9,12 +9,16 @@ This project depends on systemd-managed environment files in production. Do not 
 The systemd unit only loads `/etc/pepepow/pepepow-wallet-api.env`. Do not set `Environment=` entries for runtime configuration in the unit.
 
 ## Systemd unit location
-Canonical unit file in the repo:
-- `/opt/pepepow-wallet-suite/current/systemd/pepepow-wallet-api.service`
+Current production checkout:
+- `/home/ubuntu/pepepow-wallet-suite`
 
-Install/update:
+Checked-in Wallet unit:
+- `/home/ubuntu/pepepow-wallet-suite/systemd/pepepow-wallet-api.service`
+
+Before replacing the live unit, inspect it with `sudo systemctl cat pepepow-wallet-api.service`. Install/update only after confirming the paths:
 ```bash
-sudo cp /opt/pepepow-wallet-suite/current/systemd/pepepow-wallet-api.service /etc/systemd/system/pepepow-wallet-api.service
+cd /home/ubuntu/pepepow-wallet-suite
+sudo cp systemd/pepepow-wallet-api.service /etc/systemd/system/pepepow-wallet-api.service
 sudo systemctl daemon-reload
 sudo systemctl restart pepepow-wallet-api.service
 sudo systemctl status pepepow-wallet-api.service --no-pager
