@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a PRODUCTION ACCEPTED on 2026-09-28 at `bfcb581`; M6b raw-tx cleanup is implemented in source and pending production access-log verification/acceptance.**
+Status: **IN PROGRESS — M6a PRODUCTION ACCEPTED on 2026-09-28 at `bfcb581`; M6b PRODUCTION ACCEPTED on 2026-09-29 at `77ab1c9`; remaining M6 slices are not yet complete.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -276,7 +276,7 @@ Code scope:
 - keep an explicit Nginx `/v1/tx/raw/` 404 tombstone so requests cannot fall through to the broader `pepew-api :9193` `/v1/tx/` route;
 - preserve direct broadcast compatibility, RPC health/readiness, `PEPEW_API_BASE`, and `CORE_RPC_URL` for later M6 slices.
 
-Production deployment gate: verify post-Light-API-cutover access logs show no legitimate consumers of the retired raw-tx routes. Repo-level Web/Mini App/Bot consumer search is clean.
+Production acceptance (2026-09-29): post-Light-API-cutover access logs showed zero calls to the retired raw-tx routes; wallet-api build plus M2/M3/M4/M5/M6a/M6b boundary tests passed; `/healthz` and `/readyz` passed after restart; all five raw-tx routes returned 404; direct broadcast compatibility remained available; public Nginx still explicitly routed `/v1/tx/raw/` to wallet-api `:9194`, so there was no fall-through to `pepew-api :9193`; Telegram `/balance` and `/history` passed.
 
 Remaining M6 cleanup includes:
 

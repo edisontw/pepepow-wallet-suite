@@ -6,7 +6,7 @@
 >
 > **M6a PRODUCTION ACCEPTED (2026-09-28):** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired and return 404.
 >
-> **M6b:** Wallet API raw-tx compatibility routes/cache/RPC fallback are removed in source and pending production acceptance. Direct-broadcast compatibility remains for a later M6 slice.
+> **M6b PRODUCTION ACCEPTED (2026-09-29):** Wallet API raw-tx compatibility routes/cache/RPC fallback are retired in production and return 404. Direct-broadcast compatibility remains for M6c.
 
 `wallet-api` is the **wallet control plane**. In the current transitional source it still authenticates Telegram users and issues short-lived JWTs; direct broadcast plus readiness/diagnostic paths are the remaining legacy chain dependencies. These are scheduled for later M6 removal. It is **not** a wallet and **not** a custodian.
 
