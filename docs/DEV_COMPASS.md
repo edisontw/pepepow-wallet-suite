@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a, M6b, and M6c PRODUCTION ACCEPTED. Wallet read proxies, raw-tx compatibility, and direct Wallet broadcast are retired. Next slice: M6d readiness/RPC decoupling.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a, M6b, and M6c PRODUCTION ACCEPTED. M6d readiness/RPC decoupling is implemented in source and pending production acceptance. Wallet readiness now targets PEPEW Light API + Telegram instead of `pepew-api :9193` + direct node RPC.**
 
 ## 1. Core design principles
 
@@ -178,7 +178,7 @@ Rules:
 - the fee field is informational/read-only, not a server-provided estimate;
 - do not add a PEPEW Light API fee endpoint for this policy.
 
-The client fee policy and Wallet API cleanup both passed production acceptance on 2026-09-28. The legacy `GET /wallet/fee/estimate` route and its direct `estimatesmartfee` call are no longer served in production. Remaining `CORE_RPC_URL` uses are legacy compatibility/diagnostic paths reserved for M6 cleanup, not active fee calculation.
+The client fee policy and Wallet API cleanup passed production acceptance. The legacy fee RPC, read proxies, raw-tx compatibility, and direct Wallet broadcast have been retired; M6d source also removes Wallet API direct node RPC/readiness dependencies.
 
 ## 6. Light API client rules
 
