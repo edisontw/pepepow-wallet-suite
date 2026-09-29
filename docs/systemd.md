@@ -25,7 +25,7 @@ sudo systemctl show pepepow-wallet-api.service \
   -p ExecStart -p WorkingDirectory -p EnvironmentFiles
 ```
 
-Do not assume the historical `/opt/pepepow-wallet-suite/current` release/symlink layout is active.
+Do not assume a historical `/opt/.../current` release/symlink layout is active.
 
 ## Wallet API environment
 
