@@ -17,15 +17,27 @@ const [server, webApi, lightClient, envExample, walletUnit, deploy, doctor, opsA
   read("pepew-api/pepew-api/src/routes/tx.ts"),
 ]);
 
-const retiredWalletSurface = [
-  "/wallet/balance",
-  "/wallet/utxos",
-  "/wallet/history",
-  "/wallet/tx/raw",
-  "/wallet/tx/broadcast",
-  "/wallet/tx/send",
-  "/api/tx/send",
-  "/wallet/fee/estimate",
+const retiredWalletRouteRegistrations = [
+  /app\.get\("\/wallet\/balance"/,
+  /app\.get\("\/wallet\/utxos"/,
+  /app\.get\("\/wallet\/history"/,
+  /app\.post\("\/v1\/history"/,
+  /app\.get\("\/wallet\/tx\/raw"/,
+  /app\.get\("\/api\/tx\/raw"/,
+  /app\.get\("\/v1\/tx\/raw\/:txid"/,
+  /app\.post\("\/wallet\/tx\/raw\/batch"/,
+  /app\.post\("\/api\/tx\/raw\/batch"/,
+  /app\.post\("\/wallet\/tx\/broadcast"/,
+  /app\.post\("\/wallet\/tx\/send"/,
+  /app\.post\("\/api\/tx\/send"/,
+  /app\.get\("\/wallet\/fee\/estimate"/,
+];
+
+for (const retired of retiredWalletRouteRegistrations) {
+  assert.doesNotMatch(server, retired, `wallet-api legacy route still registered: ${retired}`);
+}
+
+for (const retired of [
   "PEPEW_API_BASE",
   "CORE_RPC_URL",
   "CORE_RPC_USER",
@@ -33,9 +45,7 @@ const retiredWalletSurface = [
   "getrawtransaction",
   "sendrawtransaction",
   "estimatesmartfee",
-];
-
-for (const retired of retiredWalletSurface) {
+]) {
   assert.ok(!server.includes(retired), `wallet-api legacy dependency present: ${retired}`);
 }
 
