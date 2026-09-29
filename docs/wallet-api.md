@@ -6,9 +6,11 @@
 >
 > **M6a PRODUCTION ACCEPTED (2026-09-28):** `GET /wallet/balance`, `GET /wallet/utxos`, `GET /wallet/history`, and wallet-api `POST /v1/history` are retired and return 404.
 >
-> **M6b PRODUCTION ACCEPTED (2026-09-29):** Wallet API raw-tx compatibility routes/cache/RPC fallback are retired in production and return 404. Direct-broadcast compatibility remains for M6c.
+> **M6b PRODUCTION ACCEPTED (2026-09-29):** Wallet API raw-tx compatibility routes/cache/RPC fallback are retired in production and return 404.
+>
+> **M6c:** Wallet API direct-broadcast routes and direct `sendrawtransaction` implementation are removed in source and pending production acceptance. RPC health/readiness remains for M6d.
 
-`wallet-api` is the **wallet control plane**. In the current transitional source it still authenticates Telegram users and issues short-lived JWTs; direct broadcast plus readiness/diagnostic paths are the remaining legacy chain dependencies. These are scheduled for later M6 removal. It is **not** a wallet and **not** a custodian.
+`wallet-api` is the **wallet control plane**. In the current M6c source it authenticates Telegram users and serves product/control-plane state; only readiness/diagnostic dependencies still reach legacy chain infrastructure. These are scheduled for M6d removal. It is **not** a wallet and **not** a custodian.
 
 ## Positioning and Non-Goals
 
@@ -16,7 +18,6 @@
 - Telegram identity verification (WebApp `initData`).
 - JWT issuance and rotation.
 - Minimal, wallet-specific state (Telegram user <-> default address, payment requests).
-- Transitional raw transaction broadcast to core RPC (scheduled for removal after Light API broadcast cutover).
 
 **What it is NOT:**
 - A key store (no mnemonics, no private keys).
@@ -63,9 +64,6 @@
 | GET | `/wallet/healthz` | Liveness | No |
 | GET | `/wallet/readyz` | Dependency readiness | No |
 | GET | `/wallet/healthz/rpc` | Core RPC health | No |
-| POST | `/wallet/tx/broadcast` | Broadcast raw tx to core RPC | No |
-| POST | `/wallet/tx/send` | Alias of `/wallet/tx/broadcast` | No |
-| POST | `/api/tx/send` | Legacy alias of `/wallet/tx/broadcast` | No |
 | GET | `/wallet/price` | Alias of `/v1/price` | No |
 | GET | `/api/price` | Alias of `/v1/price` | No |
 | POST | `/api/paylink/create` | Create JWT-signed payment link | No |
@@ -78,16 +76,16 @@
 | --- | --- | --- |
 | Purpose | Wallet control plane | Chain data indexer / proxy |
 | Auth | JWT (Telegram identity) | No auth (public) |
-| Writes | Broadcast raw tx only | Read-only in wallet usage |
+| Writes | Product/control-plane state only | Chain API compatibility/read operations |
 | Data Store | Minimal Telegram metadata (SQLite) | Cache/index data (Redis, node) |
-| Threat Surface | Auth abuse, broadcast spam | High-volume scraping / DoS |
+| Threat Surface | Auth/product-state abuse | High-volume scraping / DoS |
 
 ## Why wallet-api Does NOT Provide a Balance Index
 
 - Indexing belongs to `pepew-api`, which is built for read-heavy chain queries.
 - Keeping `wallet-api` stateless and minimal reduces attack surface.
 - Avoids duplicated chain state and inconsistent indexing logic.
-- Keeps the wallet control plane focused on auth, broadcast, and user bindings.
+- Keeps the wallet control plane focused on auth, payment requests, and user bindings.
 
 ## Security Notes
 
