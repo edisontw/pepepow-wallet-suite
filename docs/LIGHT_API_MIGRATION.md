@@ -245,7 +245,7 @@ Acceptance:
 
 ## M6 — Legacy cleanup
 
-Status: **IN PROGRESS — M6a–M6e PRODUCTION ACCEPTED; M6f final isolation boundary test is implemented and pending production acceptance.**
+Status: **COMPLETE — M6a–M6f PRODUCTION ACCEPTED on 2026-09-29.**
 
 After M1-M5 are accepted, remove or formally deprecate Wallet chain proxy code from wallet-api.
 
@@ -319,7 +319,7 @@ Source scope:
 
 Production acceptance (2026-09-29): retired Wallet legacy env keys were removed with a backup retained; Wallet API restarted successfully and `/readyz` reported only `pepewLight` + `telegram`; the updated Wallet doctor returned exit code 0; duplicate Nginx `api.pepepow.net` backup loading was removed; the active API vhost passed `nginx -t`; retired raw/broadcast/history paths were fail-closed with public 404 responses; Telegram `/balance` and `/history` passed.
 
-Remaining M6 cleanup after M6d is deployment/config/script documentation cleanup and final production isolation acceptance (M6e/M6f).
+M6e production deployment/config cleanup and M6f final isolation acceptance are complete.
 
 Do not remove `pepew-api` itself if other products still consume it.
 
@@ -337,6 +337,8 @@ Final boundary requirements:
 Automated boundary: `npm --prefix services/wallet-api run test:m6f-final-isolation`.
 
 Production acceptance does not require another Wallet restart if the accepted M6e runtime SHA is unchanged; run the final isolation test, confirm the live env/systemd/Nginx/readiness boundaries, and repeat Telegram `/balance` and `/history` smoke tests.
+
+Production acceptance (2026-09-29): `test:m6f-final-isolation` passed after correcting a test-only false positive that had matched the valid Light API path `/api/wallet/history/...`; M3/M6a–M6e and Web M2/M4/M5 regressions had already passed; Wallet `/readyz` reported only `pepewLight` + `telegram`; no legacy Wallet chain env keys remained; systemd used the verified `/home/ubuntu/pepepow-wallet-suite/services/wallet-api` runtime; retired public Wallet chain routes returned 404; Telegram `/balance` and `/history` passed. M6 is complete.
 
 Update:
 

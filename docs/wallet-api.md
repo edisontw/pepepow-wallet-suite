@@ -1,6 +1,6 @@
 # wallet-api
 
-> **Migration status:** this document describes the current legacy-compatible runtime. The approved target is for `wallet-api` to become the Telegram/product control plane only, while PEPEW Light API handles Wallet chain reads and signed broadcast. Do not add new consumers of the legacy chain proxy/RPC endpoints. See `docs/LIGHT_API_MIGRATION.md`.
+> **Migration status:** M6 is complete. `wallet-api` is the Telegram/product control plane only; PEPEW Light API handles Wallet chain reads and signed broadcast. Legacy Wallet chain proxy/RPC endpoints are retired and must not be reintroduced. See `docs/LIGHT_API_MIGRATION.md`.
 >
 > **M4:** Mini App signed broadcast moved to PEPEW Light API. The legacy Wallet API broadcast aliases remained only as rollback compatibility and are removed by M6c; new client code must not call them.
 >
@@ -14,7 +14,7 @@
 >
 > **M6e PRODUCTION ACCEPTED (2026-09-29):** Wallet production env, deployment tooling, doctor checks, systemd guidance, webroot, and Nginx retired-route handling are aligned with the current production runtime. Legacy Wallet chain env keys are removed; Wallet doctor is isolated from `pepew-api :9193`.
 >
-> **M6f:** final isolation boundary test is implemented and pending production acceptance. This verifies the Wallet target architecture without deleting the separate legacy `pepew-api :9193` service.
+> **M6f PRODUCTION ACCEPTED (2026-09-29):** final isolation passed. Wallet API/Web/env/systemd/deploy/doctor/Nginx boundaries are isolated from legacy Wallet chain dependencies; the separate `pepew-api :9193` service remains available only for its own legacy consumers.
 
 `wallet-api` is the **wallet control plane**. In M6d source it authenticates Telegram users and serves product/control-plane state; chain readiness is aligned to PEPEW Light API rather than direct legacy chain infrastructure. It is **not** a wallet and **not** a custodian.
 

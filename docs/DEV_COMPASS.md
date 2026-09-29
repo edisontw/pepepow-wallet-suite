@@ -2,7 +2,7 @@
 
 > Working guide for Wallet + Telegram development. Security rules in this file are non-negotiable.
 >
-> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 IN PROGRESS — M6a–M6e PRODUCTION ACCEPTED. M6f final isolation boundary test is implemented and pending final production acceptance. Wallet target paths are Light API + Wallet control plane; `pepew-api :9193` remains separate legacy infrastructure.**
+> Migration status: **M4 PRODUCTION ACCEPTED. M5 COMPLETE. M6 COMPLETE — M6a–M6f PRODUCTION ACCEPTED (2026-09-29). Wallet target architecture is live: Wallet API is the Telegram/product control plane, PEPEW Light API owns Wallet chain reads and signed broadcast, and `pepew-api :9193` remains isolated legacy infrastructure for other consumers only.**
 
 ## 1. Core design principles
 
