@@ -86,6 +86,15 @@ Responsibilities:
 
 Prefer reusing the proven Light Wallet behavior and API client rather than creating parallel wallet logic.
 
+### Public Wallet integration policy
+
+- `wallet.pepepow.net` is the primary integrated Wallet for Telegram, PepewPay, merchant-payment handoff, and future platform integrations.
+- `light.pepepow.net/wallet/` remains a supported standalone/backup PEPEW Light Wallet; do not retire or redirect it merely because the integrated Wallet exists.
+- Both wallets remain non-custodial and use PEPEW Light API for chain access.
+- Never transfer mnemonic/private-key material between the two browser origins through a server.
+- Keep interoperable transaction rules aligned where they affect payment compatibility: 8-decimal amounts, dust handling, client-side signing, signed-only broadcast, and uncertain-broadcast reconciliation.
+- Do not impose an arbitrary whole-coin send floor that prevents a valid Payment Platform amount above dust from being paid.
+
 ### wallet-core
 
 Shared client-side wallet primitives:

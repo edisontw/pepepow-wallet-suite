@@ -115,7 +115,6 @@ type PersistedConsolidationProgress = {
 };
 
 const DEFAULT_PATH = "m/44'/5'/0'/0/0";
-const MIN_SEND_SATS = 100000000;
 const DUST_THRESHOLD_SATS = 546;
 const RECENT_RECIPIENTS_KEY = "pepew_recentRecipients";
 const MAX_RECENT_RECIPIENTS = 6;
@@ -2158,11 +2157,8 @@ export default function Send() {
       if (recipientSatsBigInt <= 0n) {
         abortSend(t("send.errors.amountUnderFee"));
       }
-      if (recipientSatsBigInt < BigInt(DUST_THRESHOLD_SATS)) {
+      if (recipientSatsBigInt <= BigInt(DUST_THRESHOLD_SATS)) {
         abortSend(t("send.errors.amountDust"));
-      }
-      if (recipientSatsBigInt < BigInt(MIN_SEND_SATS)) {
-        abortSend(t("send.errors.amountTooLow", { min: 1 }));
       }
       if (debugEnabled) {
         console.info("[send] atomic values", {

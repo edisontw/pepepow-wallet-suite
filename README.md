@@ -4,6 +4,15 @@ Non-custodial PEPEPOW wallet, Telegram integration, and an isolated centralized-
 
 > **Production status:** PEPEW Light API migration M6 is complete. M6a-M6f were production accepted on 2026-09-29.
 
+## Public Wallet roles
+
+PEPEW intentionally keeps two non-custodial web-wallet surfaces:
+
+- `https://wallet.pepepow.net` is the integrated Wallet for the Web Wallet, Telegram Mini App/Bot flows, PepewPay handoff, and future payment/platform integrations.
+- `https://light.pepepow.net/wallet/` remains a supported standalone PEPEW Light Wallet and backup wallet interface.
+
+Both wallets keep mnemonic/private-key material and signing on the client and use PEPEW Light API for blockchain access. They are separate browser origins, so recovery material must never be transferred automatically between them. New Telegram/payment/platform integrations should target `wallet.pepepow.net`; the standalone Light Wallet remains independently usable.
+
 ## Security model
 
 The Wallet subsystem is non-custodial.

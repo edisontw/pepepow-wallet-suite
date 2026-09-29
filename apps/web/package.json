@@ -12,7 +12,8 @@
     "test:m2-light-reads": "node ./tests/m2-light-read-boundary.test.mjs",
     "test:m4-light-broadcast": "node ./tests/m4-light-broadcast-boundary.test.mjs",
     "test:fee-policy": "rm -rf ./.tmp-tests && tsc --module ES2022 --moduleResolution Bundler --target ES2022 --outDir ./.tmp-tests ./src/lib/feePolicy.ts && node ./tests/fee-policy.test.mjs",
-    "test:m5-client-fee": "node ./tests/m5-client-fee-boundary.test.mjs"
+    "test:m5-client-fee": "node ./tests/m5-client-fee-boundary.test.mjs",
+    "test:payment-compat": "rm -rf ./.tmp-payment-tests && tsc --module NodeNext --moduleResolution NodeNext --target ES2020 --outDir ./.tmp-payment-tests ./src/lib/amount.ts && node ./tests/payment-send-compat.test.mjs"
   },
   "dependencies": {
     "@pepepow/wallet-core": "file:../../packages/wallet-core",

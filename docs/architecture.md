@@ -71,7 +71,22 @@ Responsibilities:
 - balance/history/receive/send UI;
 - stale-UTXO and recent-spent reconciliation.
 
-The Light Wallet repository is the reference implementation for Light API integration and send resilience.
+The Light Wallet repository remains a supported standalone/backup wallet and a reference implementation for Light API integration and send resilience.
+
+### Public Wallet roles
+
+The two public wallet surfaces intentionally coexist:
+
+| Surface | Role |
+| --- | --- |
+| `https://wallet.pepepow.net` | Integrated Wallet: Web Wallet, Telegram Mini App/Bot UX, PepewPay/payment handoff, and future platform integrations |
+| `https://light.pepepow.net/wallet/` | Standalone PEPEW Light Wallet and backup wallet interface |
+
+Both are non-custodial clients and both use PEPEW Light API for chain access. They are separate browser origins; mnemonic/private-key material must never be copied between them by a backend migration service.
+
+Payment and messaging integrations should use `wallet.pepepow.net` as the primary payer handoff. The standalone Light Wallet remains supported and does not need Telegram identity or Payment Platform control-plane features.
+
+Core transaction rules that affect interoperability should remain compatible across both wallets, including 8-decimal amount parsing, dust handling, signed-only broadcast, and safe uncertain-broadcast reconciliation.
 
 ### wallet-core
 
@@ -199,7 +214,7 @@ The Mini App/Web Wallet uses a deterministic client-side P2PKH size policy with 
 | Repository | Responsibility |
 | --- | --- |
 | `pepepow-wallet-suite` | Telegram Bot, Mini App/product UX, wallet-api control plane, shared client wallet logic |
-| `pepepow-light-wallet` | Public Light Wallet reference client and proven Light API/send behavior |
+| `pepepow-light-wallet` | Supported standalone/backup Light Wallet plus reference Light API/send behavior |
 | `pepepow-electrumx-service` | PEPEW Light API gateway, cache, validation, wallet read/broadcast contract |
 | `electrumx-pepepow` | PEPEPOW ElectrumX chain support |
 | `pepepowd` | Blockchain consensus/node authority |
