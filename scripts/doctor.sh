@@ -6,7 +6,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_CODE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CODE_ROOT="${CODE_ROOT:-$DEFAULT_CODE_ROOT}"
 ENV_FILE="${ENV_FILE:-/etc/pepepow/pepepow-wallet-api.env}"
-PEPEW_ENV_FILE="${PEPEW_ENV_FILE:-/etc/pepepow/pepew-api.env}"
 
 build_issues=()
 deploy_issues=()
@@ -191,7 +190,6 @@ fi
 section "Services"
 services=(
   "wallet-api|${CODE_ROOT}/services/wallet-api|${ENV_FILE}|/etc/systemd/system/pepepow-wallet-api.service|9194|required"
-  "pepew-api|${CODE_ROOT}/pepew-api/pepew-api|${PEPEW_ENV_FILE}||9193|optional"
 )
 
 for svc in "${services[@]}"; do
@@ -228,11 +226,6 @@ for svc in "${services[@]}"; do
         add_issue build "wallet-api build output missing (${path}/dist/server.js)"
       fi
       ;;
-    pepew-api)
-      if [[ -d "$path" && -f "${path}/src/index.ts" && ! -f "${path}/dist/index.js" ]]; then
-        add_issue build "pepew-api build output missing (${path}/dist/index.js)"
-      fi
-      ;;
   esac
 done
 
@@ -266,7 +259,7 @@ else
 fi
 
 section "Node dependency sanity"
-export NODE_PATH="${CODE_ROOT}/node_modules:${CODE_ROOT}/services/wallet-api/node_modules:${CODE_ROOT}/apps/web/node_modules:${CODE_ROOT}/packages/wallet-core/node_modules:${CODE_ROOT}/pepew-api/pepew-api/node_modules"
+export NODE_PATH="${CODE_ROOT}/node_modules:${CODE_ROOT}/services/wallet-api/node_modules:${CODE_ROOT}/apps/web/node_modules:${CODE_ROOT}/packages/wallet-core/node_modules"
 if command -v node >/dev/null 2>&1; then
   if node --input-type=module - <<'NODE'
 const mods = ['express','node-fetch','jsonwebtoken','grammy','bitcoinjs-lib','bip39','bs58check'];
@@ -298,24 +291,6 @@ if command -v curl >/dev/null 2>&1; then
   else
     echo "  Light API unreachable"
     add_issue runtime "PEPEW Light API unreachable (${light_base})"
-  fi
-fi
-
-redis_url=""
-if [[ -f "${PEPEW_ENV_FILE}" ]]; then
-  redis_url="$(grep -E '^REDIS_URL=' "${PEPEW_ENV_FILE}" | tail -n1 | cut -d'=' -f2-)"
-fi
-if [[ -n "$redis_url" ]]; then
-  echo "REDIS_URL set (masked)"
-  if command -v redis-cli >/dev/null 2>&1; then
-    if redis-cli -u "$redis_url" PING >/dev/null 2>&1; then
-      echo "  redis ping ok"
-    else
-      echo "  redis ping failed"
-      add_issue runtime "Redis not reachable (${redis_url})"
-    fi
-  else
-    add_issue deploy "redis-cli not installed (REDIS_URL is set)"
   fi
 fi
 

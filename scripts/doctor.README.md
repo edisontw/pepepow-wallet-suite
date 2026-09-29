@@ -21,14 +21,12 @@ CODE_ROOT=/path/to/pepepow-wallet-suite bash scripts/doctor.sh
 - host/toolchain basics;
 - Git source checkout and working-tree state;
 - wallet-api build output and systemd unit;
-- optional legacy `pepew-api :9193` presence separately;
 - Wallet env keys against `.env.example`;
 - PEPEW Light API `/api/status`;
 - Telegram `getMe` when configured;
-- optional Redis connectivity for the separate legacy `pepew-api`;
 - wallet-core and Web build artifacts.
 
-It does **not** require the historical `/opt/.../{releases,shared,current}` layout and does not test Wallet `CORE_RPC_URL`, because direct Wallet RPC dependency was retired in M6d.
+It does **not** require the historical `/opt/.../{releases,shared,current}` layout, does not test Wallet `CORE_RPC_URL`, and does not inspect `pepew-api :9193`/Redis because those are separate from the Wallet runtime boundary.
 
 ## Run
 
