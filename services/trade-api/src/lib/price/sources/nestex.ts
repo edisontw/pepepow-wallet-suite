@@ -4,9 +4,13 @@ import { fetchWithTimeout, parseNumber, truncateRaw } from "../utils.js";
 import { tradeLog } from "../../tradeLogger.js";
 
 const NESTEX_TICKER_URL =
-    process.env.NESTEX_TICKER_URL || "https://trade.nestex.one/api/cg/tickers/PEPEW_USDT";
+    process.env.NESTEX_TICKER_URL || "https://api.nestex.one/cg/tickers/PEPEW_USDT";
 const NESTEX_ORDERBOOK_URL =
-    process.env.NESTEX_ORDERBOOK_URL || "https://trade.nestex.one/api/cg/orderbook/PEPEW_USDT";
+    process.env.NESTEX_ORDERBOOK_URL || "https://api.nestex.one/cg/orderbook/PEPEW_USDT?depth=100";
+const NESTEX_PUBLIC_CACHE_MS = Math.max(
+    1_000,
+    Number(process.env.NESTEX_PUBLIC_CACHE_MS || 30_000)
+);
 const NESTEX_DEBUG =
     process.env.DEBUG_NESTEX === "1" ||
     process.env.DEBUG_NESTEX === "true" ||
@@ -65,7 +69,7 @@ function samplePrices(values: number[], limit = 5, order: "asc" | "desc" = "asc"
     return copy.slice(0, limit);
 }
 
-export async function fetchNestExOrderbookTop(): Promise<{
+async function fetchNestExOrderbookTopUncached(): Promise<{
     bestBid: number | null;
     bestAsk: number | null;
     status: "OK" | "EMPTY" | "INVALID";
@@ -228,6 +232,30 @@ export async function fetchNestExOrderbookTop(): Promise<{
     }
 }
 
+
+let nestExOrderbookCache: { at: number; value: Awaited<ReturnType<typeof fetchNestExOrderbookTopUncached>> } | null = null;
+let nestExOrderbookInFlight: Promise<Awaited<ReturnType<typeof fetchNestExOrderbookTopUncached>>> | null = null;
+
+export async function fetchNestExOrderbookTop(): Promise<Awaited<ReturnType<typeof fetchNestExOrderbookTopUncached>>> {
+    const now = Date.now();
+    if (nestExOrderbookCache && now - nestExOrderbookCache.at < NESTEX_PUBLIC_CACHE_MS) {
+        return nestExOrderbookCache.value;
+    }
+    if (nestExOrderbookInFlight) {
+        return nestExOrderbookInFlight;
+    }
+
+    nestExOrderbookInFlight = fetchNestExOrderbookTopUncached()
+        .then((value) => {
+            nestExOrderbookCache = { at: Date.now(), value };
+            return value;
+        })
+        .finally(() => {
+            nestExOrderbookInFlight = null;
+        });
+    return nestExOrderbookInFlight;
+}
+
 function unwrapNestExTicker(data: any): any {
     if (!data) return data;
     if (data?.data?.ticker) return data.data.ticker;
@@ -237,7 +265,7 @@ function unwrapNestExTicker(data: any): any {
     return data;
 }
 
-export async function fetchNestExTicker(): Promise<{
+async function fetchNestExTickerUncached(): Promise<{
     ticker: NormalizedTicker;
     raw: string;
     volumeProvided: boolean;
@@ -303,4 +331,28 @@ export async function fetchNestExTicker(): Promise<{
             volumeProvided: false,
         };
     }
+}
+
+
+let nestExTickerCache: { at: number; value: Awaited<ReturnType<typeof fetchNestExTickerUncached>> } | null = null;
+let nestExTickerInFlight: Promise<Awaited<ReturnType<typeof fetchNestExTickerUncached>>> | null = null;
+
+export async function fetchNestExTicker(): Promise<Awaited<ReturnType<typeof fetchNestExTickerUncached>>> {
+    const now = Date.now();
+    if (nestExTickerCache && now - nestExTickerCache.at < NESTEX_PUBLIC_CACHE_MS) {
+        return nestExTickerCache.value;
+    }
+    if (nestExTickerInFlight) {
+        return nestExTickerInFlight;
+    }
+
+    nestExTickerInFlight = fetchNestExTickerUncached()
+        .then((value) => {
+            nestExTickerCache = { at: Date.now(), value };
+            return value;
+        })
+        .finally(() => {
+            nestExTickerInFlight = null;
+        });
+    return nestExTickerInFlight;
 }
