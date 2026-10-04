@@ -9,7 +9,7 @@
 import fetch from "node-fetch";
 
 const NESTEX_API_BASE = process.env.NESTEX_API_BASE || "https://trade.nestex.one/api/v2";
-const NESTEX_MIN_INTERVAL_MS = Number(process.env.NESTEX_MIN_INTERVAL_MS || 250);
+const NESTEX_MIN_INTERVAL_MS = Math.max(5000, Number(process.env.NESTEX_MIN_INTERVAL_MS || 5000));
 const NESTEX_RATE_LIMIT_BACKOFF_MS = Number(process.env.NESTEX_RATE_LIMIT_BACKOFF_MS || 5000);
 const NESTEX_DEBUG =
     process.env.DEBUG_NESTEX === "1" ||
@@ -19,7 +19,7 @@ const NESTEX_DEBUG =
 const NESTEX_ORDER_DEBUG =
     process.env.DEBUG_NESTEX_ORDER === "1" ||
     process.env.DEBUG_NESTEX_ORDER === "true";
-const NESTEX_OPEN_ORDERS_DEFAULT_ENDPOINTS = ["/orders", "/openorders"];
+const NESTEX_OPEN_ORDERS_DEFAULT_ENDPOINTS = ["/orders"];
 const nestExDisabledOpenOrdersEndpoints = new Set<string>();
 let nestExPreferredOpenOrdersEndpoint: string | null = null;
 
@@ -324,13 +324,19 @@ function hasNestExBalances(data: any): boolean {
 }
 
 function hasNestExTokenSuccess(data: any): boolean {
+    const success = String(data?.success ?? "").trim().toLowerCase();
+    const status = String(data?.status ?? "").trim().toLowerCase();
     return (
         data?.success === true ||
+        success === "ok" ||
         data?.status === true ||
+        status === "token valid" ||
         data?.valid === true ||
         data?.data?.valid === true ||
         data?.data?.success === true ||
-        data?.result?.success === true
+        String(data?.data?.success ?? "").trim().toLowerCase() === "ok" ||
+        data?.result?.success === true ||
+        String(data?.result?.success ?? "").trim().toLowerCase() === "ok"
     );
 }
 
@@ -342,7 +348,7 @@ function truncateForLog(input: any, maxLen = 800): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public API Functions
+// Private API Functions
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
