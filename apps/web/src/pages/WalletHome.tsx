@@ -23,6 +23,7 @@ import PageCard from "../components/layout/PageCard";
 import { REFRESH_EVENT, readRefreshPayload } from "../lib/refresh";
 import { getPendingSpendTotal } from "../lib/pending";
 import { walletStore } from "../lib/walletStore";
+import { canCreateLocalWallet, getLocalWalletState } from "../lib/localWalletState";
 
 type CopyStatus = "idle" | "copied" | "failed";
 
@@ -98,6 +99,7 @@ export default function WalletHome() {
   const mnemonicWordCount = normalizedMnemonic ? normalizedMnemonic.split(" ").length : 0;
   const mnemonicValid = (mnemonicWordCount === 12 || mnemonicWordCount === 24)
     && validateMnemonic(normalizedMnemonic);
+  const localWalletState = getLocalWalletState(address, mnemo);
   const showMnemonicHint = mnemo.trim().length > 0 && !mnemonicValid;
 
   useEffect(() => {
@@ -392,10 +394,36 @@ export default function WalletHome() {
 
   const createWallet = async () => {
     setWalletError(null);
+    if (typeof localStorage === "undefined") {
+      setWalletError(t("home.walletStorageUnavailable"));
+      return;
+    }
+    let storedAddress: string | null;
+    let storedMnemonic: string | null;
+    try {
+      storedAddress = localStorage.getItem("pepew_address");
+      storedMnemonic = localStorage.getItem("pepew_mnemonic");
+    } catch {
+      setWalletError(t("home.walletStorageUnavailable"));
+      return;
+    }
+    if (!canCreateLocalWallet(address, mnemo, storedAddress, storedMnemonic)) {
+      setWalletError(t("home.walletCreateWouldReplace"));
+      return;
+    }
     try {
       const mnemonic = generateMnemonic();
       const node = await deriveFromMnemonic(mnemonic, defaultPath);
       const derived = pubkeyToP2PKH(Buffer.from(node.publicKey!), PEPEPOW);
+      if (!canCreateLocalWallet(
+        address,
+        mnemo,
+        localStorage.getItem("pepew_address"),
+        localStorage.getItem("pepew_mnemonic"),
+      )) {
+        setWalletError(t("home.walletCreateWouldReplace"));
+        return;
+      }
       setMnemo(mnemonic);
       setAddress(derived);
       setNeedsDefaultSync(true);
@@ -454,6 +482,14 @@ export default function WalletHome() {
       <PageCard title={t("title")}>
         <div className="card">
           <div className="section-title">{t("home.localWallet")}</div>
+          {isTelegram && localWalletState !== "ready" && (
+            <div className="muted" role="status" style={{ marginTop: 6 }}>
+              {t(`home.localWalletState.${localWalletState}`)}
+            </div>
+          )}
+          {isTelegram && localWalletState === "ready" && !mnemonicValid && (
+            <div className="error" role="alert" style={{ marginTop: 6 }}>{t("home.localWalletState.invalidMnemonic")}</div>
+          )}
           <div className="row" style={{ marginTop: 6 }}>
             <button className="btn" onClick={createWallet}>{t("home.createWallet")}</button>
             <button className="btn secondary" onClick={applyMnemonic} disabled={!mnemonicValid}>{t("home.useMnemonic")}</button>
@@ -525,6 +561,9 @@ export default function WalletHome() {
               <div className="balance-line">
                 <span>{t("balance")}:</span>
                 <strong>{address ? fmtPEPEWFromSats(displayBalanceSats) : "—"}</strong>
+                {walletState.status === "loading" && displayBalanceSats === null && (
+                  <span className="muted" style={{ marginLeft: 8 }}>{t("loading")}</span>
+                )}
                 {usdBalanceLabel && (
                   <span className="muted" style={{ marginLeft: 8 }}>
                     ≈ ${usdBalanceLabel}
@@ -534,6 +573,14 @@ export default function WalletHome() {
               {pendingSpendSats > 0 && (
                 <div className="muted" style={{ marginTop: 4 }}>
                   {t("home.pendingSpend")}: {fmtPEPEWFromSats(pendingSpendSats)}
+                </div>
+              )}
+              {walletState.status === "error" && (
+                <div className="error" role="alert" style={{ marginTop: 6 }}>
+                  {t("home.lightApiReadFailed")} {t("home.lightApiRetryHint")} {" "}
+                  <button className="btn ghost" onClick={() => void walletStore.fetch({ fresh: true })}>
+                    {t("home.retryBalance")}
+                  </button>
                 </div>
               )}
               {showDebug && walletState.error && <div className="error" style={{ marginTop: 4 }}>{walletState.error}</div>}

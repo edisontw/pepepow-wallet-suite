@@ -93,12 +93,11 @@ export async function apiFetch(path: string, options: RequestInit & { signal?: A
   }
   const url = getApiUrl(path);
   if (debug) {
-    const kid = token ? token.split('.')[1]?.slice(0, 10) : 'none';
-    console.info(`[api] fetch: ${path}, token_kid=${kid}`, options);
+    console.info(`[api] request: method=${options.method || "GET"}`);
   }
   const res = await fetch(url, { ...options, headers });
   if (debug) {
-    console.info(`[api] response: ${path}, status=${res.status}`);
+    console.info(`[api] response: status=${res.status}`);
   }
   return res;
 }
@@ -115,11 +114,12 @@ export async function sha256hex(text: string) {
   return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-export async function upsertProfile(username?: string) {
+export async function upsertProfile(username?: string, options: { signal?: AbortSignal } = {}) {
   const res = await apiFetch(API_ENDPOINTS.v1.profileUpsert, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username }),
+    signal: options.signal,
   });
   return res.json();
 }
